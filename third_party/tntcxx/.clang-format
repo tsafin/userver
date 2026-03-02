@@ -1,0 +1,18 @@
+---
+Language: Cpp
+BasedOnStyle: WebKit
+Standard: c++17
+IndentWidth: 8
+UseTab: Always
+
+AccessModifierOffset: -8
+AlignAfterOpenBracket: Align
+AlwaysBreakAfterReturnType: TopLevel
+AlwaysBreakTemplateDeclarations: Yes
+ColumnLimit: 120
+ContinuationIndentWidth: 8
+Cpp11BracedListStyle: true
+SpaceInEmptyBlock: false
+PackConstructorInitializers: CurrentLine
+PointerAlignment: Right
+ReferenceAlignment: Right

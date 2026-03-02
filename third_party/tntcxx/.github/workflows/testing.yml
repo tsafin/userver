@@ -1,0 +1,112 @@
+name: Unit testing
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches: [ "master" ]
+    tags: [ "*" ]
+
+jobs:
+  default:
+    uses: ./.github/workflows/reusable-testing.yml
+    strategy:
+      fail-fast: false
+      matrix:
+        runs-on:
+          - ubuntu-22.04
+          - ubuntu-24.04
+          - macos-13
+          - macos-14
+          - macos-15
+        build-type:
+          - Debug
+          - RelWithDebInfo
+    with:
+      runs-on: ${{ matrix.runs-on }}
+      build-type: ${{ matrix.build-type }}
+      cxx-standard: 17
+      c-compiler: gcc
+      cxx-compiler: g++
+
+  build:
+    uses: ./.github/workflows/reusable-testing.yml
+    strategy:
+      fail-fast: false
+      matrix:
+        runs-on:
+          - ubuntu-22.04
+          - ubuntu-24.04
+          - macos-13
+          - macos-14
+          - macos-15
+        compiler:
+          - {c: gcc, cxx: g++}
+          - {c: clang, cxx: clang++}
+        build-type:
+          - Debug
+          - RelWithDebInfo
+        cxx-standard:
+          - 17
+          - 20
+        exclude:
+          # Exclude setups from default job
+          - cxx-standard: 17
+            compiler: {c: gcc, cxx: g++}
+          # gcc on macos is just an alias for clang
+          - runs-on: macos-13
+            compiler: {c: gcc, cxx: g++}
+          - runs-on: macos-14
+            compiler: {c: gcc, cxx: g++}
+          - runs-on: macos-15
+            compiler: {c: gcc, cxx: g++}
+    name: build (${{ matrix.runs-on }}, ${{ matrix.build-type }}, ${{ matrix.compiler.c }}, C++${{ matrix.cxx-standard }})
+    with:
+      build-only: true
+      runs-on: ${{ matrix.runs-on }}
+      build-type: ${{ matrix.build-type }}
+      cxx-standard: ${{ matrix.cxx-standard }}
+      c-compiler: ${{ matrix.compiler.c }}
+      cxx-compiler: ${{ matrix.compiler.cxx }}
+
+  valgrind:
+    uses: ./.github/workflows/reusable-testing.yml
+    strategy:
+      fail-fast: false
+      matrix:
+        build-type:
+          - Debug
+          - RelWithDebInfo
+    with:
+      runs-on: ubuntu-22.04
+      build-type: ${{ matrix.build-type }}
+      use-valgrind: true
+
+  sanitizers:
+    uses: ./.github/workflows/reusable-testing.yml
+    strategy:
+      fail-fast: false
+      matrix:
+        runs-on:
+          - ubuntu-22.04
+          - macos-14
+        build-type:
+          - Debug
+          - RelWithDebInfo
+        compiler:
+          - {c: gcc, cxx: g++}
+          - {c: clang, cxx: clang++}
+        # gcc on macos is just an alias for clang
+        exclude:
+          - runs-on: macos-14
+            compiler: {c: gcc, cxx: g++}
+        sanitizer:
+          - thread
+          - address
+    name: sanitizers (${{ matrix.sanitizer }}, ${{ matrix.runs-on }}, ${{ matrix.build-type }}, ${{ matrix.compiler.c }})
+    with:
+      runs-on: ${{ matrix.runs-on }}
+      build-type: ${{ matrix.build-type }}
+      c-compiler: ${{ matrix.compiler.c }}
+      cxx-compiler: ${{ matrix.compiler.cxx }}
+      enable-sanitizers: ${{ matrix.sanitizer }}
