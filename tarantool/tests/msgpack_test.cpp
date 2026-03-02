@@ -194,8 +194,9 @@ TEST(MsgPackRoundTrip, NegativeInt32) {
 }
 
 TEST(MsgPackRoundTrip, NegativeInt64) {
-    auto v = RoundTrip(formats::json::ValueBuilder{int64_t{-1LL << 40}}.ExtractValue());
-    EXPECT_EQ(v.As<int64_t>(), -1LL << 40);
+    constexpr int64_t kVal = -(1LL << 40);
+    auto v = RoundTrip(formats::json::ValueBuilder{kVal}.ExtractValue());
+    EXPECT_EQ(v.As<int64_t>(), kVal);
 }
 
 TEST(MsgPackRoundTrip, BoolTrue) {
@@ -310,6 +311,153 @@ TEST(MsgPackDecode, BufferOverrunThrows) {
 TEST(MsgPackDecode, UnknownByteThrows) {
     std::vector<uint8_t> buf = {0xc1};  // reserved/undefined in MsgPack
     EXPECT_THROW(MsgPackDecode(buf), storages::tarantool::TarantoolException);
+}
+
+// ---- UUID (ext type 2) ----
+
+// Wire bytes from Tarantool docs example:
+// d8 02 f6 42 3b df b4 9e 49 13 b3 61 07 40 c9 70 2e 4b
+// -> UUID "f6423bdf-b49e-4913-b361-0740c9702e4b"
+TEST(MsgPackUuid, DecodeFromRealWireBytes) {
+    std::vector<uint8_t> buf = {
+        0xd8, 0x02,
+        0xf6, 0x42, 0x3b, 0xdf,
+        0xb4, 0x9e,
+        0x49, 0x13,
+        0xb3, 0x61,
+        0x07, 0x40, 0xc9, 0x70, 0x2e, 0x4b
+    };
+    auto v = MsgPackDecode(buf);
+    ASSERT_TRUE(v.IsString());
+    EXPECT_EQ(v.As<std::string>(), "f6423bdf-b49e-4913-b361-0740c9702e4b");
+}
+
+TEST(MsgPackUuid, EncodeBytes) {
+    TntUuid uuid;
+    uuid.bytes = {0xf6,0x42,0x3b,0xdf, 0xb4,0x9e, 0x49,0x13,
+                  0xb3,0x61, 0x07,0x40,0xc9,0x70,0x2e,0x4b};
+    std::vector<uint8_t> buf;
+    EncodeUuid(buf, uuid);
+    ASSERT_EQ(buf.size(), 18u);
+    EXPECT_EQ(buf[0], 0xd8);   // fixext16
+    EXPECT_EQ(buf[1], 0x02);   // ext type UUID
+    EXPECT_EQ(std::vector<uint8_t>(buf.begin()+2, buf.end()),
+              std::vector<uint8_t>(uuid.bytes.begin(), uuid.bytes.end()));
+}
+
+TEST(MsgPackUuid, UuidFromStringRoundTrip) {
+    const std::string s = "f6423bdf-b49e-4913-b361-0740c9702e4b";
+    const TntUuid uuid = UuidFromString(s);
+    EXPECT_EQ(UuidToString(uuid), s);
+}
+
+TEST(MsgPackUuid, UuidFromStringAllZeros) {
+    const TntUuid uuid = UuidFromString("00000000-0000-0000-0000-000000000000");
+    for (auto b : uuid.bytes) EXPECT_EQ(b, 0);
+    EXPECT_EQ(UuidToString(uuid), "00000000-0000-0000-0000-000000000000");
+}
+
+TEST(MsgPackUuid, UuidFromStringBadInput) {
+    EXPECT_THROW(UuidFromString("not-a-uuid"),
+                 storages::tarantool::TarantoolException);
+    EXPECT_THROW(UuidFromString("f6423bdf-b49e-4913-b361-0740c9702e4bXX"),
+                 storages::tarantool::TarantoolException);
+}
+
+TEST(MsgPackUuid, EncodeDecodeRoundTrip) {
+    const std::string s = "12345678-1234-5678-1234-567812345678";
+    TntUuid uuid = UuidFromString(s);
+    std::vector<uint8_t> buf;
+    EncodeUuid(buf, uuid);
+    auto v = MsgPackDecode(buf);
+    ASSERT_TRUE(v.IsString());
+    EXPECT_EQ(v.As<std::string>(), s);
+}
+
+TEST(MsgPackUuid, DecodeOverrunThrows) {
+    // fixext16 + type byte, but only 10 bytes of data instead of 16
+    std::vector<uint8_t> buf = {0xd8, 0x02,
+        0x01,0x02,0x03,0x04, 0x05,0x06, 0x07,0x08, 0x09,0x0a};
+    EXPECT_THROW(MsgPackDecode(buf), storages::tarantool::TarantoolException);
+}
+
+// ---- Datetime (ext type 4) ----
+
+TEST(MsgPackDatetime, EncodeDecodeSecondsOnly) {
+    TntDatetime dt;
+    dt.seconds = 1672531200;  // 2023-01-01 00:00:00 UTC
+    std::vector<uint8_t> buf;
+    EncodeDateTime(buf, dt);
+    ASSERT_EQ(buf.size(), 10u);   // fixext8 marker + type + 8 bytes
+    EXPECT_EQ(buf[0], 0xd7);     // fixext8
+    EXPECT_EQ(buf[1], 0x04);     // ext type DATETIME
+
+    auto v = MsgPackDecode(buf);
+    ASSERT_TRUE(v.IsObject());
+    EXPECT_EQ(v["seconds"].As<int64_t>(), 1672531200);
+    EXPECT_EQ(v["nsec"].As<int64_t>(), 0);
+    EXPECT_EQ(v["tzoffset"].As<int64_t>(), 0);
+    EXPECT_EQ(v["tzindex"].As<int64_t>(), 0);
+}
+
+TEST(MsgPackDatetime, EncodeDecodeWithNsec) {
+    TntDatetime dt;
+    dt.seconds  = 1672531200;
+    dt.nsec     = 123456789;
+    std::vector<uint8_t> buf;
+    EncodeDateTime(buf, dt);
+    ASSERT_EQ(buf.size(), 18u);  // fixext16 marker + type + 16 bytes
+
+    auto v = MsgPackDecode(buf);
+    EXPECT_EQ(v["seconds"].As<int64_t>(), 1672531200);
+    EXPECT_EQ(v["nsec"].As<int64_t>(),    123456789);
+    EXPECT_EQ(v["tzoffset"].As<int64_t>(), 0);
+}
+
+TEST(MsgPackDatetime, EncodeDecodeWithTimezone) {
+    TntDatetime dt;
+    dt.seconds   = 0;
+    dt.nsec      = 0;
+    dt.tzoffset  = 180;   // UTC+3
+    dt.tzindex   = 42;
+    std::vector<uint8_t> buf;
+    EncodeDateTime(buf, dt);
+    ASSERT_EQ(buf.size(), 18u);
+
+    auto v = MsgPackDecode(buf);
+    EXPECT_EQ(v["seconds"].As<int64_t>(),  0);
+    EXPECT_EQ(v["tzoffset"].As<int64_t>(), 180);
+    EXPECT_EQ(v["tzindex"].As<int64_t>(),  42);
+}
+
+TEST(MsgPackDatetime, NegativeSeconds) {
+    TntDatetime dt;
+    dt.seconds = -86400;  // 1 day before epoch
+    std::vector<uint8_t> buf;
+    EncodeDateTime(buf, dt);
+    auto v = MsgPackDecode(buf);
+    EXPECT_EQ(v["seconds"].As<int64_t>(), -86400);
+}
+
+TEST(MsgPackDatetime, NegativeTzoffset) {
+    TntDatetime dt;
+    dt.seconds  = 1000000000;
+    dt.nsec     = 500000000;
+    dt.tzoffset = -300;  // UTC-5
+    std::vector<uint8_t> buf;
+    EncodeDateTime(buf, dt);
+    auto v = MsgPackDecode(buf);
+    EXPECT_EQ(v["seconds"].As<int64_t>(),  1000000000);
+    EXPECT_EQ(v["nsec"].As<int64_t>(),     500000000);
+    EXPECT_EQ(v["tzoffset"].As<int64_t>(), -300);
+}
+
+// Unknown ext type is silently returned as nil
+TEST(MsgPackExtType, UnknownExtIsNil) {
+    // fixext4, ext type 99 (unknown), 4 bytes of data
+    std::vector<uint8_t> buf = {0xd6, 99, 0xAA, 0xBB, 0xCC, 0xDD};
+    auto v = MsgPackDecode(buf);
+    EXPECT_TRUE(v.IsNull());
 }
 
 USERVER_NAMESPACE_END
