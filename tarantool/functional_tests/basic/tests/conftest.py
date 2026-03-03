@@ -13,7 +13,12 @@ def tarantool_service_script(service_source_dir) -> pathlib.Path:
 
 
 @pytest.fixture(scope='session')
-def service_env(tarantool_conn_info) -> dict:
+def tarantool_spaces_to_truncate() -> list:
+    return ['kv']
+
+
+@pytest.fixture(scope='session')
+def service_env(tarantool_service, tarantool_conn_info) -> dict:
     secdist_config = {
         'tarantool_settings': {
             'tarantool-database': {

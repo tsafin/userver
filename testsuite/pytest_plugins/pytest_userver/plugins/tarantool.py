@@ -12,6 +12,7 @@ import pathlib
 import typing
 
 import pytest
+import tarantool
 
 from testsuite.environment import service, utils
 
@@ -43,6 +44,13 @@ def pytest_addoption(parser):
         '--tarantool-port',
         default=str(DEFAULT_TARANTOOL_PORT),
         help='Tarantool port for functional tests',
+    )
+
+
+def pytest_configure(config):
+    config.addinivalue_line(
+        'markers',
+        'tarantool_store: per-test tarantool space data initialization',
     )
 
 
@@ -124,17 +132,73 @@ def tarantool_service_settings(
 
 
 @pytest.fixture(scope='session')
-def tarantool_conn_info(
+def tarantool_service(
+    pytestconfig,
     tarantool_service_settings,
-    tarantool_port,
     ensure_service_started,
-) -> TarantoolConnInfo:
-    """Connection info for the Tarantool instance.
+):
+    """Ensures Tarantool service is started for the test session.
 
-    Auto-starts Tarantool when ``tarantool_service_settings`` is configured.
-    Falls back to assuming an externally running instance otherwise.
+    Analogous to the ``redis_service`` fixture from
+    ``testsuite.databases.redis.pytest_plugin``.
     """
     if tarantool_service_settings is not None:
         ensure_service_started('tarantool', settings=tarantool_service_settings)
+
+
+@pytest.fixture(scope='session')
+def tarantool_conn_info(
+    tarantool_service,
+    tarantool_service_settings,
+    tarantool_port,
+) -> TarantoolConnInfo:
+    """Connection info for the Tarantool instance."""
+    if tarantool_service_settings is not None:
         return tarantool_service_settings.get_connection_info()
     return TarantoolConnInfo(host='localhost', port=tarantool_port)
+
+
+@pytest.fixture(scope='session')
+def tarantool_spaces_to_truncate() -> list[str]:
+    """List of space names to truncate between tests.
+
+    Override in your conftest.py to specify which spaces to clean:
+
+        @pytest.fixture(scope='session')
+        def tarantool_spaces_to_truncate():
+            return ['kv', 'accounts']
+    """
+    return []
+
+
+@pytest.fixture
+def tarantool_store(tarantool_conn_info, tarantool_spaces_to_truncate):
+    """Per-test direct Tarantool connection with automatic space cleanup.
+
+    Analogous to the ``redis_store`` fixture (which calls ``flushall()``).
+    Truncates all spaces listed in ``tarantool_spaces_to_truncate`` after
+    each test, ensuring a clean state for the next test.
+
+    Example usage::
+
+        async def test_something(service_client, tarantool_store):
+            tarantool_store.insert('kv', (42, 'hello'))
+            resp = await service_client.get('/kv?id=42')
+            assert resp.status == 200
+    """
+    conn = tarantool.Connection(
+        host=tarantool_conn_info.host,
+        port=tarantool_conn_info.port,
+        user='guest',
+        password='',
+        connect_now=True,
+    )
+    try:
+        yield conn
+    finally:
+        for space_name in tarantool_spaces_to_truncate:
+            try:
+                conn.call(f'box.space.{space_name}:truncate')
+            except Exception:  # pylint: disable=broad-except
+                pass
+        conn.close()
