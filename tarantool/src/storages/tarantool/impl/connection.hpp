@@ -1,6 +1,8 @@
 #pragma once
 
 #include <memory>
+#include <string>
+#include <unordered_map>
 
 #include <userver/engine/deadline.hpp>
 #include <userver/engine/io/socket.hpp>
@@ -35,6 +37,10 @@ class Connection final {
   void DoAuth(const AuthSettings& auth, engine::Deadline deadline,
               const std::string& salt);
 
+  /// Resolve space name to numeric space ID (cached after first lookup).
+  uint32_t ResolveSpaceId(const std::string& space_name,
+                          engine::Deadline deadline);
+
   /// Send `n` bytes from `buf`, suspending the coroutine as needed
   void SendAll(const void* buf, std::size_t n, engine::Deadline deadline);
 
@@ -46,6 +52,8 @@ class Connection final {
   /// Send/receive buffers (raw bytes)
   std::vector<uint8_t> send_buf_;
   std::vector<uint8_t> recv_buf_;
+
+  std::unordered_map<std::string, uint32_t> space_id_cache_;
 
   uint64_t sync_counter_{0};
   bool broken_{false};

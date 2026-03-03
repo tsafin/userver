@@ -1,0 +1,71 @@
+components_manager:
+    components:
+        handler-kv:
+            path: /kv
+            task_processor: main-task-processor
+            method: GET,POST,PUT,DELETE
+
+        tarantool-database:
+            secdist_alias: tarantool-database
+            initial_pool_size: 2
+            max_pool_size: 4
+            queue_timeout: 2s
+
+        secdist: {}
+        default-secdist-provider:
+            config: $secdist
+            missing-ok: true
+            environment-secrets-key: SECDIST_CONFIG
+
+        testsuite-support:
+
+        tests-control:
+            method: POST
+            path: /tests/{action}
+            skip-unregistered-testpoints: true
+            task_processor: main-task-processor
+            testpoint-timeout: 10s
+            testpoint-url: $mockserver/testpoint
+            throttling_enabled: false
+
+        http-client:
+            fs-task-processor: fs-task-processor
+
+        server:
+            listener:
+                port: $server-port
+                port#fallback: 8188
+                task_processor: main-task-processor
+
+        logging:
+            fs-task-processor: fs-task-processor
+            loggers:
+                default:
+                    file_path: '@stderr'
+                    level: debug
+                    overflow_behavior: discard
+
+        tracer:
+            service-name: tarantool-basic-test
+
+        dynamic-config:
+            fs-cache-path: ''
+        dynamic-config-fallbacks:
+            fallback-path: $config-fallback
+
+        dns-client:
+            fs-task-processor: fs-task-processor
+
+    coro_pool:
+        initial_size: 500
+        max_size: 1000
+
+    task_processors:
+        main-task-processor:
+            worker_threads: 4
+            thread_name: main-worker
+        fs-task-processor:
+            thread_name: fs-worker
+            worker_threads: 2
+
+    default_task_processor: main-task-processor

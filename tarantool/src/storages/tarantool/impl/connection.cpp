@@ -255,11 +255,71 @@ void Connection::DoAuth(const AuthSettings& auth,
     }
 }
 
+uint32_t Connection::ResolveSpaceId(const std::string& space_name,
+                                    engine::Deadline deadline) {
+    // Return from cache if already resolved.
+    auto it = space_id_cache_.find(space_name);
+    if (it != space_id_cache_.end()) return it->second;
+
+    // Query _vspace (space_id=281) by name index (index_id=2).
+    constexpr uint32_t kVSpaceId = 281;
+    constexpr uint32_t kVSpaceNameIndexId = 2;
+
+    std::vector<uint8_t> body;
+    EncodeFixMap(body, 6);
+    EncodeUint(body, kKeySpaceId);  EncodeUint(body, kVSpaceId);
+    EncodeUint(body, kKeyIndexId);  EncodeUint(body, kVSpaceNameIndexId);
+    EncodeUint(body, kKeyLimit);    EncodeUint(body, 1);
+    EncodeUint(body, kKeyOffset);   EncodeUint(body, 0);
+    EncodeUint(body, kKeyIterator); EncodeUint(body, 0);  // EQ
+    // Key = [space_name]
+    EncodeUint(body, kKeyKey);
+    EncodeArray(body, 1);
+    EncodeStr(body, space_name);
+
+    auto frame = BuildFrame(kIprotoSelect, ++sync_counter_, body);
+    SendAll(frame.data(), frame.size(), deadline);
+
+    recv_buf_.resize(kPreheaderSize);
+    static_cast<void>(socket_.RecvAll(recv_buf_.data(), kPreheaderSize, deadline));
+    const uint32_t body_len = DecodePreheaderLength(recv_buf_.data());
+    recv_buf_.clear();
+    recv_buf_.resize(body_len);
+    static_cast<void>(socket_.RecvAll(recv_buf_.data(), body_len, deadline));
+
+    MpDecoder dec{recv_buf_.data(), recv_buf_.data() + body_len};
+    auto header = dec.DecodeValue();
+    recv_buf_.clear();
+
+    const auto code = header["0"].As<int64_t>(0);
+    if (code != 0) {
+        throw TarantoolException{
+            fmt::format("failed to resolve space '{}': iproto error {}", space_name, code)};
+    }
+
+    auto body_val = dec.DecodeValue();
+    auto data = body_val["48"];  // kKeyData = 0x30 = 48
+    if (!data.IsArray() || data.GetSize() == 0) {
+        throw TarantoolException{
+            fmt::format("space '{}' not found", space_name)};
+    }
+    // Tuple layout: [id, owner, name, engine, field_count, flags, format]
+    const auto space_id = data[0][0].As<uint32_t>();
+    space_id_cache_[space_name] = space_id;
+    return space_id;
+}
+
 ExecutionResult Connection::Execute(OptionalCommandControl cc,
                                     const Query& query) {
     const engine::Deadline deadline =
         cc ? engine::Deadline::FromDuration(cc->execute)
            : engine::Deadline{};
+
+    // Resolve space name to numeric ID for all CRUD operations
+    uint32_t space_id = 0;
+    if (query.GetType() != Query::Type::kCall) {
+        space_id = ResolveSpaceId(query.GetSpaceOrFunc(), deadline);
+    }
 
     std::vector<uint8_t> body;
     uint32_t request_type = kIprotoCall;
@@ -277,7 +337,7 @@ ExecutionResult Connection::Execute(OptionalCommandControl cc,
         case Query::Type::kSelect: {
             request_type = kIprotoSelect;
             EncodeFixMap(body, 6);
-            EncodeUint(body, kKeySpaceId);   EncodeUint(body, 0);  // space by name NYI
+            EncodeUint(body, kKeySpaceId);   EncodeUint(body, space_id);
             EncodeUint(body, kKeyIndexId);   EncodeUint(body, 0);
             EncodeUint(body, kKeyLimit);     EncodeUint(body, query.GetLimit());
             EncodeUint(body, kKeyOffset);    EncodeUint(body, 0);
@@ -288,21 +348,21 @@ ExecutionResult Connection::Execute(OptionalCommandControl cc,
         case Query::Type::kInsert: {
             request_type = kIprotoInsert;
             EncodeFixMap(body, 2);
-            EncodeUint(body, kKeySpaceId); EncodeUint(body, 0);
+            EncodeUint(body, kKeySpaceId); EncodeUint(body, space_id);
             EncodeUint(body, kKeyTuple);   EncodeJson(body, query.GetArgs());
             break;
         }
         case Query::Type::kReplace: {
             request_type = kIprotoReplace;
             EncodeFixMap(body, 2);
-            EncodeUint(body, kKeySpaceId); EncodeUint(body, 0);
+            EncodeUint(body, kKeySpaceId); EncodeUint(body, space_id);
             EncodeUint(body, kKeyTuple);   EncodeJson(body, query.GetArgs());
             break;
         }
         case Query::Type::kDelete: {
             request_type = kIprotoDelete;
             EncodeFixMap(body, 3);
-            EncodeUint(body, kKeySpaceId); EncodeUint(body, 0);
+            EncodeUint(body, kKeySpaceId); EncodeUint(body, space_id);
             EncodeUint(body, kKeyIndexId); EncodeUint(body, 0);
             EncodeUint(body, kKeyKey);     EncodeJson(body, query.GetArgs());
             break;
@@ -310,7 +370,7 @@ ExecutionResult Connection::Execute(OptionalCommandControl cc,
         case Query::Type::kUpdate: {
             request_type = kIprotoUpdate;
             EncodeFixMap(body, 4);
-            EncodeUint(body, kKeySpaceId);  EncodeUint(body, 0);
+            EncodeUint(body, kKeySpaceId);  EncodeUint(body, space_id);
             EncodeUint(body, kKeyIndexId);  EncodeUint(body, 0);
             EncodeUint(body, kKeyKey);      EncodeJson(body, query.GetArgs());
             EncodeUint(body, kKeyTupleOps); EncodeJson(body, query.GetOps());
@@ -319,7 +379,7 @@ ExecutionResult Connection::Execute(OptionalCommandControl cc,
         case Query::Type::kUpsert: {
             request_type = kIprotoUpsert;
             EncodeFixMap(body, 3);
-            EncodeUint(body, kKeySpaceId);  EncodeUint(body, 0);
+            EncodeUint(body, kKeySpaceId);  EncodeUint(body, space_id);
             EncodeUint(body, kKeyTuple);    EncodeJson(body, query.GetArgs());
             EncodeUint(body, kKeyTupleOps); EncodeJson(body, query.GetOps());
             break;
