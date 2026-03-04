@@ -4,6 +4,7 @@
 #include <string>
 #include <unordered_map>
 
+#include <userver/clients/dns/resolver_fwd.hpp>
 #include <userver/engine/deadline.hpp>
 #include <userver/engine/io/socket.hpp>
 
@@ -24,7 +25,8 @@ namespace storages::tarantool::impl {
 /// blocking the OS thread.
 class Connection final {
  public:
-  Connection(const EndpointSettings& endpoint, const AuthSettings& auth,
+  Connection(clients::dns::Resolver& resolver,
+             const EndpointSettings& endpoint, const AuthSettings& auth,
              engine::Deadline connect_deadline);
 
   ExecutionResult Execute(OptionalCommandControl cc, const Query& query);
@@ -43,9 +45,6 @@ class Connection final {
 
   /// Send `n` bytes from `buf`, suspending the coroutine as needed
   void SendAll(const void* buf, std::size_t n, engine::Deadline deadline);
-
-  /// Receive exactly `n` bytes appended into `recv_buf_`, suspending coroutine
-  void RecvExact(std::size_t n, engine::Deadline deadline);
 
   engine::io::Socket socket_;
 

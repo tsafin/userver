@@ -1,5 +1,6 @@
 #include "pool.hpp"
 
+#include <userver/clients/dns/resolver.hpp>
 #include <userver/engine/deadline.hpp>
 #include <userver/tracing/span.hpp>
 #include <userver/tracing/tags.hpp>
@@ -13,8 +14,8 @@ USERVER_NAMESPACE_BEGIN
 
 namespace storages::tarantool::impl {
 
-Pool::Pool(PoolSettings settings)
-    : impl_{std::make_shared<PoolImpl>(std::move(settings))} {
+Pool::Pool(clients::dns::Resolver& resolver, PoolSettings settings)
+    : impl_{std::make_shared<PoolImpl>(resolver, std::move(settings))} {
     impl_->StartMaintenance();
 }
 

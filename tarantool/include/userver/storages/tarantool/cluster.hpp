@@ -8,6 +8,7 @@
 #include <string_view>
 #include <vector>
 
+#include <userver/clients/dns/resolver_fwd.hpp>
 #include <userver/components/component_fwd.hpp>
 #include <userver/utils/statistics/writer.hpp>
 
@@ -32,7 +33,8 @@ class Pool;
 /// Usually retrieved from components::Tarantool.
 class Cluster final {
  public:
-  Cluster(const impl::TarantoolSettings& settings,
+  Cluster(clients::dns::Resolver& resolver,
+          const impl::TarantoolSettings& settings,
           const components::ComponentConfig& config);
   ~Cluster();
 
@@ -70,11 +72,6 @@ class Cluster final {
 
   /// Write cluster statistics
   void WriteStatistics(utils::statistics::Writer& writer) const;
-
-  /// Exception thrown when all pools are unavailable
-  class NoAvailablePoolError : public std::runtime_error {
-    using std::runtime_error::runtime_error;
-  };
 
  private:
   ExecutionResult DoExecute(OptionalCommandControl cc, const Query& query);

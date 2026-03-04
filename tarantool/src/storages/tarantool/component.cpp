@@ -1,5 +1,6 @@
 #include <userver/storages/tarantool/component.hpp>
 
+#include <userver/clients/dns/component.hpp>
 #include <userver/components/component_config.hpp>
 #include <userver/components/component_context.hpp>
 #include <userver/components/statistics_storage.hpp>
@@ -17,7 +18,8 @@ namespace components {
 
 Tarantool::Tarantool(const ComponentConfig& config,
                      const ComponentContext& context)
-    : LoggableComponentBase{config, context} {
+    : LoggableComponentBase{config, context},
+      dns_{context.FindComponent<clients::dns::Component>()} {
     const auto& secdist =
         context.FindComponent<Secdist>().Get();
     const auto& settings_multi =
@@ -26,7 +28,8 @@ Tarantool::Tarantool(const ComponentConfig& config,
         settings_multi.Get(
             storages::tarantool::impl::GetSecdistAlias(config));
 
-    cluster_ = std::make_shared<storages::tarantool::Cluster>(settings, config);
+    cluster_ = std::make_shared<storages::tarantool::Cluster>(
+        dns_.GetResolver(), settings, config);
 
     auto& stats_storage =
         context.FindComponent<StatisticsStorage>();

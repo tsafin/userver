@@ -3,6 +3,7 @@
 #include <memory>
 #include <string>
 
+#include <userver/clients/dns/resolver_fwd.hpp>
 #include <userver/storages/tarantool/options.hpp>
 #include <userver/storages/tarantool/query.hpp>
 #include <userver/storages/tarantool/result.hpp>
@@ -18,7 +19,7 @@ class PoolImpl;
 
 class Pool final {
  public:
-    explicit Pool(PoolSettings settings);
+    Pool(clients::dns::Resolver& resolver, PoolSettings settings);
     ~Pool();
 
     Pool(const Pool&) = delete;

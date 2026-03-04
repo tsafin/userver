@@ -1,5 +1,6 @@
 #include <userver/storages/tarantool/cluster.hpp>
 
+#include <userver/clients/dns/resolver.hpp>
 #include <userver/components/component_config.hpp>
 #include <userver/logging/log.hpp>
 
@@ -12,13 +13,14 @@ USERVER_NAMESPACE_BEGIN
 
 namespace storages::tarantool {
 
-Cluster::Cluster(const impl::TarantoolSettings& settings,
+Cluster::Cluster(clients::dns::Resolver& resolver,
+                 const impl::TarantoolSettings& settings,
                  const components::ComponentConfig& config) {
     pools_.reserve(settings.endpoints.size());
     for (const auto& endpoint : settings.endpoints) {
         impl::PoolSettings pool_settings{config, endpoint, settings.auth};
         pools_.push_back(
-            std::make_unique<impl::Pool>(std::move(pool_settings)));
+            std::make_unique<impl::Pool>(resolver, std::move(pool_settings)));
     }
     if (pools_.empty()) {
         throw std::runtime_error{"Tarantool cluster has no endpoints"};

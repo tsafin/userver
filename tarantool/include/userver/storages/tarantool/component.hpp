@@ -3,6 +3,7 @@
 /// @file userver/storages/tarantool/component.hpp
 /// @brief @copybrief components::Tarantool
 
+#include <userver/clients/dns/component.hpp>
 #include <userver/components/loggable_component_base.hpp>
 #include <userver/utils/statistics/storage.hpp>
 
@@ -51,6 +52,7 @@ class Tarantool final : public LoggableComponentBase {
   static yaml_config::Schema GetStaticConfigSchema();
 
  private:
+  clients::dns::Component& dns_;
   std::shared_ptr<storages::tarantool::Cluster> cluster_;
   utils::statistics::Entry statistics_holder_;
 };
