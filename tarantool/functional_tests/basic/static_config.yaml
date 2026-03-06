@@ -28,8 +28,10 @@ components_manager:
             testpoint-url: $mockserver/testpoint
             throttling_enabled: false
 
-        http-client:
-            fs-task-processor: fs-task-processor
+        http-client: {}
+
+        http-client-middleware-pipeline:
+            middlewares: {}
 
         server:
             listener:
@@ -45,13 +47,8 @@ components_manager:
                     level: debug
                     overflow_behavior: discard
 
-        tracer:
-            service-name: tarantool-basic-test
-
         dynamic-config:
             fs-cache-path: ''
-        dynamic-config-fallbacks:
-            fallback-path: $config-fallback
 
         dns-client:
             fs-task-processor: fs-task-processor

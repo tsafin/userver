@@ -50,20 +50,22 @@ if (USERVER_IS_THE_ROOT_PROJECT)
         add_google_tests(${PROJECT_NAME}_unittest)
     endif()
 
-    add_executable(${PROJECT_NAME}_tttest ${TT_TEST_SOURCES})
-    target_include_directories(${PROJECT_NAME}_tttest PRIVATE
-        $<TARGET_PROPERTY:${PROJECT_NAME},INCLUDE_DIRECTORIES>)
-    target_link_libraries(${PROJECT_NAME}_tttest userver-utest ${PROJECT_NAME})
-    add_test(${PROJECT_NAME}_tttest
-        env
-        ${CMAKE_BINARY_DIR}/testsuite/env
-        --databases=tarantool
-        run --
-        ${CMAKE_CURRENT_BINARY_DIR}/${PROJECT_NAME}_tttest
-        --gtest_output=xml:${CMAKE_BINARY_DIR}/test-results/${PROJECT_NAME}_tttest.xml
-    )
-    set_tests_properties(${PROJECT_NAME}_tttest PROPERTIES ENVIRONMENT
-        "TESTSUITE_TARANTOOL_SERVER_START_TIMEOUT=30.0")
+    if (TT_TEST_SOURCES)
+        add_executable(${PROJECT_NAME}_tttest ${TT_TEST_SOURCES})
+        target_include_directories(${PROJECT_NAME}_tttest PRIVATE
+            $<TARGET_PROPERTY:${PROJECT_NAME},INCLUDE_DIRECTORIES>)
+        target_link_libraries(${PROJECT_NAME}_tttest userver-utest ${PROJECT_NAME})
+        add_test(${PROJECT_NAME}_tttest
+            env
+            ${CMAKE_BINARY_DIR}/testsuite/env
+            --databases=tarantool
+            run --
+            ${CMAKE_CURRENT_BINARY_DIR}/${PROJECT_NAME}_tttest
+            --gtest_output=xml:${CMAKE_BINARY_DIR}/test-results/${PROJECT_NAME}_tttest.xml
+        )
+        set_tests_properties(${PROJECT_NAME}_tttest PROPERTIES ENVIRONMENT
+            "TESTSUITE_TARANTOOL_SERVER_START_TIMEOUT=30.0")
+    endif()
 
     add_subdirectory(functional_tests)
 endif()
