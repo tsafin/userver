@@ -112,13 +112,18 @@ void PoolImpl::MaintainConnections() {
 
     const bool broken = conn_ptr->IsBroken();
     if (!broken) {
+        bool ping_ok = false;
         try {
             conn_ptr->Ping(engine::Deadline::FromDuration(
                 settings_.connect_timeout));
+            ping_ok = true;
         } catch (const std::exception& ex) {
             LOG_LIMITED_WARNING()
                 << "Tarantool: ping failed for '"
                 << settings_.endpoint.host << "': " << ex;
+        }
+        if (ping_ok) {
+            availability_monitor_.AccountSuccess();
         }
     }
     DoRelease(std::move(conn_ptr));

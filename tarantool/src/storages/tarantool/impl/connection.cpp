@@ -309,12 +309,8 @@ uint32_t Connection::ResolveSpaceId(const std::string& space_name,
     return space_id;
 }
 
-ExecutionResult Connection::Execute(OptionalCommandControl cc,
+ExecutionResult Connection::Execute(engine::Deadline deadline,
                                     const Query& query) {
-    const engine::Deadline deadline =
-        cc ? engine::Deadline::FromDuration(cc->execute)
-           : engine::Deadline{};
-
     // Resolve space name to numeric ID for all CRUD operations
     uint32_t space_id = 0;
     if (query.GetType() != Query::Type::kCall) {

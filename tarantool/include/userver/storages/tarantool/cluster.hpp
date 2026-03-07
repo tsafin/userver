@@ -71,11 +71,6 @@ class Cluster final {
   /// Write cluster statistics
   void WriteStatistics(utils::statistics::Writer& writer) const;
 
-  /// Exception thrown when all pools are unavailable
-  class NoAvailablePoolError : public std::runtime_error {
-    using std::runtime_error::runtime_error;
-  };
-
  private:
   ExecutionResult DoExecute(OptionalCommandControl cc, const Query& query);
 

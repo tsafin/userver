@@ -27,7 +27,7 @@ class Connection final {
   Connection(const EndpointSettings& endpoint, const AuthSettings& auth,
              engine::Deadline connect_deadline);
 
-  ExecutionResult Execute(OptionalCommandControl cc, const Query& query);
+  ExecutionResult Execute(engine::Deadline deadline, const Query& query);
 
   void Ping(engine::Deadline deadline);
 

@@ -51,7 +51,7 @@ ExecutionResult Pool::Execute(OptionalCommandControl cc, const Query& query) {
     ++req_stats.total;
 
     try {
-        auto result = conn_ptr->Execute(cc, query);
+        auto result = conn_ptr->Execute(deadline, query);
         if (!result.IsOk()) {
             ++req_stats.error;
         }
