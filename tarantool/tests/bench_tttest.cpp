@@ -99,18 +99,29 @@ void BenchJsonEncode(std::size_t n, const std::string& val) {
 
 void BenchPool(const std::string& host, int port,
                std::size_t pool_size, int concurrency,
-               std::size_t n, const std::string& val,
+               std::size_t per_coro, const std::string& val,
                clients::dns::Resolver& resolver,
                const std::string& label) {
     auto pool = std::make_unique<storages::tarantool::impl::Pool>(
         resolver, MakePool(host, port, pool_size));
 
-    // warmup
-    for (int i = 0; i < 200; ++i)
-        pool->Execute(std::nullopt,
-            storages::tarantool::Query::Replace("kv", MakeTuple(uint64_t(i), "w")));
+    // Concurrent warmup: run one REPLACE per coroutine in parallel so that
+    // every connection in the pool has its space-id cache populated before
+    // the timed section begins.
+    {
+        std::vector<engine::TaskWithResult<void>> warmup_tasks;
+        warmup_tasks.reserve(concurrency);
+        for (int c = 0; c < concurrency; ++c) {
+            warmup_tasks.push_back(engine::AsyncNoSpan([&pool, c] {
+                for (int w = 0; w < 5; ++w)
+                    pool->Execute(std::nullopt,
+                        storages::tarantool::Query::Replace(
+                            "kv", MakeTuple(uint64_t(c * 5 + w), "w")));
+            }));
+        }
+        for (auto& t : warmup_tasks) t.Get();
+    }
 
-    const std::size_t per_coro = n / concurrency;
     const auto r = Time(std::size_t(concurrency) * per_coro, [&] {
         std::vector<engine::TaskWithResult<void>> tasks;
         tasks.reserve(concurrency);
@@ -136,12 +147,12 @@ TEST(TarantoolBench, InsertThroughput) {
     const std::string host = host_env ? host_env : "127.0.0.1";
     const int port = port_env ? std::stoi(port_env) : 3301;
 
-    constexpr std::size_t kN = 10000;
+    constexpr std::size_t kPerCoro = 2000;  // fixed per-coroutine op count
     const std::string val32(32, 'x');
 
     // ── Section 1: pure CPU cost (no network) ──────────────────────────────
     std::cout << "\n╔══ CPU cost (no network) ═══════════════════════════════╗\n";
-    BenchJsonEncode(kN, val32);
+    BenchJsonEncode(kPerCoro, val32);
     std::cout << "╚════════════════════════════════════════════════════════╝\n\n";
 
     // ── Section 2: vary ev threads ────────────────────────────────────────
@@ -160,12 +171,19 @@ TEST(TarantoolBench, InsertThroughput) {
                 engine::current_task::GetTaskProcessor(), dns_cfg};
 
             // sequential baseline
-            BenchPool(host, port, 1, 1, kN, val32, resolver,
+            BenchPool(host, port, 1, 1, kPerCoro, val32, resolver,
                       "sequential  (pool=1,  coro=1)");
 
-            // scale concurrency
+            // pipelining: small fixed pool, varying coro count demonstrates
+            // that a single connection can serve many concurrent in-flight ops.
             for (int coro : {4, 8, 16, 32, 64, 128}) {
-                BenchPool(host, port, coro, coro, kN, val32, resolver,
+                BenchPool(host, port, 4, coro, kPerCoro, val32, resolver,
+                          "pipeline    (pool=4,  coro=" + std::to_string(coro) + ")");
+            }
+
+            // scale pool=coro (one dedicated connection per coroutine)
+            for (int coro : {4, 8, 16, 32, 64, 128}) {
+                BenchPool(host, port, coro, coro, kPerCoro, val32, resolver,
                           "concurrent  (pool=" + std::to_string(coro) +
                           ", coro=" + std::to_string(coro) + ")");
             }

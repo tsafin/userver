@@ -53,27 +53,25 @@ ExecutionResult Pool::Execute(OptionalCommandControl cc, const Query& query) {
                               : impl_->GetStatistics().crud;
     ++req_stats.total;
 
-    // Phase 1: Acquire the pool slot and execute the request.
-    // The connection's internal reader-task handles response demultiplexing,
-    // but we hold the pool slot for the full request lifetime to avoid races
-    // with the maintenance task (which uses TryPop without the semaphore and
-    // could fill the pool queue while we're waiting, causing DoRelease to
-    // drop the connection with in-flight requests).
+    // Phase 1: Acquire the pool slot, send the request, then immediately
+    // release the pool slot (pipelining). Releasing before wait_until allows
+    // the same connection to carry multiple in-flight requests concurrently:
+    // the reader task demultiplexes responses by sync_id, so each Future is
+    // resolved independently. bounded_push always succeeds here because the
+    // total in-pool + given-away count never exceeds max_pool_size.
     engine::Future<ExecutionResult> fut;
-    std::unique_ptr<ConnectionPtr> conn_holder;
     try {
         auto conn_ptr = std::make_unique<ConnectionPtr>(impl_->Acquire(deadline));
         fut = (*conn_ptr)->ExecuteAsync(deadline, query);
-        conn_holder = std::move(conn_ptr);
+        conn_ptr.reset();  // return connection to pool immediately (pipelining)
     } catch (...) {
         ++req_stats.error;
         throw;
     }
 
-    // Phase 2: Wait for the response. The pool slot is released when
-    // conn_holder goes out of scope at the end of this function.
+    // Phase 2: Wait for response. The pool slot is already free; other
+    // coroutines can reuse the same connection while we wait.
     const auto status = fut.wait_until(deadline);
-    conn_holder.reset();  // release pool slot now that future is settled
     if (status == engine::FutureStatus::kTimeout) {
         ++req_stats.error;
         throw TarantoolException{"execute deadline expired"};

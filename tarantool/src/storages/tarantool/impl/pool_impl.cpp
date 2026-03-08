@@ -1,5 +1,7 @@
 #include "pool_impl.hpp"
 
+#include <optional>
+
 #include <userver/clients/dns/resolver.hpp>
 #include <userver/logging/log.hpp>
 #include <userver/utils/assert.hpp>
@@ -95,44 +97,48 @@ void PoolImpl::StopMaintenance() {
 }
 
 void PoolImpl::MaintainConnections() {
-    const auto try_push = [this] {
-        try {
-            PushConnection(engine::Deadline::FromDuration(
-                settings_.connect_timeout));
-        } catch (const std::exception& ex) {
-            LOG_ERROR() << "Tarantool: failed to create connection: " << ex;
+    const auto try_grow = [this] {
+        if (AliveConnectionsCountApprox() < settings_.initial_pool_size) {
+            try {
+                PushConnection(engine::Deadline::FromDuration(
+                    settings_.connect_timeout));
+            } catch (const std::exception& ex) {
+                LOG_ERROR() << "Tarantool: failed to create connection: " << ex;
+            }
         }
     };
 
-    auto conn_ptr = TryPop();
-    if (!conn_ptr) {
-        if (AliveConnectionsCountApprox() < settings_.initial_pool_size) {
-            try_push();
-        }
+    // Use proper Acquire() so the given_away_semaphore_ is decremented.
+    // TryPop() bypasses the semaphore, which allows alive_connections to
+    // temporarily exceed max_pool_size and causes bounded_push to fail in
+    // DoRelease, which would drop a connection that may have in-flight
+    // pipelined requests.
+    constexpr auto kMaintenanceAcquireTimeout = std::chrono::milliseconds{200};
+    std::optional<ConnectionPtr> conn;
+    try {
+        conn.emplace(Acquire(
+            engine::Deadline::FromDuration(kMaintenanceAcquireTimeout)));
+    } catch (const std::exception&) {
+        // Pool is fully busy or unavailable; skip this maintenance cycle.
+        try_grow();
         return;
     }
 
-    const bool broken = conn_ptr->IsBroken();
-    if (!broken) {
-        bool ping_ok = false;
+    if (!(*conn)->IsBroken()) {
         try {
-            conn_ptr->Ping(engine::Deadline::FromDuration(
+            (*conn)->Ping(engine::Deadline::FromDuration(
                 settings_.connect_timeout));
-            ping_ok = true;
         } catch (const std::exception& ex) {
             LOG_LIMITED_WARNING()
                 << "Tarantool: ping failed for '"
                 << settings_.endpoint.host << "': " << ex;
         }
-        if (ping_ok) {
-            availability_monitor_.AccountSuccess();
-        }
+        // AccountSuccess is called by PoolImpl::Release() if not broken.
     }
-    DoRelease(std::move(conn_ptr));
+    // conn goes out of scope → ~ConnectionPtr() → Release() →
+    // ReleaseConnection() → semaphore unlocked properly.
 
-    if (AliveConnectionsCountApprox() < settings_.initial_pool_size) {
-        try_push();
-    }
+    try_grow();
 }
 
 void PoolImpl::AccountConnectionAcquired() {

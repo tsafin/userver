@@ -4,6 +4,8 @@
 #include <cstring>
 #include <stdexcept>
 
+#include <netinet/tcp.h>
+
 #include <fmt/format.h>
 #include <openssl/sha.h>
 
@@ -183,6 +185,9 @@ Connection::Connection(clients::dns::Resolver& resolver,
             fmt::format("Failed to connect to {}:{}", endpoint.host,
                         endpoint.port)};
     }
+    // Disable Nagle's algorithm: IPROTO frames are small and complete, and we
+    // want them sent immediately rather than buffered waiting for ACKs.
+    socket_.SetOption(IPPROTO_TCP, TCP_NODELAY, 1);
 
     // Read 128-byte greeting (direct, before reader task starts)
     std::vector<uint8_t> greeting(kGreetingSize);
