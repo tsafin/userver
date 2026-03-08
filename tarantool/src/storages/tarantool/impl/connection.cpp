@@ -251,19 +251,48 @@ void Connection::DoAuth(const AuthSettings& auth,
 // ---- Background reader task ----
 
 void Connection::ReaderLoop() {
-    std::vector<uint8_t> prehdr(kPreheaderSize);
+    // Streaming read buffer: a single RecvSome call fills as many bytes as the
+    // socket has available.  When the server has pipelined many responses back-
+    // to-back, we decode all of them out of this buffer without extra syscalls,
+    // reducing recv overhead from 2×N to ~N/K (K = avg responses per segment).
+    constexpr size_t kReadBufSize = 65536;
+    std::vector<uint8_t> rbuf(kReadBufSize);
+    size_t rpos = 0;  // start of unconsumed data
+    size_t rend = 0;  // end of received data
+
+    // Refill buffer: compact if more than half is consumed, grow if needed,
+    // then read as much as the socket has available (at least 1 byte).
+    auto fill = [&] {
+        if (rpos > kReadBufSize / 2) {
+            const size_t avail = rend - rpos;
+            std::memmove(rbuf.data(), rbuf.data() + rpos, avail);
+            rpos = 0;
+            rend = avail;
+        }
+        if (rbuf.size() < rend + kReadBufSize) rbuf.resize(rend + kReadBufSize);
+        const size_t n = socket_.RecvSome(rbuf.data() + rend,
+                                          rbuf.size() - rend, {});
+        if (n == 0) throw std::runtime_error{"connection closed by peer"};
+        rend += n;
+    };
+
+    auto ensure_bytes = [&](size_t n) {
+        while (rend - rpos < n) fill();
+    };
+
     try {
         while (true) {
-            static_cast<void>(
-                socket_.RecvAll(prehdr.data(), kPreheaderSize, {}));
-            const uint32_t body_len = DecodePreheaderLength(prehdr.data());
+            ensure_bytes(kPreheaderSize);
+            const uint32_t body_len = DecodePreheaderLength(rbuf.data() + rpos);
+            rpos += kPreheaderSize;
 
-            std::vector<uint8_t> body(body_len);
-            static_cast<void>(
-                socket_.RecvAll(body.data(), body_len, {}));
+            ensure_bytes(body_len);
+            // Decode directly from the buffer (zero-copy): set body_data before
+            // advancing rpos so the pointer stays valid during decode.
+            const uint8_t* body_data = rbuf.data() + rpos;
+            MpDecoder dec{body_data, body_data + body_len};
+            rpos += body_len;
 
-            // Parse IPROTO response: header map {code, sync, ...} + body map
-            MpDecoder dec{body.data(), body.data() + body_len};
             auto header = dec.DecodeValue();
             const auto sync_id = header["1"].As<uint64_t>(0);
             const auto code    = header["0"].As<int64_t>(0);
@@ -346,26 +375,59 @@ engine::Future<ExecutionResult> Connection::SendAndRegister(
 
     auto frame = BuildFrame(request_type, sync_id, body);
 
+    // Stage the encoded frame for batch-flushing.
     {
-        std::lock_guard send_lock(send_mutex_);
-        if (broken_.load(std::memory_order_acquire)) {
-            std::lock_guard plock(pending_mutex_);
-            pending_.erase(sync_id);
-            throw TarantoolException{"connection is broken"};
+        std::lock_guard lock(staging_mutex_);
+        staging_buf_.insert(staging_buf_.end(), frame.begin(), frame.end());
+    }
+
+    // Race for the flush role: only the winner calls SendAll.
+    // All other coroutines return immediately; the winner carries their frames.
+    bool expected = false;
+    if (!flush_in_progress_.compare_exchange_strong(
+            expected, true,
+            std::memory_order_acquire, std::memory_order_relaxed)) {
+        return future;
+    }
+
+    // We are the flush winner.  Drain staging_buf_ and send in a loop so
+    // frames pushed by concurrent coroutines *while* we were in SendAll are
+    // also picked up without a second round of flushing.
+    while (true) {
+        std::vector<uint8_t> to_send;
+        {
+            std::lock_guard lock(staging_mutex_);
+            if (staging_buf_.empty()) {
+                // Release the flush role while holding staging_mutex_ to close
+                // the TOCTOU window between the empty-check and the CAS store.
+                flush_in_progress_.store(false, std::memory_order_release);
+                break;
+            }
+            to_send = std::move(staging_buf_);
         }
+
+        if (broken_.load(std::memory_order_acquire)) {
+            {
+                std::lock_guard lock(staging_mutex_);
+                flush_in_progress_.store(false, std::memory_order_release);
+            }
+            WakeAllPending(std::make_exception_ptr(
+                TarantoolException{"connection is broken"}));
+            break;
+        }
+
         try {
-            static_cast<void>(
-                socket_.SendAll(frame.data(), frame.size(), deadline));
+            socket_.SendAll(to_send.data(), to_send.size(), deadline);
         } catch (...) {
             broken_.store(true, std::memory_order_release);
             {
-                std::lock_guard plock(pending_mutex_);
-                pending_.erase(sync_id);
+                std::lock_guard lock(staging_mutex_);
+                flush_in_progress_.store(false, std::memory_order_release);
             }
-            // Remaining pending entries will be woken when the reader task
-            // fails to recv and calls WakeAllPending.
-            throw;
+            WakeAllPending(std::current_exception());
+            break;
         }
+        // Loop: pick up any frames staged while we were in SendAll.
     }
 
     return future;

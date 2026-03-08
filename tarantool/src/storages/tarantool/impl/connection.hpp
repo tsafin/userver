@@ -4,6 +4,7 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #include <userver/clients/dns/resolver_fwd.hpp>
 #include <userver/engine/deadline.hpp>
@@ -61,9 +62,10 @@ class Connection final {
   uint32_t ResolveSpaceId(const std::string& space_name,
                           engine::Deadline deadline);
 
-  /// Core pipelining primitive: registers a pending entry, sends the frame
-  /// atomically (serialised by send_mutex_), and returns the Future.
-  /// The frame is built with the allocated sync_id baked in.
+  /// Core pipelining primitive: registers a pending entry, stages the encoded
+  /// frame, and either flushes it immediately (if this coroutine wins the CAS
+  /// for the flush role) or lets a concurrent flusher carry it along.  The
+  /// returned Future resolves once the reader task delivers the response.
   engine::Future<ExecutionResult> SendAndRegister(engine::Deadline deadline,
                                                   uint32_t request_type,
                                                   std::vector<uint8_t> body);
@@ -77,8 +79,16 @@ class Connection final {
 
   engine::io::Socket socket_;
 
-  /// Serialises concurrent frame writes.
-  engine::Mutex send_mutex_;
+  // ---- Send-side batching ------------------------------------------------
+  // Each sender appends its encoded frame to staging_buf_ under staging_mutex_
+  // and then races for the flush role via a CAS on flush_in_progress_.
+  // The winner drains staging_buf_ and sends all accumulated frames in a single
+  // SendAll call; losers return immediately and their frames are carried along.
+  // This coalesces N concurrent sends into ~1 syscall instead of N.
+  engine::Mutex staging_mutex_;
+  std::vector<uint8_t> staging_buf_;
+  std::atomic<bool> flush_in_progress_{false};
+
   /// Guards the pending_ map.
   engine::Mutex pending_mutex_;
   /// In-flight requests: sync_id → promise waiting for the response.
