@@ -576,6 +576,11 @@ ExecutionResult Connection::Execute(engine::Deadline deadline,
 
 // ---- Ping ----
 
+engine::Future<ExecutionResult> Connection::PingAsync(engine::Deadline deadline) {
+    std::vector<uint8_t> body;
+    return SendAndRegister(deadline, kIprotoPing, std::move(body));
+}
+
 void Connection::Ping(engine::Deadline deadline) {
     std::vector<uint8_t> body;  // empty body for ping
     auto future = SendAndRegister(deadline, kIprotoPing, body);

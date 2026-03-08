@@ -48,6 +48,10 @@ class Connection final {
   engine::Future<ExecutionResult> ExecuteAsync(engine::Deadline deadline,
                                                const Query& query);
 
+  /// Asynchronous ping: sends IPROTO_PING and returns a Future resolved when
+  /// the empty response arrives.  Pool slot may be released before wait_until.
+  engine::Future<ExecutionResult> PingAsync(engine::Deadline deadline);
+
   void Ping(engine::Deadline deadline);
 
   bool IsBroken() const noexcept {

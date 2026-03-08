@@ -27,6 +27,10 @@ class Pool final {
 
     ExecutionResult Execute(OptionalCommandControl cc, const Query& query);
 
+    /// Send an IPROTO PING and wait for the empty response.
+    /// Useful for latency/throughput benchmarking without any server-side work.
+    void Ping(OptionalCommandControl cc = std::nullopt);
+
     void WriteStatistics(utils::statistics::Writer& writer) const;
 
     bool IsAvailable() const;

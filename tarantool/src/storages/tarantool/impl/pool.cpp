@@ -92,6 +92,31 @@ ExecutionResult Pool::Execute(OptionalCommandControl cc, const Query& query) {
     }
 }
 
+void Pool::Ping(OptionalCommandControl cc) {
+    const engine::Deadline deadline =
+        cc ? engine::Deadline::FromDuration(cc->execute)
+           : engine::Deadline::FromDuration(impl_->GetSettings().queue_timeout);
+
+    // Same pipelining pattern as Execute(): release the pool slot before
+    // waiting for the response so many pings can be in-flight simultaneously.
+    engine::Future<ExecutionResult> fut;
+    {
+        auto conn_ptr = std::make_unique<ConnectionPtr>(impl_->Acquire(deadline));
+        fut = (*conn_ptr)->PingAsync(deadline);
+    }  // conn_ptr destroyed here → pool slot released (pipelining)
+
+    const auto status = fut.wait_until(deadline);
+    if (status == engine::FutureStatus::kTimeout)
+        throw TarantoolException{"ping deadline expired"};
+    if (status != engine::FutureStatus::kReady) {
+        engine::current_task::CancellationPoint();
+        throw TarantoolException{"ping cancelled"};
+    }
+    auto result = fut.get();
+    if (!result.IsOk())
+        throw TarantoolException{"ping returned error"};
+}
+
 void Pool::WriteStatistics(utils::statistics::Writer& writer) const {
     writer.ValueWithLabels(impl_->GetStatistics(),
                            {{"tarantool_instance", impl_->GetHostName()}});

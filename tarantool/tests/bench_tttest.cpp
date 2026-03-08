@@ -95,6 +95,41 @@ void BenchJsonEncode(std::size_t n, const std::string& val) {
     (void)sink;
 }
 
+// ---- ping benchmark (measures pure client+protocol overhead, no server work) -
+
+void BenchPing(const std::string& host, int port,
+               std::size_t pool_size, int concurrency,
+               std::size_t per_coro,
+               clients::dns::Resolver& resolver,
+               const std::string& label) {
+    auto pool = std::make_unique<storages::tarantool::impl::Pool>(
+        resolver, MakePool(host, port, pool_size));
+
+    // Warmup: establish all connections
+    {
+        std::vector<engine::TaskWithResult<void>> warmup_tasks;
+        warmup_tasks.reserve(concurrency);
+        for (int c = 0; c < concurrency; ++c)
+            warmup_tasks.push_back(engine::AsyncNoSpan([&pool] {
+                pool->Ping();
+            }));
+        for (auto& t : warmup_tasks) t.Get();
+    }
+
+    const auto r = Time(std::size_t(concurrency) * per_coro, [&] {
+        std::vector<engine::TaskWithResult<void>> tasks;
+        tasks.reserve(concurrency);
+        for (int c = 0; c < concurrency; ++c) {
+            tasks.push_back(engine::AsyncNoSpan([&pool, per_coro] {
+                for (std::size_t i = 0; i < per_coro; ++i)
+                    pool->Ping();
+            }));
+        }
+        for (auto& t : tasks) t.Get();
+    });
+    Print(label, r);
+}
+
 // ---- network benchmark -----------------------------------------------------
 
 void BenchPool(const std::string& host, int port,
@@ -169,6 +204,18 @@ TEST(TarantoolBench, InsertThroughput) {
             ::userver::static_config::DnsClient dns_cfg{};
             clients::dns::Resolver resolver{
                 engine::current_task::GetTaskProcessor(), dns_cfg};
+
+            // ── PING: pure protocol RTT, zero server-side work ─────────────
+            // Shows the ceiling imposed by the connector itself.
+            // IPROTO PING (type 64) has an empty body; the server replies with
+            // an empty header instantly — any throughput shortfall vs REPLACE
+            // is purely connector overhead, not server processing time.
+            BenchPing(host, port, 1, 1, kPerCoro, resolver,
+                      "ping        (pool=1,  coro=1)");
+            for (int coro : {4, 8, 16, 32, 64, 128}) {
+                BenchPing(host, port, 4, coro, kPerCoro, resolver,
+                          "ping        (pool=4,  coro=" + std::to_string(coro) + ")");
+            }
 
             // sequential baseline
             BenchPool(host, port, 1, 1, kPerCoro, val32, resolver,
