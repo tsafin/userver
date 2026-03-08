@@ -161,7 +161,7 @@ PoolImpl::ConnectionUniquePtr PoolImpl::DoCreateConnection(
     engine::Deadline deadline) {
     try {
         return std::make_unique<Connection>(resolver_, settings_.endpoint,
-                                           settings_.auth, deadline);
+                                            settings_.auth, deadline);
     } catch (const std::exception&) {
         availability_monitor_.AccountFailure();
         throw;

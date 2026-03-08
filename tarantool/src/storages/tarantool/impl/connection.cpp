@@ -8,6 +8,10 @@
 #include <openssl/sha.h>
 
 #include <userver/clients/dns/resolver.hpp>
+#include <userver/engine/async.hpp>
+#include <userver/engine/exception.hpp>
+#include <userver/engine/future_status.hpp>
+#include <userver/engine/io/exception.hpp>
 #include <userver/engine/io/sockaddr.hpp>
 #include <userver/engine/io/socket.hpp>
 #include <userver/formats/json/value_builder.hpp>
@@ -54,29 +58,26 @@ constexpr uint32_t kKeyTupleOps     = 0x28;
 // IPROTO response keys
 constexpr uint32_t kKeyData         = 0x30;
 constexpr uint32_t kKeyError        = 0x31;
-constexpr uint32_t kKeyErrorStack   = 0x52;
 
 // Greeting constants
-constexpr std::size_t kGreetingSize    = 128;
-constexpr std::size_t kSaltOffset      = 64;
-constexpr std::size_t kSaltLength      = 44;  // base64-encoded, 32 bytes decoded
-constexpr std::size_t kPreheaderSize   = 5;   // 0xce + 4 bytes length
+constexpr std::size_t kGreetingSize  = 128;
+constexpr std::size_t kSaltOffset    = 64;
+constexpr std::size_t kSaltLength    = 44;  // base64-encoded, 32 bytes decoded
+constexpr std::size_t kPreheaderSize = 5;   // 0xce + 4 bytes length
 
 // ---- IPROTO frame builder ----
 
-// Prepend the 5-byte IPROTO length prefix (0xce + big-endian uint32)
 void BuildHeader(std::vector<uint8_t>& out, uint32_t request_type,
                  uint64_t sync) {
     EncodeFixMap(out, 2);
-    EncodeUint(out, kKeyCode);   EncodeUint(out, request_type);
-    EncodeUint(out, kKeySync);   EncodeUint(out, sync);
+    EncodeUint(out, kKeyCode);  EncodeUint(out, request_type);
+    EncodeUint(out, kKeySync);  EncodeUint(out, sync);
 }
 
 std::vector<uint8_t> BuildFrame(uint32_t request_type, uint64_t sync,
                                 const std::vector<uint8_t>& body) {
     std::vector<uint8_t> frame;
     frame.reserve(5 + 20 + body.size());
-    // Reserve 5 bytes for length prefix
     frame.resize(5);
     BuildHeader(frame, request_type, sync);
     frame.insert(frame.end(), body.begin(), body.end());
@@ -129,7 +130,6 @@ std::vector<uint8_t> Base64Decode(std::string_view s) {
 
 std::vector<uint8_t> Scramble(const std::string& password,
                                const std::vector<uint8_t>& salt) {
-    // scramble = SHA1(password) XOR SHA1(salt[0..20] + SHA1(SHA1(password)))
     std::array<uint8_t, 20> hash1;
     SHA1(reinterpret_cast<const uint8_t*>(password.data()),
          password.size(), hash1.data());
@@ -162,7 +162,6 @@ Connection::Connection(clients::dns::Resolver& resolver,
     span.AddTag(tracing::kDatabaseType, "tarantool");
     span.AddTag(tracing::kDatabaseInstance, endpoint.host);
 
-    // Resolve host asynchronously via the userver DNS resolver (non-blocking).
     const auto addrs = resolver.Resolve(endpoint.host, connect_deadline);
 
     std::exception_ptr last_exc;
@@ -185,72 +184,198 @@ Connection::Connection(clients::dns::Resolver& resolver,
                         endpoint.port)};
     }
 
-    // Read 128-byte greeting
-    recv_buf_.resize(kGreetingSize);
-    static_cast<void>(socket_.RecvAll(recv_buf_.data(), kGreetingSize, connect_deadline));
-
-    // Extract salt (bytes 64..107 are base64-encoded)
+    // Read 128-byte greeting (direct, before reader task starts)
+    std::vector<uint8_t> greeting(kGreetingSize);
+    static_cast<void>(socket_.RecvAll(greeting.data(), kGreetingSize,
+                                      connect_deadline));
     const std::string salt_b64{
-        reinterpret_cast<const char*>(recv_buf_.data() + kSaltOffset),
+        reinterpret_cast<const char*>(greeting.data() + kSaltOffset),
         kSaltLength};
-    recv_buf_.clear();
 
     DoAuth(auth, connect_deadline, salt_b64);
+
+    // Start background reader – must be last (after auth completes)
+    reader_task_ = engine::AsyncNoSpan([this] { ReaderLoop(); });
 }
+
+Connection::~Connection() {
+    broken_.store(true, std::memory_order_release);
+    // SyncCancel requests cancellation and blocks until the task finishes.
+    // The reader's socket_.RecvAll() will throw engine::io::IoCancelled,
+    // which triggers WakeAllPending for any in-flight requests.
+    reader_task_.SyncCancel();
+}
+
+// ---- Auth (direct socket reads, called before reader task) ----
 
 void Connection::DoAuth(const AuthSettings& auth,
                         engine::Deadline deadline,
                         const std::string& salt_b64) {
-    if (auth.user.empty() || auth.user == "guest") {
-        // guest user — skip auth
-        return;
-    }
+    if (auth.user.empty() || auth.user == "guest") return;
 
-    auto salt = Base64Decode(salt_b64);
+    auto salt     = Base64Decode(salt_b64);
     auto scramble = Scramble(auth.password, salt);
 
     std::vector<uint8_t> body;
     EncodeFixMap(body, 2);
     EncodeUint(body, kKeyUserName); EncodeStr(body, auth.user);
     EncodeUint(body, kKeyTuple);
-    // CHAP-SHA1 tuple: ["chap-sha1", scramble_bytes]
     EncodeArray(body, 2);
     EncodeStr(body, "chap-sha1");
-    // encode scramble as raw binary (mp bin8)
-    body.push_back(0xc4);  // bin8
+    body.push_back(0xc4);
     body.push_back(static_cast<uint8_t>(scramble.size()));
     body.insert(body.end(), scramble.begin(), scramble.end());
 
-    auto frame = BuildFrame(kIprotoAuth, ++sync_counter_, body);
-    SendAll(frame.data(), frame.size(), deadline);
+    const uint64_t sync_id = ++sync_counter_;
+    auto frame = BuildFrame(kIprotoAuth, sync_id, body);
+    static_cast<void>(socket_.SendAll(frame.data(), frame.size(), deadline));
 
-    // Read response
-    recv_buf_.resize(kPreheaderSize);
-    static_cast<void>(socket_.RecvAll(recv_buf_.data(), kPreheaderSize, deadline));
-    const uint32_t body_len = DecodePreheaderLength(recv_buf_.data());
-    recv_buf_.clear();
-    recv_buf_.resize(body_len);
-    static_cast<void>(socket_.RecvAll(recv_buf_.data(), body_len, deadline));
+    std::vector<uint8_t> prehdr(kPreheaderSize);
+    static_cast<void>(socket_.RecvAll(prehdr.data(), kPreheaderSize, deadline));
+    const uint32_t body_len = DecodePreheaderLength(prehdr.data());
+    std::vector<uint8_t> resp(body_len);
+    static_cast<void>(socket_.RecvAll(resp.data(), body_len, deadline));
 
-    MpDecoder dec{recv_buf_.data(), recv_buf_.data() + body_len};
-    // IPROTO: header map then body map
+    MpDecoder dec{resp.data(), resp.data() + body_len};
     auto header = dec.DecodeValue();
-    recv_buf_.clear();
-
-    // Check response code (header key 0x00 = REQUEST_TYPE, used as status code in response)
-    const auto code = header["0"].As<int64_t>(0);
-    if (code != 0) {
+    if (header["0"].As<int64_t>(0) != 0) {
         throw TarantoolAuthException{"authentication failed"};
     }
 }
 
+// ---- Background reader task ----
+
+void Connection::ReaderLoop() {
+    std::vector<uint8_t> prehdr(kPreheaderSize);
+    try {
+        while (true) {
+            static_cast<void>(
+                socket_.RecvAll(prehdr.data(), kPreheaderSize, {}));
+            const uint32_t body_len = DecodePreheaderLength(prehdr.data());
+
+            std::vector<uint8_t> body(body_len);
+            static_cast<void>(
+                socket_.RecvAll(body.data(), body_len, {}));
+
+            // Parse IPROTO response: header map {code, sync, ...} + body map
+            MpDecoder dec{body.data(), body.data() + body_len};
+            auto header = dec.DecodeValue();
+            const auto sync_id = header["1"].As<uint64_t>(0);
+            const auto code    = header["0"].As<int64_t>(0);
+
+            formats::json::Value data_val{};
+            std::string error_msg;
+            if (code != 0) {
+                if (dec.p < dec.end) {
+                    auto body_map = dec.DecodeValue();
+                    error_msg = body_map["49"].As<std::string>("tarantool error");
+                }
+            } else {
+                if (dec.p < dec.end) {
+                    auto body_map = dec.DecodeValue();
+                    data_val = body_map["48"];
+                }
+            }
+            ExecutionResult result{code == 0,
+                                   static_cast<uint32_t>(
+                                       std::max<int64_t>(0, code)),
+                                   std::move(error_msg),
+                                   std::move(data_val)};
+
+            // Dispatch to the waiting coroutine
+            engine::Promise<ExecutionResult> promise;
+            bool found = false;
+            {
+                std::lock_guard lock(pending_mutex_);
+                auto it = pending_.find(sync_id);
+                if (it != pending_.end()) {
+                    promise = std::move(it->second);
+                    pending_.erase(it);
+                    found = true;
+                }
+            }
+            if (found) {
+                promise.set_value(std::move(result));
+            }
+        }
+    } catch (const engine::io::IoCancelled&) {
+        // Normal shutdown: destructor called reader_task_.SyncCancel()
+        WakeAllPending(std::current_exception());
+    } catch (const engine::TaskCancelledException&) {
+        // Task cancelled via userver task cancellation mechanism
+        WakeAllPending(std::current_exception());
+    } catch (...) {
+        broken_.store(true, std::memory_order_release);
+        WakeAllPending(std::current_exception());
+    }
+}
+
+void Connection::WakeAllPending(std::exception_ptr ex) {
+    std::unordered_map<uint64_t, engine::Promise<ExecutionResult>> pending;
+    {
+        std::lock_guard lock(pending_mutex_);
+        pending = std::move(pending_);
+    }
+    for (auto& [id, p] : pending) {
+        try {
+            p.set_exception(ex);
+        } catch (...) {}
+    }
+}
+
+// ---- Core pipelining primitive ----
+
+engine::Future<ExecutionResult> Connection::SendAndRegister(
+        engine::Deadline deadline,
+        uint32_t request_type,
+        std::vector<uint8_t> body) {
+
+    engine::Promise<ExecutionResult> promise;
+    auto future = promise.get_future();
+
+    const uint64_t sync_id = ++sync_counter_;
+    {
+        std::lock_guard lock(pending_mutex_);
+        pending_.emplace(sync_id, std::move(promise));
+    }
+
+    auto frame = BuildFrame(request_type, sync_id, body);
+
+    {
+        std::lock_guard send_lock(send_mutex_);
+        if (broken_.load(std::memory_order_acquire)) {
+            std::lock_guard plock(pending_mutex_);
+            pending_.erase(sync_id);
+            throw TarantoolException{"connection is broken"};
+        }
+        try {
+            static_cast<void>(
+                socket_.SendAll(frame.data(), frame.size(), deadline));
+        } catch (...) {
+            broken_.store(true, std::memory_order_release);
+            {
+                std::lock_guard plock(pending_mutex_);
+                pending_.erase(sync_id);
+            }
+            // Remaining pending entries will be woken when the reader task
+            // fails to recv and calls WakeAllPending.
+            throw;
+        }
+    }
+
+    return future;
+}
+
+// ---- Space ID resolver ----
+
 uint32_t Connection::ResolveSpaceId(const std::string& space_name,
                                     engine::Deadline deadline) {
-    // Return from cache if already resolved.
-    auto it = space_id_cache_.find(space_name);
-    if (it != space_id_cache_.end()) return it->second;
+    {
+        std::lock_guard lock(space_cache_mutex_);
+        auto it = space_id_cache_.find(space_name);
+        if (it != space_id_cache_.end()) return it->second;
+    }
 
-    // Query _vspace (space_id=281) by name index (index_id=2).
     constexpr uint32_t kVSpaceId = 281;
     constexpr uint32_t kVSpaceNameIndexId = 2;
 
@@ -261,46 +386,40 @@ uint32_t Connection::ResolveSpaceId(const std::string& space_name,
     EncodeUint(body, kKeyLimit);    EncodeUint(body, 1);
     EncodeUint(body, kKeyOffset);   EncodeUint(body, 0);
     EncodeUint(body, kKeyIterator); EncodeUint(body, 0);  // EQ
-    // Key = [space_name]
     EncodeUint(body, kKeyKey);
     EncodeArray(body, 1);
     EncodeStr(body, space_name);
 
-    auto frame = BuildFrame(kIprotoSelect, ++sync_counter_, body);
-    SendAll(frame.data(), frame.size(), deadline);
-
-    recv_buf_.resize(kPreheaderSize);
-    static_cast<void>(socket_.RecvAll(recv_buf_.data(), kPreheaderSize, deadline));
-    const uint32_t body_len = DecodePreheaderLength(recv_buf_.data());
-    recv_buf_.clear();
-    recv_buf_.resize(body_len);
-    static_cast<void>(socket_.RecvAll(recv_buf_.data(), body_len, deadline));
-
-    MpDecoder dec{recv_buf_.data(), recv_buf_.data() + body_len};
-    auto header = dec.DecodeValue();
-    recv_buf_.clear();
-
-    const auto code = header["0"].As<int64_t>(0);
-    if (code != 0) {
+    auto future = SendAndRegister(deadline, kIprotoSelect, body);
+    const auto status = future.wait_until(deadline);
+    if (status != engine::FutureStatus::kReady) {
         throw TarantoolException{
-            fmt::format("failed to resolve space '{}': iproto error {}", space_name, code)};
+            fmt::format("deadline expired resolving space '{}'", space_name)};
     }
 
-    auto body_val = dec.DecodeValue();
-    auto data = body_val["48"];  // kKeyData = 0x30 = 48
+    auto result = future.get();
+    if (!result.IsOk()) {
+        throw TarantoolException{
+            fmt::format("failed to resolve space '{}'", space_name)};
+    }
+    auto data = result.GetData();
     if (!data.IsArray() || data.GetSize() == 0) {
         throw TarantoolException{
             fmt::format("space '{}' not found", space_name)};
     }
-    // Tuple layout: [id, owner, name, engine, field_count, flags, format]
     const auto space_id = data[0][0].As<uint32_t>();
-    space_id_cache_[space_name] = space_id;
+
+    {
+        std::lock_guard lock(space_cache_mutex_);
+        space_id_cache_[space_name] = space_id;
+    }
     return space_id;
 }
 
-ExecutionResult Connection::Execute(engine::Deadline deadline,
-                                    const Query& query) {
-    // Resolve space name to numeric ID for all CRUD operations
+// ---- ExecuteAsync ----
+
+engine::Future<ExecutionResult> Connection::ExecuteAsync(
+        engine::Deadline deadline, const Query& query) {
     uint32_t space_id = 0;
     if (query.GetType() != Query::Type::kCall) {
         space_id = ResolveSpaceId(query.GetSpaceOrFunc(), deadline);
@@ -326,7 +445,7 @@ ExecutionResult Connection::Execute(engine::Deadline deadline,
             EncodeUint(body, kKeyIndexId);   EncodeUint(body, 0);
             EncodeUint(body, kKeyLimit);     EncodeUint(body, query.GetLimit());
             EncodeUint(body, kKeyOffset);    EncodeUint(body, 0);
-            EncodeUint(body, kKeyIterator);  EncodeUint(body, 0);  // EQ
+            EncodeUint(body, kKeyIterator);  EncodeUint(body, 0);
             EncodeUint(body, kKeyKey);       EncodeJson(body, query.GetArgs());
             break;
         }
@@ -371,68 +490,38 @@ ExecutionResult Connection::Execute(engine::Deadline deadline,
         }
     }
 
-    auto frame = BuildFrame(request_type, ++sync_counter_, body);
-    try {
-        SendAll(frame.data(), frame.size(), deadline);
-
-        recv_buf_.resize(kPreheaderSize);
-        static_cast<void>(socket_.RecvAll(recv_buf_.data(), kPreheaderSize, deadline));
-        const uint32_t body_len = DecodePreheaderLength(recv_buf_.data());
-        recv_buf_.clear();
-        recv_buf_.resize(body_len);
-        static_cast<void>(socket_.RecvAll(recv_buf_.data(), body_len, deadline));
-
-        MpDecoder dec{recv_buf_.data(), recv_buf_.data() + body_len};
-        // IPROTO response: header map (contains code), then body map (contains DATA/ERROR)
-        auto header = dec.DecodeValue();
-        recv_buf_.clear();
-
-        const auto code = header["0"].As<int64_t>(0);
-        if (code != 0) {
-            // Decode body for error message
-            formats::json::Value body_val{};
-            if (dec.p < dec.end) {
-                body_val = dec.DecodeValue();
-            }
-            const auto msg = body_val["49"].As<std::string>("tarantool error");
-            return ExecutionResult{false, static_cast<uint32_t>(code), msg, {}};
-        }
-        // Decode body for data
-        formats::json::Value body_val{};
-        if (dec.p < dec.end) {
-            body_val = dec.DecodeValue();
-        }
-        auto data = body_val["48"];  // kKeyData = 0x30 = 48
-        return ExecutionResult{true, 0, {}, std::move(data)};
-    } catch (...) {
-        broken_ = true;
-        throw;
-    }
+    return SendAndRegister(deadline, request_type, std::move(body));
 }
+
+// ---- Execute (sync wrapper) ----
+
+ExecutionResult Connection::Execute(engine::Deadline deadline,
+                                    const Query& query) {
+    auto future = ExecuteAsync(deadline, query);
+    const auto status = future.wait_until(deadline);
+    if (status == engine::FutureStatus::kTimeout)
+        throw TarantoolException{"execute deadline expired"};
+    if (status == engine::FutureStatus::kCancelled)
+        throw engine::TaskCancelledException{
+            engine::TaskCancellationReason::kUserRequest};
+    return future.get();
+}
+
+// ---- Ping ----
 
 void Connection::Ping(engine::Deadline deadline) {
     std::vector<uint8_t> body;  // empty body for ping
-    auto frame = BuildFrame(kIprotoPing, ++sync_counter_, body);
-    try {
-        SendAll(frame.data(), frame.size(), deadline);
-        recv_buf_.resize(kPreheaderSize);
-        static_cast<void>(socket_.RecvAll(recv_buf_.data(), kPreheaderSize, deadline));
-        const uint32_t body_len = DecodePreheaderLength(recv_buf_.data());
-        recv_buf_.clear();
-        if (body_len > 0) {
-            recv_buf_.resize(body_len);
-            static_cast<void>(socket_.RecvAll(recv_buf_.data(), body_len, deadline));
-            recv_buf_.clear();
-        }
-    } catch (...) {
-        broken_ = true;
-        throw;
+    auto future = SendAndRegister(deadline, kIprotoPing, body);
+    const auto status = future.wait_until(deadline);
+    if (status != engine::FutureStatus::kReady) {
+        broken_.store(true, std::memory_order_release);
+        throw TarantoolException{"ping timeout or cancelled"};
     }
-}
-
-void Connection::SendAll(const void* buf, std::size_t n,
-                         engine::Deadline deadline) {
-    static_cast<void>(socket_.SendAll(buf, n, deadline));
+    auto result = future.get();
+    if (!result.IsOk()) {
+        broken_.store(true, std::memory_order_release);
+        throw TarantoolException{"ping returned error"};
+    }
 }
 
 }  // namespace storages::tarantool::impl
