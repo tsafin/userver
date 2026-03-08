@@ -1,17 +1,13 @@
 #include "connection.hpp"
 
 #include <array>
-#include <arpa/inet.h>
-#include <cstdio>
 #include <cstring>
-#include <netdb.h>
-#include <netinet/in.h>
 #include <stdexcept>
-#include <sys/socket.h>
 
 #include <fmt/format.h>
 #include <openssl/sha.h>
 
+#include <userver/clients/dns/resolver.hpp>
 #include <userver/engine/io/sockaddr.hpp>
 #include <userver/engine/io/socket.hpp>
 #include <userver/formats/json/value_builder.hpp>
@@ -98,16 +94,20 @@ std::vector<uint8_t> BuildFrame(uint32_t request_type, uint64_t sync,
 static const char* kBase64Chars =
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
-std::vector<uint8_t> Base64Decode(std::string_view s) {
-    static uint8_t table[256];
-    static bool init = false;
-    if (!init) {
-        std::memset(table, 0xFF, sizeof(table));
+const std::array<uint8_t, 256>& GetBase64Table() {
+    static const auto kTable = [] {
+        std::array<uint8_t, 256> t;
+        t.fill(0xFF);
         for (int i = 0; i < 64; ++i)
-            table[static_cast<uint8_t>(kBase64Chars[i])] = static_cast<uint8_t>(i);
-        table[static_cast<uint8_t>('=')] = 0;
-        init = true;
-    }
+            t[static_cast<uint8_t>(kBase64Chars[i])] = static_cast<uint8_t>(i);
+        t[static_cast<uint8_t>('=')] = 0;
+        return t;
+    }();
+    return kTable;
+}
+
+std::vector<uint8_t> Base64Decode(std::string_view s) {
+    const auto& table = GetBase64Table();
     std::vector<uint8_t> out;
     out.reserve(s.size() * 3 / 4);
     uint32_t val = 0;
@@ -154,30 +154,20 @@ std::vector<uint8_t> Scramble(const std::string& password,
 
 // ---- Connection implementation ----
 
-Connection::Connection(const EndpointSettings& endpoint,
+Connection::Connection(clients::dns::Resolver& resolver,
+                       const EndpointSettings& endpoint,
                        const AuthSettings& auth,
                        engine::Deadline connect_deadline) {
     tracing::Span span{scopes::kConnect};
     span.AddTag(tracing::kDatabaseType, "tarantool");
     span.AddTag(tracing::kDatabaseInstance, endpoint.host);
 
-    // Resolve host synchronously (blocking) and connect
-    struct addrinfo hints {};
-    hints.ai_family = AF_INET;
-    hints.ai_socktype = SOCK_STREAM;
-    struct addrinfo* result = nullptr;
-    const auto port_str = std::to_string(endpoint.port);
-    const int rc = ::getaddrinfo(endpoint.host.c_str(), port_str.c_str(),
-                                 &hints, &result);
-    if (rc != 0) {
-        throw TarantoolException{
-            fmt::format("getaddrinfo failed for {}:{} - {}", endpoint.host,
-                        endpoint.port, ::gai_strerror(rc))};
-    }
-    struct addrinfo* rp = result;
+    // Resolve host asynchronously via the userver DNS resolver (non-blocking).
+    const auto addrs = resolver.Resolve(endpoint.host, connect_deadline);
+
     std::exception_ptr last_exc;
-    for (; rp != nullptr; rp = rp->ai_next) {
-        engine::io::Sockaddr addr{rp->ai_addr};
+    for (auto addr : addrs) {
+        addr.SetPort(endpoint.port);
         engine::io::Socket sock{addr.Domain(),
                                 engine::io::SocketType::kStream};
         try {
@@ -188,7 +178,6 @@ Connection::Connection(const EndpointSettings& endpoint,
             last_exc = std::current_exception();
         }
     }
-    ::freeaddrinfo(result);
     if (socket_.Fd() == -1) {
         if (last_exc) std::rethrow_exception(last_exc);
         throw TarantoolException{
@@ -444,12 +433,6 @@ void Connection::Ping(engine::Deadline deadline) {
 void Connection::SendAll(const void* buf, std::size_t n,
                          engine::Deadline deadline) {
     static_cast<void>(socket_.SendAll(buf, n, deadline));
-}
-
-void Connection::RecvExact(std::size_t n, engine::Deadline deadline) {
-    const std::size_t offset = recv_buf_.size();
-    recv_buf_.resize(offset + n);
-    static_cast<void>(socket_.RecvAll(recv_buf_.data() + offset, n, deadline));
 }
 
 }  // namespace storages::tarantool::impl

@@ -3,6 +3,7 @@
 #include <atomic>
 #include <memory>
 
+#include <userver/clients/dns/resolver_fwd.hpp>
 #include <userver/drivers/impl/connection_pool_base.hpp>
 #include <userver/utils/datetime/steady_coarse_clock.hpp>
 #include <userver/utils/periodic_task.hpp>
@@ -36,7 +37,7 @@ class PoolAvailabilityMonitor {
 class PoolImpl final
     : public drivers::impl::ConnectionPoolBase<Connection, PoolImpl> {
  public:
-    explicit PoolImpl(PoolSettings settings);
+    PoolImpl(clients::dns::Resolver& resolver, PoolSettings settings);
     ~PoolImpl();
 
     bool IsAvailable() const;
@@ -65,6 +66,7 @@ class PoolImpl final
     void StopMaintenance();
     void MaintainConnections();
 
+    clients::dns::Resolver& resolver_;
     PoolSettings settings_;
     stats::PoolStatistics stats_{};
     PoolAvailabilityMonitor availability_monitor_{};

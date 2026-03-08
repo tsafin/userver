@@ -221,10 +221,6 @@ inline void EncodeDateTime(std::vector<uint8_t>& out, const TntDatetime& dt) {
     }
 }
 
-// Forward declaration
-inline void EncodeJson(std::vector<uint8_t>& out,
-                       const formats::json::Value& v);
-
 inline void EncodeJson(std::vector<uint8_t>& out,
                        const formats::json::Value& v) {
     if (v.IsNull()) {

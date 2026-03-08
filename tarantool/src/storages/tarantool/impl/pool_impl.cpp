@@ -1,5 +1,6 @@
 #include "pool_impl.hpp"
 
+#include <userver/clients/dns/resolver.hpp>
 #include <userver/logging/log.hpp>
 #include <userver/utils/assert.hpp>
 
@@ -37,9 +38,10 @@ void PoolAvailabilityMonitor::AccountFailure() noexcept {
     last_failure_ = Clock::now();
 }
 
-PoolImpl::PoolImpl(PoolSettings settings)
+PoolImpl::PoolImpl(clients::dns::Resolver& resolver, PoolSettings settings)
     : drivers::impl::ConnectionPoolBase<Connection, PoolImpl>{
           settings.max_pool_size, kMaxSimultaneouslyConnecting},
+      resolver_{resolver},
       settings_{std::move(settings)} {
     try {
         Init(settings_.initial_pool_size, settings_.connect_timeout);
@@ -158,8 +160,8 @@ void PoolImpl::AccountOverload() {
 PoolImpl::ConnectionUniquePtr PoolImpl::DoCreateConnection(
     engine::Deadline deadline) {
     try {
-        return std::make_unique<Connection>(settings_.endpoint, settings_.auth,
-                                           deadline);
+        return std::make_unique<Connection>(resolver_, settings_.endpoint,
+                                           settings_.auth, deadline);
     } catch (const std::exception&) {
         availability_monitor_.AccountFailure();
         throw;
