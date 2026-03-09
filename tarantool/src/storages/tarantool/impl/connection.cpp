@@ -16,6 +16,7 @@
 #include <userver/engine/io/exception.hpp>
 #include <userver/engine/io/sockaddr.hpp>
 #include <userver/engine/io/socket.hpp>
+#include <userver/engine/sleep.hpp>
 #include <userver/formats/json/value_builder.hpp>
 #include <userver/logging/log.hpp>
 #include <userver/tracing/span.hpp>
@@ -199,15 +200,20 @@ Connection::Connection(clients::dns::Resolver& resolver,
 
     DoAuth(auth, connect_deadline, salt_b64);
 
-    // Start background reader – must be last (after auth completes)
+    // Start flush + reader background tasks – must be last (after auth).
+    flush_task_ = engine::AsyncNoSpan([this] { FlushLoop(); });
     reader_task_ = engine::AsyncNoSpan([this] { ReaderLoop(); });
 }
 
 Connection::~Connection() {
     broken_.store(true, std::memory_order_release);
+    // Wake the flush task in case it is sleeping in WaitForEvent(), so it
+    // can notice cancellation promptly rather than waiting for the next Send().
+    flush_event_.Send();
     // SyncCancel requests cancellation and blocks until the task finishes.
-    // The reader's socket_.RecvAll() will throw engine::io::IoCancelled,
-    // which triggers WakeAllPending for any in-flight requests.
+    flush_task_.SyncCancel();
+    // reader_task_ RecvSome() will throw engine::io::IoCancelled, which
+    // triggers WakeAllPending for any in-flight requests.
     reader_task_.SyncCancel();
 }
 
@@ -357,10 +363,57 @@ void Connection::WakeAllPending(std::exception_ptr ex) {
     }
 }
 
+// ---- Flush coroutine ----
+
+void Connection::FlushLoop() {
+    // WaitForEvent() returns false when the task is cancelled (normal shutdown).
+    while (flush_event_.WaitForEvent()) {
+        // Yield once: all concurrent senders that have already staged their frame
+        // and called flush_event_.Send() will continue executing (they return the
+        // future and then yield at wait_until()).  By the time we resume, every
+        // same-scheduler-slice sender has its frame in staging_buf_, so the
+        // subsequent SendAll coalesces the entire batch into one syscall —
+        // the same "batch-everything-then-flush" model as Tarantool net.box.
+        engine::Yield();
+
+        // Inner drain loop: keep sending until staging_buf_ is empty.
+        // New frames arriving during SendAll call flush_event_.Send() again;
+        // those will be picked up by the next outer-loop iteration.
+        for (;;) {
+            std::vector<uint8_t> to_send;
+            {
+                std::lock_guard lock(staging_mutex_);
+                if (staging_buf_.empty()) break;
+                to_send = std::move(staging_buf_);
+            }
+
+            if (broken_.load(std::memory_order_acquire)) {
+                WakeAllPending(std::make_exception_ptr(
+                    TarantoolException{"connection is broken"}));
+                return;
+            }
+
+            try {
+                // Use default (unreachable) deadline: individual request deadlines are
+                // enforced by the caller's wait_until(); the flush task itself
+                // has no per-request deadline.
+                socket_.SendAll(to_send.data(), to_send.size(), engine::Deadline{});
+            } catch (const engine::TaskCancelledException&) {
+                return;
+            } catch (...) {
+                broken_.store(true, std::memory_order_release);
+                WakeAllPending(std::current_exception());
+                return;
+            }
+        }
+    }
+    // Task was cancelled (normal shutdown path).
+}
+
 // ---- Core pipelining primitive ----
 
 engine::Future<ExecutionResult> Connection::SendAndRegister(
-        engine::Deadline deadline,
+        engine::Deadline /*deadline*/,
         uint32_t request_type,
         std::vector<uint8_t> body) {
 
@@ -375,60 +428,13 @@ engine::Future<ExecutionResult> Connection::SendAndRegister(
 
     auto frame = BuildFrame(request_type, sync_id, body);
 
-    // Stage the encoded frame for batch-flushing.
+    // Stage the encoded frame; the flush coroutine sends it after coalescing
+    // with frames from all other concurrent callers.
     {
         std::lock_guard lock(staging_mutex_);
         staging_buf_.insert(staging_buf_.end(), frame.begin(), frame.end());
     }
-
-    // Race for the flush role: only the winner calls SendAll.
-    // All other coroutines return immediately; the winner carries their frames.
-    bool expected = false;
-    if (!flush_in_progress_.compare_exchange_strong(
-            expected, true,
-            std::memory_order_acquire, std::memory_order_relaxed)) {
-        return future;
-    }
-
-    // We are the flush winner.  Drain staging_buf_ and send in a loop so
-    // frames pushed by concurrent coroutines *while* we were in SendAll are
-    // also picked up without a second round of flushing.
-    while (true) {
-        std::vector<uint8_t> to_send;
-        {
-            std::lock_guard lock(staging_mutex_);
-            if (staging_buf_.empty()) {
-                // Release the flush role while holding staging_mutex_ to close
-                // the TOCTOU window between the empty-check and the CAS store.
-                flush_in_progress_.store(false, std::memory_order_release);
-                break;
-            }
-            to_send = std::move(staging_buf_);
-        }
-
-        if (broken_.load(std::memory_order_acquire)) {
-            {
-                std::lock_guard lock(staging_mutex_);
-                flush_in_progress_.store(false, std::memory_order_release);
-            }
-            WakeAllPending(std::make_exception_ptr(
-                TarantoolException{"connection is broken"}));
-            break;
-        }
-
-        try {
-            socket_.SendAll(to_send.data(), to_send.size(), deadline);
-        } catch (...) {
-            broken_.store(true, std::memory_order_release);
-            {
-                std::lock_guard lock(staging_mutex_);
-                flush_in_progress_.store(false, std::memory_order_release);
-            }
-            WakeAllPending(std::current_exception());
-            break;
-        }
-        // Loop: pick up any frames staged while we were in SendAll.
-    }
+    flush_event_.Send();  // Signal the flush coroutine (non-blocking, multi-producer safe)
 
     return future;
 }

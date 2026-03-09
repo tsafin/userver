@@ -11,6 +11,7 @@
 #include <userver/engine/future.hpp>
 #include <userver/engine/io/socket.hpp>
 #include <userver/engine/mutex.hpp>
+#include <userver/engine/single_consumer_event.hpp>
 #include <userver/engine/task/task_with_result.hpp>
 
 #include <userver/storages/tarantool/options.hpp>
@@ -74,6 +75,8 @@ class Connection final {
                                                   uint32_t request_type,
                                                   std::vector<uint8_t> body);
 
+  void FlushLoop();
+
   /// Background loop – runs for the lifetime of the connection and dispatches
   /// every incoming IPROTO frame to the waiting coroutine via its Promise.
   void ReaderLoop();
@@ -83,20 +86,25 @@ class Connection final {
 
   engine::io::Socket socket_;
 
-  // ---- Send-side batching ------------------------------------------------
+  // ---- Send-side batching (flush coroutine) --------------------------------
   // Each sender appends its encoded frame to staging_buf_ under staging_mutex_
-  // and then races for the flush role via a CAS on flush_in_progress_.
-  // The winner drains staging_buf_ and sends all accumulated frames in a single
-  // SendAll call; losers return immediately and their frames are carried along.
-  // This coalesces N concurrent sends into ~1 syscall instead of N.
+  // and signals flush_event_.  The dedicated flush_task_ coroutine waits on
+  // that event, calls engine::Yield() once to let all concurrent senders
+  // finish staging their frames, then drains the entire buffer and sends it in
+  // a single SendAll call.  This coalesces N concurrent sends into ~1 syscall
+  // (same "batch everything then send" model as Tarantool net.box).
   engine::Mutex staging_mutex_;
   std::vector<uint8_t> staging_buf_;
-  std::atomic<bool> flush_in_progress_{false};
+  engine::SingleConsumerEvent flush_event_;
 
   /// Guards the pending_ map.
   engine::Mutex pending_mutex_;
   /// In-flight requests: sync_id → promise waiting for the response.
   std::unordered_map<uint64_t, engine::Promise<ExecutionResult>> pending_;
+
+  /// Background flush task: drains staging_buf_ and sends to socket.
+  /// Declared before reader_task_ so it is SyncCancel'd first in ~Connection.
+  engine::TaskWithResult<void> flush_task_;
 
   /// Background reader task started at the end of the constructor.
   engine::TaskWithResult<void> reader_task_;
