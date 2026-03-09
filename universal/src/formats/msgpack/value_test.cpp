@@ -1,4 +1,5 @@
 #include <userver/formats/msgpack/serialize.hpp>
+#include <userver/formats/msgpack/serialize_tarantool.hpp>
 #include <userver/formats/msgpack/value.hpp>
 #include <userver/formats/msgpack/value_builder.hpp>
 #include <userver/formats/msgpack/tarantool_types.hpp>
@@ -493,6 +494,49 @@ TEST(MsgpackValue, DecimalString) {
     EXPECT_TRUE(val.IsDecimal());
     EXPECT_FALSE(val.IsUuid());
     EXPECT_EQ(val.AsDecimalString(), "-12.34");
+}
+
+// ======================================================================== //
+//  ADL Parse hooks (serialize_tarantool.hpp)                               //
+// ======================================================================== //
+
+TEST(MsgpackADL, ParseUuid) {
+    // fixext16, type=2, 16 zero bytes
+    std::vector<uint8_t> bytes(18, 0);
+    bytes[0] = 0xd8; bytes[1] = 0x02;
+    auto v = Value::FromBytes(bytes.data(), bytes.size());
+    // ADL hook: Parse(v, To<TntUuid>{}) → v.AsUuid()
+    const TntUuid uuid = Parse(v, formats::parse::To<TntUuid>{});
+    EXPECT_EQ(uuid, TntUuid{});
+}
+
+TEST(MsgpackADL, ParseTimestampTz) {
+    // fixext8, type=4, seconds=100 LE
+    std::vector<uint8_t> bytes(10, 0);
+    bytes[0] = 0xd7; bytes[1] = 0x04;
+    bytes[2] = 100;  // seconds = 100 (LE)
+    auto v = Value::FromBytes(bytes.data(), bytes.size());
+    const TimestampTz ts = Parse(v, formats::parse::To<TimestampTz>{});
+    EXPECT_EQ(ts.tp.time_since_epoch().count(), int64_t{100} * 1'000'000'000LL);
+}
+
+TEST(MsgpackADL, SerializeUuid) {
+    TntUuid uuid{};
+    uuid.bytes[0] = 0x12; uuid.bytes[1] = 0x34;
+    // ADL Serialize hook: Serialize(uuid, To<ValueBuilder>{}) → ValueBuilder(uuid)
+    ValueBuilder b = Serialize(uuid, formats::serialize::To<ValueBuilder>{});
+    const auto bytes = b.ToBytes();
+    auto v = Value::FromBytes(bytes.data(), bytes.size());
+    EXPECT_TRUE(v.IsUuid());
+    EXPECT_EQ(v.AsUuid(), uuid);
+}
+
+TEST(MsgpackADL, ParseScalarsViaADL) {
+    // int64_t via ADL Parse
+    const uint8_t buf[] = {0x2a};  // fixint 42
+    auto v = Value::FromBytes(buf, sizeof(buf));
+    EXPECT_EQ(Parse(v, formats::parse::To<int64_t>{}), 42);
+    EXPECT_EQ(Parse(v, formats::parse::To<uint32_t>{}), 42u);
 }
 
 USERVER_NAMESPACE_END

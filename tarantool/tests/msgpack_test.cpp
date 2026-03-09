@@ -577,4 +577,87 @@ TEST(StructuredError, EmptyInfoOnMissingKey) {
     EXPECT_TRUE(ext_err.IsMissing());
 }
 
+// ============================================================================
+// JSON fallback path for MpDecoder::DecodeExt — Phase D
+// (These test the MsgPackDecode / RoundTrip path which returns JSON values)
+// ============================================================================
+
+// Build a Decimal (ext type 1) encoding for "12.34":
+//   scale=2, BCD digits [0,1,2,3,4] (leading zero) + positive sign (0x0C)
+//   → bytes 0x01, 0x23, 0x4C  (3 BCD bytes + 1 scale byte = 4 data bytes)
+//   Use fixext4 (0xd6): 4 data bytes after type byte.
+static std::vector<uint8_t> MakeDecimalExt() {
+    return {0xd6, 0x01,  // fixext4, type=kExtDecimal
+            0x02,        // scale = 2
+            0x01,        // BCD 0, 1
+            0x23,        // BCD 2, 3
+            0x4c};       // BCD digit 4, sign 0x0C = positive
+}
+
+TEST(MsgPackDecodeExt, DecimalDecodesToString) {
+    auto v = MsgPackDecode(MakeDecimalExt());
+    // Value should be the decimal string "12.34"
+    EXPECT_FALSE(v.IsNull());
+    EXPECT_EQ(v.As<std::string>(), "12.34");
+}
+
+// Build an interval ext (type 6) with day=1, hour=2
+static std::vector<uint8_t> MakeIntervalExt() {
+    std::vector<uint8_t> buf;
+    using namespace storages::tarantool::impl;
+    // Interval ext: ext8 format (variable length)
+    // We'll build the data bytes first
+    std::vector<uint8_t> data;
+    // count = 2 (two non-zero fields: day=3, hour=4)
+    data.push_back(0x02);           // count = 2
+    data.push_back(0x03);           // field_id = 3 (day)
+    data.push_back(0x01);           // value = 1
+    data.push_back(0x04);           // field_id = 4 (hour)
+    data.push_back(0x02);           // value = 2
+
+    // Encode as ext8: 0xc7, len, type
+    buf.push_back(0xc7);
+    buf.push_back(static_cast<uint8_t>(data.size()));
+    buf.push_back(0x06);  // kExtInterval
+    buf.insert(buf.end(), data.begin(), data.end());
+    return buf;
+}
+
+TEST(MsgPackDecodeExt, IntervalDecodesToJsonObject) {
+    auto v = MsgPackDecode(MakeIntervalExt());
+    // Should be a JSON object with named fields
+    EXPECT_FALSE(v.IsNull());
+    EXPECT_TRUE(v.IsObject());
+    EXPECT_EQ(v["day"].As<int64_t>(),  1);
+    EXPECT_EQ(v["hour"].As<int64_t>(), 2);
+    EXPECT_EQ(v["year"].As<int64_t>(), 0);  // unset fields default to 0
+}
+
+// Build an error ext (type 3) with a single frame
+static std::vector<uint8_t> MakeErrorExt() {
+    std::vector<uint8_t> inner;
+    using namespace storages::tarantool::impl;
+    // {0x00: [{0x03:"disk error"}]}
+    EncodeFixMap(inner, 1);
+    EncodeUint(inner, 0x00);  // ERROR_STACK key
+    EncodeArray(inner, 1);
+    EncodeFixMap(inner, 1);
+    EncodeUint(inner, 0x03);  // kErrMessage
+    EncodeStr(inner, "disk error");
+
+    std::vector<uint8_t> buf;
+    buf.push_back(0xc7);
+    buf.push_back(static_cast<uint8_t>(inner.size()));
+    buf.push_back(0x03);  // kExtError
+    buf.insert(buf.end(), inner.begin(), inner.end());
+    return buf;
+}
+
+TEST(MsgPackDecodeExt, ErrorDecodesToJsonObject) {
+    auto v = MsgPackDecode(MakeErrorExt());
+    EXPECT_FALSE(v.IsNull());
+    // Should be the decoded inner map: {"0": [{"3":"disk error"}]}
+    EXPECT_TRUE(v.IsObject());
+}
+
 USERVER_NAMESPACE_END

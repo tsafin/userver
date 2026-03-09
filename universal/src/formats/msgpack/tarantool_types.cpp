@@ -287,4 +287,93 @@ DatetimeRaw DecodeExt4Bytes(const uint8_t* data, uint32_t len) {
 
 }  // namespace formats::msgpack
 
+// ---- DecodeDecimalBytes -------------------------------------------------------
+
+namespace formats::msgpack {
+
+std::string DecodeDecimalBytes(const uint8_t* data, uint32_t len) {
+    const uint8_t* p   = data;
+    const uint8_t* end = data + len;
+
+    if (p >= end) throw ParseException{"Decimal: empty ext data"};
+
+    // Read scale as msgpack uint/int (big-endian, per Tarantool spec)
+    int64_t scale = 0;
+    {
+        const uint8_t b = *p++;
+        if (b <= 0x7f) {
+            scale = static_cast<int64_t>(b);
+        } else if (b == 0xcc) {
+            if (p >= end) throw ParseException{"Decimal: truncated scale"};
+            scale = static_cast<int64_t>(*p++);
+        } else if (b == 0xcd) {
+            if (p + 2 > end) throw ParseException{"Decimal: truncated scale"};
+            scale = static_cast<int64_t>(
+                (static_cast<uint16_t>(p[0]) << 8) | p[1]);
+            p += 2;
+        } else if (b == 0xd0) {
+            if (p >= end) throw ParseException{"Decimal: truncated scale"};
+            scale = static_cast<int64_t>(static_cast<int8_t>(*p++));
+        } else if (b == 0xd1) {
+            if (p + 2 > end) throw ParseException{"Decimal: truncated scale"};
+            scale = static_cast<int64_t>(static_cast<int16_t>(
+                (static_cast<uint16_t>(p[0]) << 8) | p[1]));
+            p += 2;
+        } else {
+            throw ParseException{fmt::format(
+                "Decimal: unexpected scale byte 0x{:02x}", b)};
+        }
+    }
+
+    // Parse BCD nibbles; last nibble is sign
+    std::vector<uint8_t> digits;
+    bool negative = false;
+
+    while (p < end) {
+        const uint8_t byte = *p++;
+        const uint8_t hi   = (byte >> 4) & 0x0f;
+        const uint8_t lo   = byte & 0x0f;
+
+        if (p >= end) {
+            // Last byte: lo nibble is sign
+            digits.push_back(hi);
+            negative = (lo == 0x0b || lo == 0x0d);
+        } else {
+            digits.push_back(hi);
+            digits.push_back(lo);
+        }
+    }
+
+    if (digits.empty()) return "0";
+
+    // Build decimal string
+    std::string all;
+    all.reserve(digits.size());
+    for (auto d : digits) all += static_cast<char>('0' + d);
+
+    std::string result;
+    const auto all_len = static_cast<int64_t>(all.size());
+
+    if (scale <= 0) {
+        const std::size_t nz = all.find_first_not_of('0');
+        result = (nz == std::string::npos) ? "0" : all.substr(nz);
+        if (scale < 0) result += std::string(static_cast<std::size_t>(-scale), '0');
+    } else if (scale >= all_len) {
+        result = "0.";
+        result += std::string(static_cast<std::size_t>(scale - all_len), '0');
+        result += all;
+    } else {
+        const std::size_t dot_pos = static_cast<std::size_t>(all_len - scale);
+        std::string int_part  = all.substr(0, dot_pos);
+        const std::string frac_part = all.substr(dot_pos);
+        const std::size_t nz = int_part.find_first_not_of('0');
+        int_part = (nz == std::string::npos) ? "0" : int_part.substr(nz);
+        result = int_part + "." + frac_part;
+    }
+
+    if (negative && result != "0") result = "-" + result;
+    return result;
+}
+
+}  // namespace formats::msgpack
 USERVER_NAMESPACE_END

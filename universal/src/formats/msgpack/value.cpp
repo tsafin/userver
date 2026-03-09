@@ -8,6 +8,7 @@
 #include <fmt/format.h>
 
 #include <userver/formats/msgpack/tarantool_types.hpp>
+#include <userver/formats/parse/to.hpp>
 #include <userver/utils/datetime/date.hpp>
 
 USERVER_NAMESPACE_BEGIN
@@ -981,87 +982,9 @@ std::string Value::AsDecimalString() const {
     CheckNotMissing();
     if (!IsDecimal()) ThrowTypeMismatch(kTypeExt);
     const auto sv = GetExtData();
-    const auto* p   = reinterpret_cast<const uint8_t*>(sv.data());
-    const auto* end = p + sv.size();
-
-    if (p >= end) throw ParseException{"Decimal: empty ext data"};
-
-    // Read scale as msgpack uint/int
-    int64_t scale = 0;
-    {
-        const uint8_t b = *p++;
-        if (b <= 0x7f) {
-            scale = static_cast<int64_t>(b);
-        } else if (b == 0xcc) {
-            if (p >= end) throw ParseException{"Decimal: truncated scale"};
-            scale = static_cast<int64_t>(*p++);
-        } else if (b == 0xcd) {
-            if (p + 2 > end) throw ParseException{"Decimal: truncated scale"};
-            scale = static_cast<int64_t>(
-                (static_cast<uint16_t>(p[0]) << 8) | p[1]);
-            p += 2;
-        } else if (b == 0xd0) {
-            if (p >= end) throw ParseException{"Decimal: truncated scale"};
-            scale = static_cast<int64_t>(static_cast<int8_t>(*p++));
-        } else if (b == 0xd1) {
-            if (p + 2 > end) throw ParseException{"Decimal: truncated scale"};
-            scale = static_cast<int64_t>(static_cast<int16_t>(
-                (static_cast<uint16_t>(p[0]) << 8) | p[1]));
-            p += 2;
-        } else {
-            throw ParseException{fmt::format(
-                "Decimal: unexpected scale byte 0x{:02x}", b)};
-        }
-    }
-
-    // Parse BCD nibbles; last nibble is sign
-    std::vector<uint8_t> digits;  // decimal digit values (0–9)
-    bool negative = false;
-
-    while (p < end) {
-        const uint8_t byte = *p++;
-        const uint8_t hi   = (byte >> 4) & 0x0f;
-        const uint8_t lo   = byte & 0x0f;
-
-        if (p >= end) {
-            // Last byte: lo nibble is sign
-            digits.push_back(hi);
-            negative = (lo == 0x0b || lo == 0x0d);
-        } else {
-            digits.push_back(hi);
-            digits.push_back(lo);
-        }
-    }
-
-    if (digits.empty()) return "0";
-
-    // Build decimal string
-    std::string all;
-    all.reserve(digits.size());
-    for (auto d : digits) all += static_cast<char>('0' + d);
-
-    std::string result;
-    const auto all_len = static_cast<int64_t>(all.size());
-
-    if (scale <= 0) {
-        const std::size_t nz = all.find_first_not_of('0');
-        result = (nz == std::string::npos) ? "0" : all.substr(nz);
-        if (scale < 0) result += std::string(static_cast<std::size_t>(-scale), '0');
-    } else if (scale >= all_len) {
-        result = "0.";
-        result += std::string(static_cast<std::size_t>(scale - all_len), '0');
-        result += all;
-    } else {
-        const std::size_t dot_pos = static_cast<std::size_t>(all_len - scale);
-        std::string int_part  = all.substr(0, dot_pos);
-        const std::string frac_part = all.substr(dot_pos);
-        const std::size_t nz = int_part.find_first_not_of('0');
-        int_part = (nz == std::string::npos) ? "0" : int_part.substr(nz);
-        result = int_part + "." + frac_part;
-    }
-
-    if (negative && result != "0") result = "-" + result;
-    return result;
+    return DecodeDecimalBytes(
+        reinterpret_cast<const uint8_t*>(sv.data()),
+        static_cast<uint32_t>(sv.size()));
 }
 
 // ---- As<T> specialisations for Tarantool types ----------------------------
@@ -1087,6 +1010,22 @@ template <> TntUuid Value::As<TntUuid>() const {
 template <> TntInterval Value::As<TntInterval>() const {
     return AsInterval();
 }
+
+// ---- Parse() friends (non-template ADL hooks for built-in scalar types) ----
+// These thin wrappers call the corresponding As<T>() explicit specialisation.
+
+bool        Parse(const Value& v, formats::parse::To<bool>)        { return v.As<bool>(); }
+int8_t      Parse(const Value& v, formats::parse::To<int8_t>)      { return v.As<int8_t>(); }
+int16_t     Parse(const Value& v, formats::parse::To<int16_t>)     { return v.As<int16_t>(); }
+int32_t     Parse(const Value& v, formats::parse::To<int32_t>)     { return v.As<int32_t>(); }
+int64_t     Parse(const Value& v, formats::parse::To<int64_t>)     { return v.As<int64_t>(); }
+uint8_t     Parse(const Value& v, formats::parse::To<uint8_t>)     { return v.As<uint8_t>(); }
+uint16_t    Parse(const Value& v, formats::parse::To<uint16_t>)    { return v.As<uint16_t>(); }
+uint32_t    Parse(const Value& v, formats::parse::To<uint32_t>)    { return v.As<uint32_t>(); }
+uint64_t    Parse(const Value& v, formats::parse::To<uint64_t>)    { return v.As<uint64_t>(); }
+float       Parse(const Value& v, formats::parse::To<float>)       { return v.As<float>(); }
+double      Parse(const Value& v, formats::parse::To<double>)      { return v.As<double>(); }
+std::string Parse(const Value& v, formats::parse::To<std::string>) { return v.As<std::string>(); }
 
 }  // namespace formats::msgpack
 

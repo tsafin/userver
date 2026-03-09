@@ -392,6 +392,42 @@ inline formats::json::Value MpDecoder::DecodeExt(uint32_t data_len) {
         obj["tzoffset"]  = static_cast<int64_t>(dt.tzoffset);
         obj["tzindex"]   = static_cast<int64_t>(dt.tzindex);
         return obj.ExtractValue();
+    } else if (ext_type == mp::kExtDecimal) {
+        // Decode BCD decimal → JSON string, e.g. "123.45"
+        if (p + data_len > end)
+            throw TarantoolException{"MsgPack decimal overrun"};
+        const std::string s = formats::msgpack::DecodeDecimalBytes(p, data_len);
+        p += data_len;
+        return formats::json::ValueBuilder{s}.ExtractValue();
+    } else if (ext_type == mp::kExtError) {
+        // Decode the nested msgpack map (structured error stack) as JSON
+        if (p + data_len > end)
+            throw TarantoolException{"MsgPack error overrun"};
+        MpDecoder inner{p, p + data_len};
+        p += data_len;
+        return inner.DecodeValue();
+    } else if (ext_type == mp::kExtInterval) {
+        // Decode packed interval → JSON object with field names
+        if (p + data_len > end)
+            throw TarantoolException{"MsgPack interval overrun"};
+        const uint8_t* iend = p + data_len;
+        MpDecoder inner{p, iend};
+        p = iend;
+
+        const uint64_t count = static_cast<uint64_t>(
+            inner.DecodeValue().As<int64_t>(0));
+        static constexpr const char* kFields[] = {
+            "year","month","week","day","hour","minute","second","nanosecond","adjust"
+        };
+        formats::json::ValueBuilder obj(formats::json::Type::kObject);
+        for (const auto* n : kFields) obj[n] = int64_t{0};
+        for (uint64_t i = 0; i < count; ++i) {
+            const auto field_id = static_cast<uint64_t>(
+                inner.DecodeValue().As<int64_t>(0));
+            const int64_t val = inner.DecodeValue().As<int64_t>(0);
+            if (field_id < 9) obj[kFields[field_id]] = val;
+        }
+        return obj.ExtractValue();
     } else {
         // Unknown ext: skip data and return nil
         if (p + data_len > end) throw TarantoolException{"MsgPack ext overrun"};

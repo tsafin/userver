@@ -151,6 +151,7 @@ std::vector<uint8_t> EncodeInterval(const TntInterval& iv);
 
 // Decode helpers (defined in tarantool_types.cpp).
 DatetimeRaw DecodeExt4Bytes(const uint8_t* data, uint32_t len);
+std::string DecodeDecimalBytes(const uint8_t* data, uint32_t len);
 
 }  // namespace formats::msgpack
 

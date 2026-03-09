@@ -11,6 +11,7 @@
 
 #include <userver/formats/msgpack/exception.hpp>
 #include <userver/formats/msgpack/tarantool_types.hpp>
+#include <userver/formats/parse/to.hpp>
 #include <userver/utils/datetime/date.hpp>
 
 USERVER_NAMESPACE_BEGIN
@@ -108,11 +109,40 @@ public:
     // ------------------------------------------------------------------ //
 
     /// @brief Converts the value to T.
+    ///
+    /// For built-in types (bool, int, double, string) explicit specialisations
+    /// defined in value.cpp are used.  For Tarantool ext types include
+    /// `<userver/formats/msgpack/serialize_tarantool.hpp>` to enable the ADL
+    /// `Parse()` hooks; for user-defined types, provide a
+    /// `Parse(const Value&, formats::parse::To<T>)` function.
+    ///
     /// @throw MemberMissingException  if IsMissing().
     /// @throw TypeMismatchException   if the type doesn't fit.
     /// @throw ConversionException     for numeric overflow / encoding errors.
     template <typename T>
-    T As() const;
+    T As() const {
+        return Parse(*this, formats::parse::To<T>{});
+    }
+
+private:
+    // Non-template friend declarations make `Parse` a known name for
+    // phase-1 lookup inside As<T>(), enabling ADL at instantiation time
+    // for the generic template version (containers, user types, etc.).
+    // Each friend is defined in value.cpp.
+    friend bool        Parse(const Value&, formats::parse::To<bool>);
+    friend int8_t      Parse(const Value&, formats::parse::To<int8_t>);
+    friend int16_t     Parse(const Value&, formats::parse::To<int16_t>);
+    friend int32_t     Parse(const Value&, formats::parse::To<int32_t>);
+    friend int64_t     Parse(const Value&, formats::parse::To<int64_t>);
+    friend uint8_t     Parse(const Value&, formats::parse::To<uint8_t>);
+    friend uint16_t    Parse(const Value&, formats::parse::To<uint16_t>);
+    friend uint32_t    Parse(const Value&, formats::parse::To<uint32_t>);
+    friend uint64_t    Parse(const Value&, formats::parse::To<uint64_t>);
+    friend float       Parse(const Value&, formats::parse::To<float>);
+    friend double      Parse(const Value&, formats::parse::To<double>);
+    friend std::string Parse(const Value&, formats::parse::To<std::string>);
+
+public:
 
     /// @brief Returns As<T>() or @p default_val on any error (including missing).
     template <typename T>
