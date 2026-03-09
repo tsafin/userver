@@ -1,6 +1,7 @@
 /// @brief Throughput benchmark for the Tarantool userver connector.
 ///
 /// Run: TARANTOOL_HOST=127.0.0.1 TARANTOOL_PORT=3301 ./userver-tarantool_tttest --gtest_filter="TarantoolBench*"
+/// CPU-only benchmarks: ./userver-tarantool_tttest --gtest_filter="TarantoolCpuBench*"
 
 #include <chrono>
 #include <cstdlib>
@@ -15,8 +16,9 @@
 #include <userver/components/component_config.hpp>
 #include <userver/engine/async.hpp>
 #include <userver/engine/run_standalone.hpp>
-#include <userver/formats/json/serialize.hpp>
 #include <userver/formats/json/value_builder.hpp>
+#include <userver/formats/msgpack/value.hpp>
+#include <userver/formats/msgpack/value_builder.hpp>
 #include <userver/formats/yaml/serialize.hpp>
 #include <userver/yaml_config/yaml_config.hpp>
 
@@ -72,26 +74,166 @@ storages::tarantool::impl::PoolSettings MakePool(
     return storages::tarantool::impl::PoolSettings{cfg, ep, {}};
 }
 
-formats::json::Value MakeTuple(uint64_t id, const std::string& val) {
-    formats::json::ValueBuilder b{formats::json::Type::kArray};
-    b.PushBack(id);
-    b.PushBack(val);
-    return b.ExtractValue();
+formats::msgpack::ValueBuilder MakeTuple(uint64_t id, const std::string& val) {
+    auto b = formats::msgpack::ValueBuilder::Array();
+    b.PushBack(formats::msgpack::ValueBuilder{id});
+    b.PushBack(formats::msgpack::ValueBuilder{val});
+    return b;
 }
 
-// ---- micro-benchmark: pure JSON-encode cost --------------------------------
+// ---- Local re-implementation of old JSON→msgpack encode path ---------------
+// (Mirrors the removed EncodeJson to compare against the new ValueBuilder path)
 
-void BenchJsonEncode(std::size_t n, const std::string& val) {
+static void EncodeJsonLocal(std::vector<uint8_t>& out,
+                            const formats::json::Value& v) {
+    using namespace storages::tarantool::impl;
+    if (v.IsNull()) {
+        out.push_back(0xc0);  // nil
+    } else if (v.IsBool()) {
+        out.push_back(v.As<bool>() ? 0xc3 : 0xc2);
+    } else if (v.IsInt64()) {
+        EncodeUint(out, static_cast<uint64_t>(v.As<int64_t>()));
+    } else if (v.IsUInt64()) {
+        EncodeUint(out, v.As<uint64_t>());
+    } else if (v.IsDouble()) {
+        double d = v.As<double>();
+        out.push_back(0xcb);
+        uint64_t bits; std::memcpy(&bits, &d, 8);
+        for (int s = 56; s >= 0; s -= 8) out.push_back(static_cast<uint8_t>(bits >> s));
+    } else if (v.IsString()) {
+        EncodeStr(out, v.As<std::string>());
+    } else if (v.IsArray()) {
+        EncodeArray(out, static_cast<uint32_t>(v.GetSize()));
+        for (const auto& elem : v) EncodeJsonLocal(out, elem);
+    }
+}
+
+// ---- CPU micro-benchmarks: old JSON path vs new ValueBuilder path ----------
+
+void BenchEncodeComparison(std::size_t n, const std::string& val) {
+    using namespace storages::tarantool::impl;
     volatile std::size_t sink = 0;
-    const auto r = Time(n, [&] {
+
+    // --- Old path: build JSON Value, then EncodeJson ---
+    const auto r_old = Time(n, [&] {
         for (std::size_t i = 0; i < n; ++i) {
-            auto v = MakeTuple(i, val);
+            formats::json::ValueBuilder b{formats::json::Type::kArray};
+            b.PushBack(static_cast<int64_t>(i));
+            b.PushBack(val);
+            auto jv = b.ExtractValue();
             std::vector<uint8_t> buf;
-            storages::tarantool::impl::EncodeJson(buf, v);
+            EncodeJsonLocal(buf, jv);
             sink += buf.size();
         }
     });
-    Print("json→msgpack encode only (no network)", r);
+    Print("encode: JSON Value → EncodeJson (OLD)", r_old);
+
+    // --- New path: ValueBuilder → ToBytes ---
+    const auto r_new = Time(n, [&] {
+        for (std::size_t i = 0; i < n; ++i) {
+            auto b = formats::msgpack::ValueBuilder::Array();
+            b.PushBack(formats::msgpack::ValueBuilder{static_cast<uint64_t>(i)});
+            b.PushBack(formats::msgpack::ValueBuilder{val});
+            auto bytes = b.ToBytes();
+            sink += bytes.size();
+        }
+    });
+    Print("encode: ValueBuilder → ToBytes (NEW)", r_new);
+
+    const double speedup = static_cast<double>(r_old.elapsed.count()) /
+                           static_cast<double>(r_new.elapsed.count());
+    std::cout << "  speedup: " << std::fixed << std::setprecision(2) << speedup << "x\n";
+    (void)sink;
+}
+
+// ---- CPU decode comparison: MsgPackDecode(JSON) vs Value::FromBytes --------
+
+void BenchDecodeComparison(std::size_t n) {
+    using namespace storages::tarantool::impl;
+
+    // Build a sample response: array of [uint64, string, uuid_ext]
+    TntUuid uuid;
+    uuid.bytes = {0x12,0x34,0x56,0x78, 0x12,0x34, 0x56,0x78,
+                  0x12,0x34, 0x56,0x78,0x9a,0xbc,0xde,0xf0};
+
+    std::vector<uint8_t> row;
+    EncodeArray(row, 3);
+    EncodeUint(row, 42u);
+    EncodeStr(row, "hello_value");
+    EncodeUuid(row, uuid);
+
+    volatile std::size_t sink = 0;
+
+    // --- Old path: MsgPackDecode → JSON, access UUID as string ---
+    const auto r_old = Time(n, [&] {
+        for (std::size_t i = 0; i < n; ++i) {
+            auto v = MsgPackDecode(row);
+            sink += v[0].As<int64_t>();
+            sink += v[1].As<std::string>().size();
+            sink += v[2].As<std::string>().size();  // UUID decoded eagerly
+        }
+    });
+    Print("decode: MsgPackDecode → json::Value (OLD)", r_old);
+
+    // --- New path: Value::FromBytes, lazy ext decode ---
+    const auto r_new = Time(n, [&] {
+        for (std::size_t i = 0; i < n; ++i) {
+            auto v = formats::msgpack::Value::FromBytes(row.data(), row.size());
+            sink += v[0].As<uint64_t>();
+            sink += v[1].As<std::string>().size();
+            sink += v[2].AsUuid().bytes[0];  // lazy UUID decode only when accessed
+        }
+    });
+    Print("decode: msgpack::Value::FromBytes (NEW)", r_new);
+
+    const double speedup = static_cast<double>(r_old.elapsed.count()) /
+                           static_cast<double>(r_new.elapsed.count());
+    std::cout << "  speedup: " << std::fixed << std::setprecision(2) << speedup << "x\n";
+    (void)sink;
+}
+
+// ---- CPU decode: lazy (don't access UUID) vs eager -------------------------
+
+void BenchDecodeSkipExt(std::size_t n) {
+    using namespace storages::tarantool::impl;
+
+    // Same row as above
+    TntUuid uuid;
+    uuid.bytes = {0x12,0x34,0x56,0x78, 0x12,0x34, 0x56,0x78,
+                  0x12,0x34, 0x56,0x78,0x9a,0xbc,0xde,0xf0};
+    std::vector<uint8_t> row;
+    EncodeArray(row, 3);
+    EncodeUint(row, 42u);
+    EncodeStr(row, "hello_value");
+    EncodeUuid(row, uuid);
+
+    volatile std::size_t sink = 0;
+
+    // --- Old path: MsgPackDecode always decodes UUID even if not used ---
+    const auto r_old = Time(n, [&] {
+        for (std::size_t i = 0; i < n; ++i) {
+            auto v = MsgPackDecode(row);
+            sink += v[0].As<int64_t>();
+            sink += v[1].As<std::string>().size();
+            // UUID field not accessed — but MsgPackDecode parsed it eagerly
+        }
+    });
+    Print("decode skip ext: MsgPackDecode (OLD)", r_old);
+
+    // --- New path: Value::FromBytes never decodes UUID if not accessed ---
+    const auto r_new = Time(n, [&] {
+        for (std::size_t i = 0; i < n; ++i) {
+            auto v = formats::msgpack::Value::FromBytes(row.data(), row.size());
+            sink += v[0].As<uint64_t>();
+            sink += v[1].As<std::string>().size();
+            // UUID field not accessed — zero decode cost
+        }
+    });
+    Print("decode skip ext: msgpack::FromBytes (NEW)", r_new);
+
+    const double speedup = static_cast<double>(r_old.elapsed.count()) /
+                           static_cast<double>(r_new.elapsed.count());
+    std::cout << "  speedup (lazy skip): " << std::fixed << std::setprecision(2) << speedup << "x\n";
     (void)sink;
 }
 
@@ -174,7 +316,22 @@ void BenchPool(const std::string& host, int port,
     Print(label, r);
 }
 
-// ---- test ------------------------------------------------------------------
+// ---- test: CPU only (no Tarantool required) --------------------------------
+
+TEST(TarantoolCpuBench, EncodeDecodeComparison) {
+    constexpr std::size_t kN = 200'000;
+    const std::string val32(32, 'x');
+
+    std::cout << "\n╔══ Phase 3 encode: old JSON path vs new ValueBuilder ════╗\n";
+    BenchEncodeComparison(kN, val32);
+    std::cout << "╠══ Phase B/D decode: MsgPackDecode vs FromBytes ══════════╣\n";
+    BenchDecodeComparison(kN);
+    std::cout << "╠══ Phase B/D decode (skip ext): lazy zero-cost skip ══════╣\n";
+    BenchDecodeSkipExt(kN);
+    std::cout << "╚════════════════════════════════════════════════════════╝\n";
+}
+
+// ---- test: network throughput ----------------------------------------------
 
 TEST(TarantoolBench, InsertThroughput) {
     const char* host_env = std::getenv("TARANTOOL_HOST");
@@ -187,7 +344,7 @@ TEST(TarantoolBench, InsertThroughput) {
 
     // ── Section 1: pure CPU cost (no network) ──────────────────────────────
     std::cout << "\n╔══ CPU cost (no network) ═══════════════════════════════╗\n";
-    BenchJsonEncode(kPerCoro, val32);
+    BenchEncodeComparison(kPerCoro, val32);
     std::cout << "╚════════════════════════════════════════════════════════╝\n\n";
 
     // ── Section 2: vary ev threads ────────────────────────────────────────
