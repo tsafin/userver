@@ -23,6 +23,7 @@
 #include <userver/tracing/tags.hpp>
 
 #include <userver/storages/tarantool/exceptions.hpp>
+#include <userver/storages/tarantool/error_info.hpp>
 
 #include <storages/tarantool/impl/msgpack.hpp>
 #include <storages/tarantool/impl/tracing_tags.hpp>
@@ -59,14 +60,46 @@ constexpr uint32_t kKeyUserName     = 0x23;
 constexpr uint32_t kKeyTupleOps     = 0x28;
 
 // IPROTO response keys
-constexpr uint32_t kKeyData         = 0x30;
-constexpr uint32_t kKeyError        = 0x31;
+constexpr uint32_t kKeyData              = 0x30;
+constexpr uint32_t kKeyError            = 0x31;  // legacy error string
+constexpr uint32_t kKeyErrorExtended    = 0x52;  // structured error (Tarantool 2.4+)
+
+// Structured error map keys (inside IPROTO_ERROR value)
+constexpr uint32_t kErrStack    = 0x00;
+// Frame field keys
+constexpr uint32_t kErrType     = 0x00;
+constexpr uint32_t kErrFile     = 0x01;
+constexpr uint32_t kErrLine     = 0x02;
+constexpr uint32_t kErrMessage  = 0x03;
+constexpr uint32_t kErrSysErrno = 0x04;
+constexpr uint32_t kErrErrcode  = 0x05;
 
 // Greeting constants
 constexpr std::size_t kGreetingSize  = 128;
 constexpr std::size_t kSaltOffset    = 64;
 constexpr std::size_t kSaltLength    = 44;  // base64-encoded, 32 bytes decoded
 constexpr std::size_t kPreheaderSize = 5;   // 0xce + 4 bytes length
+
+// ---- Structured error decoder ----
+
+TntErrorInfo DecodeErrorInfo(const formats::msgpack::Value& err_val) {
+    TntErrorInfo info;
+    const auto stack_val = err_val[kErrStack];
+    if (stack_val.IsMissing() || !stack_val.IsArray()) return info;
+
+    for (std::size_t i = 0; i < stack_val.GetSize(); ++i) {
+        const auto frame_val = stack_val[i];
+        TntErrorFrame frame;
+        frame.type       = frame_val[kErrType].As<std::string>("");
+        frame.file       = frame_val[kErrFile].As<std::string>("");
+        frame.line       = frame_val[kErrLine].As<uint32_t>(0u);
+        frame.message    = frame_val[kErrMessage].As<std::string>("");
+        frame.sys_errno  = frame_val[kErrSysErrno].As<uint32_t>(0u);
+        frame.errcode    = frame_val[kErrErrcode].As<uint32_t>(0u);
+        info.stack.push_back(std::move(frame));
+    }
+    return info;
+}
 
 // ---- IPROTO frame builder ----
 
@@ -308,10 +341,20 @@ void Connection::ReaderLoop() {
 
             std::vector<uint8_t> data_buf{};
             std::string error_msg;
+            std::optional<TntErrorInfo> error_info;
             if (code != 0) {
                 if (!body_view.IsMissing()) {
-                    error_msg = body_view[kKeyError].As<std::string>(
-                        "tarantool error");
+                    // Prefer structured error (Tarantool 2.4+)
+                    const auto ext_err = body_view[kKeyErrorExtended];
+                    if (!ext_err.IsMissing()) {
+                        error_info = DecodeErrorInfo(ext_err);
+                        error_msg = error_info->Message();
+                    }
+                    // Always populate legacy string as fallback/override
+                    if (error_msg.empty()) {
+                        error_msg = body_view[kKeyError].As<std::string>(
+                            "tarantool error");
+                    }
                 }
             } else {
                 if (!body_view.IsMissing()) {
@@ -335,7 +378,8 @@ void Connection::ReaderLoop() {
                                    static_cast<uint32_t>(
                                        std::max<int64_t>(0, code)),
                                    std::move(error_msg),
-                                   std::move(data_buf)};
+                                   std::move(data_buf),
+                                   std::move(error_info)};
 
             // Dispatch to the waiting coroutine
             engine::Promise<ExecutionResult> promise;

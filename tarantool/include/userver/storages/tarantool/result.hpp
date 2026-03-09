@@ -5,8 +5,11 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
+
+#include <userver/storages/tarantool/error_info.hpp>
 
 #include <userver/formats/msgpack/value.hpp>
 
@@ -25,7 +28,8 @@ class ExecutionResult final {
 
   explicit ExecutionResult(bool ok, uint32_t error_code,
                            std::string error_message,
-                           std::vector<uint8_t> data_buf);
+                           std::vector<uint8_t> data_buf,
+                           std::optional<TntErrorInfo> error_info = std::nullopt);
 
   /// @throws CommandException if the server returned an error
   void AssertOk() const;
@@ -48,6 +52,7 @@ class ExecutionResult final {
   bool ok_{true};
   uint32_t error_code_{0};
   std::string error_message_;
+  std::optional<TntErrorInfo> error_info_;
   std::vector<uint8_t> data_buf_;  ///< owns the raw msgpack bytes
   formats::msgpack::Value data_;   ///< zero-copy cursor into data_buf_
 };

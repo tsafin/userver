@@ -1,5 +1,7 @@
 #include <userver/utest/utest.hpp>
 
+#include <userver/formats/msgpack/value.hpp>
+#include <userver/storages/tarantool/error_info.hpp>
 #include <storages/tarantool/impl/msgpack.hpp>
 
 USERVER_NAMESPACE_BEGIN
@@ -472,6 +474,107 @@ TEST(MsgPackExtType, UnknownExtIsNil) {
     std::vector<uint8_t> buf = {0xd6, 99, 0xAA, 0xBB, 0xCC, 0xDD};
     auto v = MsgPackDecode(buf);
     EXPECT_TRUE(v.IsNull());
+}
+
+// ============================================================================
+// Structured error decoding (Phase C)
+// ============================================================================
+
+// Build a msgpack-encoded IPROTO_ERROR value (key 0x52) that looks like:
+//   {0x00: [{0x00:"ClientError", 0x01:"eval", 0x02:42,
+//            0x03:"No such space", 0x04:0, 0x05:36}]}
+static std::vector<uint8_t> MakeStructuredErrorBody() {
+    std::vector<uint8_t> buf;
+    using namespace storages::tarantool::impl;
+
+    // Outer IPROTO_ERROR map {0x52: <err_val>}
+    EncodeFixMap(buf, 1);
+    EncodeUint(buf, 0x52);
+
+    // err_val = {0x00: <stack_array>}
+    EncodeFixMap(buf, 1);
+    EncodeUint(buf, 0x00);  // kErrStack
+
+    // stack_array = [{frame}]
+    EncodeArray(buf, 1);
+
+    // frame = {0x00:"ClientError", 0x01:"eval", 0x02:42,
+    //          0x03:"No such space", 0x04:0, 0x05:36}
+    EncodeFixMap(buf, 6);
+    EncodeUint(buf, 0x00); EncodeStr(buf, "ClientError");
+    EncodeUint(buf, 0x01); EncodeStr(buf, "eval");
+    EncodeUint(buf, 0x02); EncodeUint(buf, 42);
+    EncodeUint(buf, 0x03); EncodeStr(buf, "No such space 'test'");
+    EncodeUint(buf, 0x04); EncodeUint(buf, 0);
+    EncodeUint(buf, 0x05); EncodeUint(buf, 36);
+
+    return buf;
+}
+
+TEST(StructuredError, DecodesSingleFrame) {
+    auto body_bytes = MakeStructuredErrorBody();
+    auto body_val = formats::msgpack::Value::FromBytes(
+        body_bytes.data(), body_bytes.size());
+
+    const auto ext_err = body_val[0x52u];
+    ASSERT_FALSE(ext_err.IsMissing());
+
+    const auto stack = ext_err[0x00u];
+    ASSERT_FALSE(stack.IsMissing());
+    ASSERT_TRUE(stack.IsArray());
+    ASSERT_EQ(stack.GetSize(), 1u);
+
+    const auto frame = stack[0];
+    EXPECT_EQ(frame[0x00u].As<std::string>(""), "ClientError");
+    EXPECT_EQ(frame[0x01u].As<std::string>(""), "eval");
+    EXPECT_EQ(frame[0x02u].As<uint32_t>(0u), 42u);
+    EXPECT_EQ(frame[0x03u].As<std::string>(""), "No such space 'test'");
+    EXPECT_EQ(frame[0x04u].As<uint32_t>(0u), 0u);
+    EXPECT_EQ(frame[0x05u].As<uint32_t>(0u), 36u);
+}
+
+TEST(StructuredError, TntErrorInfoFields) {
+    auto body_bytes = MakeStructuredErrorBody();
+    auto body_val = formats::msgpack::Value::FromBytes(
+        body_bytes.data(), body_bytes.size());
+
+    // Simulate DecodeErrorInfo logic
+    const auto ext_err = body_val[0x52u];
+    ASSERT_FALSE(ext_err.IsMissing());
+
+    storages::tarantool::TntErrorInfo info;
+    const auto stack_val = ext_err[0x00u];
+    for (std::size_t i = 0; i < stack_val.GetSize(); ++i) {
+        const auto fv = stack_val[i];
+        storages::tarantool::TntErrorFrame f;
+        f.type       = fv[0x00u].As<std::string>("");
+        f.file       = fv[0x01u].As<std::string>("");
+        f.line       = fv[0x02u].As<uint32_t>(0u);
+        f.message    = fv[0x03u].As<std::string>("");
+        f.sys_errno  = fv[0x04u].As<uint32_t>(0u);
+        f.errcode    = fv[0x05u].As<uint32_t>(0u);
+        info.stack.push_back(std::move(f));
+    }
+
+    ASSERT_EQ(info.stack.size(), 1u);
+    EXPECT_EQ(info.Message(), "No such space 'test'");
+    EXPECT_EQ(info.Errcode(), 36u);
+    EXPECT_EQ(info.stack[0].type, "ClientError");
+    EXPECT_EQ(info.stack[0].file, "eval");
+    EXPECT_EQ(info.stack[0].line, 42u);
+}
+
+TEST(StructuredError, EmptyInfoOnMissingKey) {
+    // Body with only legacy 0x31 key — no 0x52
+    std::vector<uint8_t> buf;
+    using namespace storages::tarantool::impl;
+    EncodeFixMap(buf, 1);
+    EncodeUint(buf, 0x31);
+    EncodeStr(buf, "some error");
+
+    auto body_val = formats::msgpack::Value::FromBytes(buf.data(), buf.size());
+    const auto ext_err = body_val[0x52u];
+    EXPECT_TRUE(ext_err.IsMissing());
 }
 
 USERVER_NAMESPACE_END
