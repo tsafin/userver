@@ -17,7 +17,6 @@
 #include <userver/engine/io/sockaddr.hpp>
 #include <userver/engine/io/socket.hpp>
 #include <userver/engine/sleep.hpp>
-#include <userver/formats/json/value_builder.hpp>
 #include <userver/formats/msgpack/value.hpp>
 #include <userver/logging/log.hpp>
 #include <userver/tracing/span.hpp>
@@ -307,7 +306,7 @@ void Connection::ReaderLoop() {
             // Body starts immediately after the header in the same buffer.
             auto body_view = header.NextSibling();
 
-            formats::json::Value data_val{};
+            std::vector<uint8_t> data_buf{};
             std::string error_msg;
             if (code != 0) {
                 if (!body_view.IsMissing()) {
@@ -317,13 +316,18 @@ void Connection::ReaderLoop() {
             } else {
                 if (!body_view.IsMissing()) {
                     // Navigate to the data array via integer key (0x30).
-                    // Then decode only that sub-value into json::Value for the
-                    // public API (Phase 2 will replace this with msgpack::Value).
-                    auto data_cursor = body_view[kKeyData];
+                    // Copy the raw msgpack bytes so ExecutionResult can own them
+                    // independently of the receive buffer (rbuf may be reused).
+                    const auto data_cursor = body_view[kKeyData];
                     if (!data_cursor.IsMissing()) {
-                        MpDecoder data_dec{data_cursor.GetRawPos(),
-                                           data_cursor.GetRawEnd()};
-                        data_val = data_dec.DecodeValue();
+                        const uint8_t* data_begin = data_cursor.GetRawPos();
+                        // NextSibling() gives the tight end of this value;
+                        // if data is the last item, fall back to buffer end.
+                        const auto next = data_cursor.NextSibling();
+                        const uint8_t* data_end = next.IsMissing()
+                            ? data_cursor.GetRawEnd()
+                            : next.GetRawPos();
+                        data_buf.assign(data_begin, data_end);
                     }
                 }
             }
@@ -331,7 +335,7 @@ void Connection::ReaderLoop() {
                                    static_cast<uint32_t>(
                                        std::max<int64_t>(0, code)),
                                    std::move(error_msg),
-                                   std::move(data_val)};
+                                   std::move(data_buf)};
 
             // Dispatch to the waiting coroutine
             engine::Promise<ExecutionResult> promise;

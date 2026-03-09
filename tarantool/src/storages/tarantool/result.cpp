@@ -8,11 +8,16 @@ namespace storages::tarantool {
 
 ExecutionResult::ExecutionResult(bool ok, uint32_t error_code,
                                  std::string error_message,
-                                 formats::json::Value data)
+                                 std::vector<uint8_t> data_buf)
     : ok_{ok},
       error_code_{error_code},
       error_message_{std::move(error_message)},
-      data_{std::move(data)} {}
+      data_buf_{std::move(data_buf)} {
+    if (!data_buf_.empty()) {
+        data_ = formats::msgpack::Value::FromBytes(data_buf_.data(),
+                                                   data_buf_.size());
+    }
+}
 
 void ExecutionResult::AssertOk() const {
     if (!ok_) {
