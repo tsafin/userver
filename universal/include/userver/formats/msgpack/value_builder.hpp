@@ -10,7 +10,9 @@
 #include <vector>
 
 #include <userver/formats/msgpack/exception.hpp>
+#include <userver/formats/msgpack/tarantool_types.hpp>
 #include <userver/formats/msgpack/value.hpp>
+#include <userver/utils/datetime/date.hpp>
 
 USERVER_NAMESPACE_BEGIN
 
@@ -66,6 +68,15 @@ public:
     /// Constructs a ValueBuilder from an existing (decoded) msgpack Value.
     /// This re-encodes the value into the builder's node tree.
     explicit ValueBuilder(const Value& v);
+
+    // ---- Tarantool ext type constructors -----------------------------------
+    explicit ValueBuilder(TntUuid uuid);
+    explicit ValueBuilder(utils::datetime::Date date);
+    explicit ValueBuilder(DatetimeTz dt);
+    explicit ValueBuilder(DatetimeWithoutTz dt);
+    explicit ValueBuilder(TimestampTz ts);
+    explicit ValueBuilder(TimestampWithoutTz ts);
+    explicit ValueBuilder(TntInterval interval);
 
     // ------------------------------------------------------------------ //
     //  Copy / move                                                         //

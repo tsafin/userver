@@ -8,8 +8,8 @@ Uses CMake with a Makefile wrapper. Build artifacts go to `build_debug/` or `bui
 
 ```bash
 # Configure + build
-make build-debug        # Debug + sanitizers (addr, ub)
-make build-release      # Release
+make build-debug        # Debug + sanitizers (addr, ub) — for correctness/asan testing
+make build-release      # Release (RelWithDebInfo via Makefile.local) — for benchmarks/profiling
 
 # Run all tests
 make test-debug
@@ -24,6 +24,15 @@ make docker-test-debug
 
 # Generate docs
 make docs
+```
+
+**IMPORTANT: Always use `build-release` for benchmarks and profiling.** `build-debug` enables addr+ub sanitizers which make it 10–50× slower and produce meaningless profile data.
+
+The file `Makefile.local` (gitignored) overrides the release build type to `RelWithDebInfo` so that `perf` and flamegraph tools can resolve symbols:
+
+```makefile
+# Makefile.local
+CMAKE_RELEASE_FLAGS = -DCMAKE_BUILD_TYPE=RelWithDebInfo $(CMAKE_COMMON_FLAGS)
 ```
 
 Always use `sudo apt` (not plain `apt`) when installing system packages.

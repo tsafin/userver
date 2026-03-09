@@ -8,6 +8,9 @@
 
 #include <fmt/format.h>
 
+#include <userver/formats/msgpack/tarantool_types.hpp>
+#include <userver/utils/datetime/date.hpp>
+
 USERVER_NAMESPACE_BEGIN
 
 namespace formats::msgpack {
@@ -27,6 +30,11 @@ using IntPair  = std::pair<uint64_t,     NodePtr>;
 using StrMap   = std::vector<StrPair>;
 using IntMap   = std::vector<IntPair>;
 
+// Raw pre-encoded msgpack bytes (for ext types and other opaque values).
+struct ExtData {
+    std::vector<uint8_t> raw;
+};
+
 struct Node {
     using Data = std::variant<
         std::monostate,  // nil
@@ -37,7 +45,8 @@ struct Node {
         std::string,
         Array,
         StrMap,
-        IntMap
+        IntMap,
+        ExtData
     >;
 
     Data data{std::monostate{}};
@@ -51,6 +60,7 @@ struct Node {
     explicit Node(Array arr)         : data(std::move(arr)) {}
     explicit Node(StrMap m)          : data(std::move(m)) {}
     explicit Node(IntMap m)          : data(std::move(m)) {}
+    explicit Node(ExtData e)         : data(std::move(e)) {}
 
     // Deep copy
     Node(const Node& o);
@@ -221,6 +231,8 @@ void EncodeNode(std::vector<uint8_t>& out, const impl::Node& node) {
                 EncodeUInt(out, k);
                 EncodeNode(out, *vp);
             }
+        } else if constexpr (std::is_same_v<T, impl::ExtData>) {
+            out.insert(out.end(), v.raw.begin(), v.raw.end());
         }
     }, node.data);
 }
@@ -456,6 +468,36 @@ Value ValueBuilder::ToValue(std::vector<uint8_t>& out) const {
     out = ToBytes();
     return Value::FromBytes(out.data(), out.size());
 }
+
+// ---- Tarantool ext type constructors --------------------------------------
+
+ValueBuilder::ValueBuilder(TntUuid uuid)
+    : root_(std::make_shared<impl::Node>(impl::ExtData{EncodeUuid(uuid)})),
+      node_(root_.get()) {}
+
+ValueBuilder::ValueBuilder(utils::datetime::Date date)
+    : root_(std::make_shared<impl::Node>(impl::ExtData{EncodeDate(date)})),
+      node_(root_.get()) {}
+
+ValueBuilder::ValueBuilder(DatetimeTz dt)
+    : root_(std::make_shared<impl::Node>(impl::ExtData{EncodeDatetimeTz(dt)})),
+      node_(root_.get()) {}
+
+ValueBuilder::ValueBuilder(DatetimeWithoutTz dt)
+    : root_(std::make_shared<impl::Node>(impl::ExtData{EncodeDatetimeWithoutTz(dt)})),
+      node_(root_.get()) {}
+
+ValueBuilder::ValueBuilder(TimestampTz ts)
+    : root_(std::make_shared<impl::Node>(impl::ExtData{EncodeTimestampTz(ts)})),
+      node_(root_.get()) {}
+
+ValueBuilder::ValueBuilder(TimestampWithoutTz ts)
+    : root_(std::make_shared<impl::Node>(impl::ExtData{EncodeTimestampWithoutTz(ts)})),
+      node_(root_.get()) {}
+
+ValueBuilder::ValueBuilder(TntInterval interval)
+    : root_(std::make_shared<impl::Node>(impl::ExtData{EncodeInterval(interval)})),
+      node_(root_.get()) {}
 
 // ---- Path --------------------------------------------------------------
 

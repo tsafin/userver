@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <string>
@@ -12,6 +13,7 @@
 #include <userver/formats/json/value.hpp>
 #include <userver/formats/json/value_builder.hpp>
 #include <userver/formats/json/serialize.hpp>
+#include <userver/formats/msgpack/tarantool_types.hpp>
 
 #include <userver/storages/tarantool/exceptions.hpp>
 
@@ -61,7 +63,11 @@ USERVER_NAMESPACE_BEGIN
 
 namespace storages::tarantool::impl {
 
-// ---- Minimal MsgPack encoder into std::vector<uint8_t> ----
+// ---- Pull in shared Tarantool ext types ------------------------------------
+using formats::msgpack::TntUuid;
+
+// Legacy alias: TntDatetime == TimestampTz
+using TntDatetime = formats::msgpack::TimestampTz;
 
 inline void EncodeUint(std::vector<uint8_t>& out, uint64_t v) {
     if (v <= 0x7f) {
@@ -127,20 +133,7 @@ inline void EncodeArray(std::vector<uint8_t>& out, uint32_t count) {
     }
 }
 
-// ---- Tarantool custom ext types: UUID and Datetime ----
-
-// UUID: always 16 bytes, big-endian as per RFC 4122 field order.
-struct TntUuid {
-    std::array<uint8_t, 16> bytes{};  // raw UUID bytes, big-endian
-};
-
-// Datetime as stored in Tarantool MsgPack (little-endian fields).
-struct TntDatetime {
-    int64_t  seconds   = 0;  // Unix timestamp (seconds since epoch)
-    uint32_t nsec      = 0;  // Nanoseconds [0, 999999999]
-    int16_t  tzoffset  = 0;  // Timezone offset in minutes
-    uint16_t tzindex   = 0;  // Timezone name index (0 = UTC)
-};
+// ---- Minimal MsgPack encoder into std::vector<uint8_t> ----
 
 // Parse "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" into TntUuid.
 // Throws TarantoolException on malformed input.
@@ -200,25 +193,11 @@ inline void WriteLE64(std::vector<uint8_t>& out, uint64_t v) {
     WriteLE32(out, static_cast<uint32_t>(v >> 32));
 }
 
-// Encode TntDatetime as MsgPack fixext8 (seconds only) or fixext16 (with nsec/tz).
-// Uses ext type 4 (MP_DATETIME).
+// Encode TntDatetime (= TimestampTz) as MsgPack ext type 4.
+// Delegates to the shared EncodeTimestampTz helper.
 inline void EncodeDateTime(std::vector<uint8_t>& out, const TntDatetime& dt) {
-    const bool has_extra = (dt.nsec != 0 || dt.tzoffset != 0 || dt.tzindex != 0);
-    if (has_extra) {
-        out.push_back(mp::kFixExt16);
-        out.push_back(static_cast<uint8_t>(mp::kExtDatetime));
-        WriteLE64(out, static_cast<uint64_t>(dt.seconds));
-        WriteLE32(out, dt.nsec);
-        // tzoffset (int16 LE) + tzindex (uint16 LE)
-        out.push_back(static_cast<uint8_t>(dt.tzoffset));
-        out.push_back(static_cast<uint8_t>(static_cast<uint16_t>(dt.tzoffset) >> 8));
-        out.push_back(static_cast<uint8_t>(dt.tzindex));
-        out.push_back(static_cast<uint8_t>(dt.tzindex >> 8));
-    } else {
-        out.push_back(mp::kFixExt8);
-        out.push_back(static_cast<uint8_t>(mp::kExtDatetime));
-        WriteLE64(out, static_cast<uint64_t>(dt.seconds));
-    }
+    auto bytes = formats::msgpack::EncodeTimestampTz(dt);
+    out.insert(out.end(), bytes.begin(), bytes.end());
 }
 
 inline void EncodeJson(std::vector<uint8_t>& out,
@@ -374,21 +353,21 @@ inline TntUuid MpDecoder::DecodeUuidBytes() {
 }
 
 inline TntDatetime MpDecoder::DecodeDatetimeBytes(uint32_t data_len) {
-    TntDatetime dt;
     if (data_len != 8 && data_len != 16)
         throw TarantoolException{
             fmt::format("Bad datetime ext size: {}", data_len)};
     if (p + data_len > end) throw TarantoolException{"MsgPack datetime overrun"};
-    dt.seconds = static_cast<int64_t>(ReadLE64());
-    if (data_len == 16) {
-        dt.nsec      = ReadLE32();
-        const uint16_t raw_tz = static_cast<uint16_t>(Read8()) |
-                                 static_cast<uint16_t>(Read8()) << 8;
-        dt.tzoffset  = static_cast<int16_t>(raw_tz);
-        dt.tzindex   = static_cast<uint16_t>(Read8()) |
-                        static_cast<uint16_t>(Read8()) << 8;
-    }
-    return dt;
+    const auto raw = formats::msgpack::DecodeExt4Bytes(p, data_len);
+    p += data_len;
+    const int64_t total_ns =
+        raw.seconds * 1'000'000'000LL + static_cast<int64_t>(raw.nsec);
+    TntDatetime ts;
+    ts.tp = std::chrono::time_point<
+                std::chrono::system_clock, std::chrono::nanoseconds>{
+                std::chrono::nanoseconds{total_ns}};
+    ts.tzoffset = raw.tzoffset;
+    ts.tzindex  = raw.tzindex;
+    return ts;
 }
 
 // DecodeExt: called after the fixext/ext marker byte is consumed.
@@ -403,9 +382,13 @@ inline formats::json::Value MpDecoder::DecodeExt(uint32_t data_len) {
             UuidToString(DecodeUuidBytes())}.ExtractValue();
     } else if (ext_type == mp::kExtDatetime) {
         const TntDatetime dt = DecodeDatetimeBytes(data_len);
+        const int64_t total_ns = dt.tp.time_since_epoch().count();
+        int64_t seconds = total_ns / 1'000'000'000LL;
+        int64_t nsec_i  = total_ns % 1'000'000'000LL;
+        if (nsec_i < 0) { nsec_i += 1'000'000'000LL; --seconds; }
         formats::json::ValueBuilder obj(formats::json::Type::kObject);
-        obj["seconds"]   = dt.seconds;
-        obj["nsec"]      = static_cast<int64_t>(dt.nsec);
+        obj["seconds"]   = seconds;
+        obj["nsec"]      = nsec_i;
         obj["tzoffset"]  = static_cast<int64_t>(dt.tzoffset);
         obj["tzindex"]   = static_cast<int64_t>(dt.tzindex);
         return obj.ExtractValue();

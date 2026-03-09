@@ -382,10 +382,27 @@ TEST(MsgPackUuid, DecodeOverrunThrows) {
 }
 
 // ---- Datetime (ext type 4) ----
+// TntDatetime is now an alias for formats::msgpack::TimestampTz,
+// which stores a chrono::time_point<system_clock, nanoseconds> + tzoffset/tzindex.
+
+namespace {
+// Helper: seconds since epoch → nanosecond time_point
+auto TpFromSec(int64_t sec) {
+    return std::chrono::time_point_cast<std::chrono::nanoseconds>(
+        std::chrono::system_clock::from_time_t(static_cast<std::time_t>(sec)));
+}
+int64_t TpToSec(const TntDatetime& dt) {
+    return std::chrono::duration_cast<std::chrono::seconds>(
+               dt.tp.time_since_epoch()).count();
+}
+int64_t TpToNsec(const TntDatetime& dt) {
+    return dt.tp.time_since_epoch().count() % 1'000'000'000LL;
+}
+} // namespace
 
 TEST(MsgPackDatetime, EncodeDecodeSecondsOnly) {
     TntDatetime dt;
-    dt.seconds = 1672531200;  // 2023-01-01 00:00:00 UTC
+    dt.tp = TpFromSec(1672531200);  // 2023-01-01 00:00:00 UTC
     std::vector<uint8_t> buf;
     EncodeDateTime(buf, dt);
     ASSERT_EQ(buf.size(), 10u);   // fixext8 marker + type + 8 bytes
@@ -402,8 +419,7 @@ TEST(MsgPackDatetime, EncodeDecodeSecondsOnly) {
 
 TEST(MsgPackDatetime, EncodeDecodeWithNsec) {
     TntDatetime dt;
-    dt.seconds  = 1672531200;
-    dt.nsec     = 123456789;
+    dt.tp = TpFromSec(1672531200) + std::chrono::nanoseconds{123456789};
     std::vector<uint8_t> buf;
     EncodeDateTime(buf, dt);
     ASSERT_EQ(buf.size(), 18u);  // fixext16 marker + type + 16 bytes
@@ -416,10 +432,9 @@ TEST(MsgPackDatetime, EncodeDecodeWithNsec) {
 
 TEST(MsgPackDatetime, EncodeDecodeWithTimezone) {
     TntDatetime dt;
-    dt.seconds   = 0;
-    dt.nsec      = 0;
-    dt.tzoffset  = 180;   // UTC+3
-    dt.tzindex   = 42;
+    dt.tp       = TpFromSec(0);
+    dt.tzoffset = 180;   // UTC+3
+    dt.tzindex  = 42;
     std::vector<uint8_t> buf;
     EncodeDateTime(buf, dt);
     ASSERT_EQ(buf.size(), 18u);
@@ -432,7 +447,7 @@ TEST(MsgPackDatetime, EncodeDecodeWithTimezone) {
 
 TEST(MsgPackDatetime, NegativeSeconds) {
     TntDatetime dt;
-    dt.seconds = -86400;  // 1 day before epoch
+    dt.tp = TpFromSec(-86400);  // 1 day before epoch
     std::vector<uint8_t> buf;
     EncodeDateTime(buf, dt);
     auto v = MsgPackDecode(buf);
@@ -441,8 +456,7 @@ TEST(MsgPackDatetime, NegativeSeconds) {
 
 TEST(MsgPackDatetime, NegativeTzoffset) {
     TntDatetime dt;
-    dt.seconds  = 1000000000;
-    dt.nsec     = 500000000;
+    dt.tp       = TpFromSec(1000000000) + std::chrono::nanoseconds{500000000};
     dt.tzoffset = -300;  // UTC-5
     std::vector<uint8_t> buf;
     EncodeDateTime(buf, dt);

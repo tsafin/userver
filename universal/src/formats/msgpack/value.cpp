@@ -7,6 +7,9 @@
 
 #include <fmt/format.h>
 
+#include <userver/formats/msgpack/tarantool_types.hpp>
+#include <userver/utils/datetime/date.hpp>
+
 USERVER_NAMESPACE_BEGIN
 
 namespace formats::msgpack {
@@ -751,6 +754,338 @@ std::string Value::As<std::string>() const {
         len = Read32(p); p += 4;
     }
     return std::string{reinterpret_cast<const char*>(p), len};
+}
+
+// ======================================================================== //
+//  Tarantool ext type predicates and accessors                             //
+// ======================================================================== //
+
+bool Value::IsUuid()     const noexcept { return IsExt() && GetExtType() == 2; }
+bool Value::IsDatetime() const noexcept { return IsExt() && GetExtType() == 4; }
+bool Value::IsDecimal()  const noexcept { return IsExt() && GetExtType() == 1; }
+bool Value::IsInterval() const noexcept { return IsExt() && GetExtType() == 6; }
+
+TntUuid Value::AsUuid() const {
+    CheckNotMissing();
+    if (!IsUuid()) ThrowTypeMismatch(kTypeExt);
+    const auto data = GetExtData();
+    if (data.size() != 16) throw ParseException{"UUID ext data must be exactly 16 bytes"};
+    TntUuid uuid;
+    std::memcpy(uuid.bytes.data(), data.data(), 16);
+    return uuid;
+}
+
+DatetimeTz Value::AsDatetimeTz() const {
+    CheckNotMissing();
+    if (!IsDatetime()) ThrowTypeMismatch(kTypeExt);
+    const auto sv = GetExtData();
+    const auto raw = DecodeExt4Bytes(
+        reinterpret_cast<const uint8_t*>(sv.data()),
+        static_cast<uint32_t>(sv.size()));
+    if (raw.nsec != 0) {
+        throw ConversionException{
+            "datetime has sub-second part; use AsTimestampTz()", GetPath()};
+    }
+    DatetimeTz dt;
+    dt.tp       = std::chrono::time_point<
+                      std::chrono::system_clock, std::chrono::seconds>{
+                      std::chrono::seconds{raw.seconds}};
+    dt.tzoffset = raw.tzoffset;
+    dt.tzindex  = raw.tzindex;
+    return dt;
+}
+
+DatetimeWithoutTz Value::AsDatetimeWithoutTz() const {
+    CheckNotMissing();
+    if (!IsDatetime()) ThrowTypeMismatch(kTypeExt);
+    const auto sv = GetExtData();
+    const auto raw = DecodeExt4Bytes(
+        reinterpret_cast<const uint8_t*>(sv.data()),
+        static_cast<uint32_t>(sv.size()));
+    if (raw.nsec != 0) {
+        throw ConversionException{
+            "datetime has sub-second part; use AsTimestampWithoutTz()", GetPath()};
+    }
+    if (raw.tzoffset != 0 || raw.tzindex != 0) {
+        throw ConversionException{
+            "datetime has timezone info; use AsDatetimeTz()", GetPath()};
+    }
+    DatetimeWithoutTz dt;
+    dt.tp = std::chrono::time_point<
+                std::chrono::system_clock, std::chrono::seconds>{
+                std::chrono::seconds{raw.seconds}};
+    return dt;
+}
+
+TimestampTz Value::AsTimestampTz() const {
+    CheckNotMissing();
+    if (!IsDatetime()) ThrowTypeMismatch(kTypeExt);
+    const auto sv = GetExtData();
+    const auto raw = DecodeExt4Bytes(
+        reinterpret_cast<const uint8_t*>(sv.data()),
+        static_cast<uint32_t>(sv.size()));
+    TimestampTz ts;
+    const int64_t total_ns =
+        raw.seconds * 1'000'000'000LL + static_cast<int64_t>(raw.nsec);
+    ts.tp = std::chrono::time_point<
+                std::chrono::system_clock, std::chrono::nanoseconds>{
+                std::chrono::nanoseconds{total_ns}};
+    ts.tzoffset = raw.tzoffset;
+    ts.tzindex  = raw.tzindex;
+    return ts;
+}
+
+TimestampWithoutTz Value::AsTimestampWithoutTz() const {
+    CheckNotMissing();
+    if (!IsDatetime()) ThrowTypeMismatch(kTypeExt);
+    const auto sv = GetExtData();
+    const auto raw = DecodeExt4Bytes(
+        reinterpret_cast<const uint8_t*>(sv.data()),
+        static_cast<uint32_t>(sv.size()));
+    if (raw.tzoffset != 0 || raw.tzindex != 0) {
+        throw ConversionException{
+            "datetime has timezone info; use AsTimestampTz()", GetPath()};
+    }
+    TimestampWithoutTz ts;
+    const int64_t total_ns =
+        raw.seconds * 1'000'000'000LL + static_cast<int64_t>(raw.nsec);
+    ts.tp = std::chrono::time_point<
+                std::chrono::system_clock, std::chrono::nanoseconds>{
+                std::chrono::nanoseconds{total_ns}};
+    return ts;
+}
+
+utils::datetime::Date Value::AsDate() const {
+    CheckNotMissing();
+    if (!IsDatetime()) ThrowTypeMismatch(kTypeExt);
+    const auto sv = GetExtData();
+    const auto raw = DecodeExt4Bytes(
+        reinterpret_cast<const uint8_t*>(sv.data()),
+        static_cast<uint32_t>(sv.size()));
+    if (raw.nsec != 0) {
+        throw ConversionException{
+            "datetime has sub-second part; not a plain date", GetPath()};
+    }
+    if (raw.tzoffset != 0 || raw.tzindex != 0) {
+        throw ConversionException{
+            "datetime has timezone info; not a plain date", GetPath()};
+    }
+    if (raw.seconds % 86400 != 0) {
+        throw ConversionException{
+            "datetime is not midnight-UTC; use AsDatetimeWithoutTz()", GetPath()};
+    }
+    using Days    = utils::datetime::Date::Days;
+    using SysDays = utils::datetime::Date::SysDays;
+    return utils::datetime::Date{SysDays{Days{raw.seconds / 86400LL}}};
+}
+
+TntInterval Value::AsInterval() const {
+    CheckNotMissing();
+    if (!IsInterval()) ThrowTypeMismatch(kTypeExt);
+    const auto sv = GetExtData();
+    const auto* p   = reinterpret_cast<const uint8_t*>(sv.data());
+    const auto* end = p + sv.size();
+
+    auto read_uint = [&]() -> uint64_t {
+        if (p >= end) throw ParseException{"Interval: unexpected end of data"};
+        const uint8_t b = *p++;
+        if (b <= 0x7f) return b;
+        if (b == 0xcc) {
+            if (p >= end) throw ParseException{"Interval: truncated uint8"};
+            return *p++;
+        }
+        if (b == 0xcd) {
+            if (p + 2 > end) throw ParseException{"Interval: truncated uint16"};
+            const uint16_t v = (static_cast<uint16_t>(p[0]) << 8) | p[1];
+            p += 2;
+            return v;
+        }
+        if (b == 0xce) {
+            if (p + 4 > end) throw ParseException{"Interval: truncated uint32"};
+            const uint32_t v =
+                (static_cast<uint32_t>(p[0]) << 24) |
+                (static_cast<uint32_t>(p[1]) << 16) |
+                (static_cast<uint32_t>(p[2]) <<  8) | p[3];
+            p += 4;
+            return v;
+        }
+        if (b == 0xcf) {
+            if (p + 8 > end) throw ParseException{"Interval: truncated uint64"};
+            uint64_t v = 0;
+            for (int i = 0; i < 8; ++i) v = (v << 8) | *p++;
+            return v;
+        }
+        throw ParseException{fmt::format("Interval: unexpected byte 0x{:02x} in uint", b)};
+    };
+
+    auto read_int = [&]() -> int64_t {
+        if (p >= end) throw ParseException{"Interval: unexpected end of data"};
+        const uint8_t b = *p;
+        if (b <= 0x7f) { ++p; return b; }
+        if ((b & 0xe0) == 0xe0) { ++p; return static_cast<int64_t>(static_cast<int8_t>(b)); }
+        if (b == 0xd0) {
+            p += 2;
+            if (p - 1 >= end) throw ParseException{"Interval: truncated int8"};
+            return static_cast<int64_t>(static_cast<int8_t>(*(p - 1)));
+        }
+        if (b == 0xd1) {
+            p += 3;
+            if (p - 2 >= end) throw ParseException{"Interval: truncated int16"};
+            const int16_t v = static_cast<int16_t>(
+                (static_cast<uint16_t>(*(p-2)) << 8) | *(p-1));
+            return static_cast<int64_t>(v);
+        }
+        if (b == 0xd2) {
+            p += 5;
+            if (p - 4 >= end) throw ParseException{"Interval: truncated int32"};
+            const int32_t v = static_cast<int32_t>(
+                (static_cast<uint32_t>(*(p-4)) << 24) |
+                (static_cast<uint32_t>(*(p-3)) << 16) |
+                (static_cast<uint32_t>(*(p-2)) <<  8) | *(p-1));
+            return static_cast<int64_t>(v);
+        }
+        if (b == 0xd3) {
+            p += 9;
+            if (p - 8 >= end) throw ParseException{"Interval: truncated int64"};
+            int64_t v = 0;
+            for (int i = 8; i >= 1; --i)
+                v = (v << 8) | static_cast<int64_t>(*(p - i));
+            return v;
+        }
+        // Fall through to uint read for non-negative values
+        return static_cast<int64_t>(read_uint());
+    };
+
+    const uint64_t count = read_uint();
+    TntInterval iv;
+    for (uint64_t i = 0; i < count; ++i) {
+        const uint64_t field_id = read_uint();
+        const int64_t  val      = read_int();
+        switch (field_id) {
+            case 0: iv.year       = val; break;
+            case 1: iv.month      = val; break;
+            case 2: iv.week       = val; break;
+            case 3: iv.day        = val; break;
+            case 4: iv.hour       = val; break;
+            case 5: iv.minute     = val; break;
+            case 6: iv.second     = val; break;
+            case 7: iv.nanosecond = val; break;
+            case 8: iv.adjust     = val; break;
+            default: break;  // unknown field, skip
+        }
+    }
+    return iv;
+}
+
+std::string Value::AsDecimalString() const {
+    CheckNotMissing();
+    if (!IsDecimal()) ThrowTypeMismatch(kTypeExt);
+    const auto sv = GetExtData();
+    const auto* p   = reinterpret_cast<const uint8_t*>(sv.data());
+    const auto* end = p + sv.size();
+
+    if (p >= end) throw ParseException{"Decimal: empty ext data"};
+
+    // Read scale as msgpack uint/int
+    int64_t scale = 0;
+    {
+        const uint8_t b = *p++;
+        if (b <= 0x7f) {
+            scale = static_cast<int64_t>(b);
+        } else if (b == 0xcc) {
+            if (p >= end) throw ParseException{"Decimal: truncated scale"};
+            scale = static_cast<int64_t>(*p++);
+        } else if (b == 0xcd) {
+            if (p + 2 > end) throw ParseException{"Decimal: truncated scale"};
+            scale = static_cast<int64_t>(
+                (static_cast<uint16_t>(p[0]) << 8) | p[1]);
+            p += 2;
+        } else if (b == 0xd0) {
+            if (p >= end) throw ParseException{"Decimal: truncated scale"};
+            scale = static_cast<int64_t>(static_cast<int8_t>(*p++));
+        } else if (b == 0xd1) {
+            if (p + 2 > end) throw ParseException{"Decimal: truncated scale"};
+            scale = static_cast<int64_t>(static_cast<int16_t>(
+                (static_cast<uint16_t>(p[0]) << 8) | p[1]));
+            p += 2;
+        } else {
+            throw ParseException{fmt::format(
+                "Decimal: unexpected scale byte 0x{:02x}", b)};
+        }
+    }
+
+    // Parse BCD nibbles; last nibble is sign
+    std::vector<uint8_t> digits;  // decimal digit values (0–9)
+    bool negative = false;
+
+    while (p < end) {
+        const uint8_t byte = *p++;
+        const uint8_t hi   = (byte >> 4) & 0x0f;
+        const uint8_t lo   = byte & 0x0f;
+
+        if (p >= end) {
+            // Last byte: lo nibble is sign
+            digits.push_back(hi);
+            negative = (lo == 0x0b || lo == 0x0d);
+        } else {
+            digits.push_back(hi);
+            digits.push_back(lo);
+        }
+    }
+
+    if (digits.empty()) return "0";
+
+    // Build decimal string
+    std::string all;
+    all.reserve(digits.size());
+    for (auto d : digits) all += static_cast<char>('0' + d);
+
+    std::string result;
+    const auto all_len = static_cast<int64_t>(all.size());
+
+    if (scale <= 0) {
+        const std::size_t nz = all.find_first_not_of('0');
+        result = (nz == std::string::npos) ? "0" : all.substr(nz);
+        if (scale < 0) result += std::string(static_cast<std::size_t>(-scale), '0');
+    } else if (scale >= all_len) {
+        result = "0.";
+        result += std::string(static_cast<std::size_t>(scale - all_len), '0');
+        result += all;
+    } else {
+        const std::size_t dot_pos = static_cast<std::size_t>(all_len - scale);
+        std::string int_part  = all.substr(0, dot_pos);
+        const std::string frac_part = all.substr(dot_pos);
+        const std::size_t nz = int_part.find_first_not_of('0');
+        int_part = (nz == std::string::npos) ? "0" : int_part.substr(nz);
+        result = int_part + "." + frac_part;
+    }
+
+    if (negative && result != "0") result = "-" + result;
+    return result;
+}
+
+// ---- As<T> specialisations for Tarantool types ----------------------------
+
+template <> utils::datetime::Date Value::As<utils::datetime::Date>() const {
+    return AsDate();
+}
+template <> DatetimeTz Value::As<DatetimeTz>() const {
+    return AsDatetimeTz();
+}
+template <> DatetimeWithoutTz Value::As<DatetimeWithoutTz>() const {
+    return AsDatetimeWithoutTz();
+}
+template <> TimestampTz Value::As<TimestampTz>() const {
+    return AsTimestampTz();
+}
+template <> TimestampWithoutTz Value::As<TimestampWithoutTz>() const {
+    return AsTimestampWithoutTz();
+}
+template <> TntUuid Value::As<TntUuid>() const {
+    return AsUuid();
+}
+template <> TntInterval Value::As<TntInterval>() const {
+    return AsInterval();
 }
 
 }  // namespace formats::msgpack

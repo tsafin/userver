@@ -1,8 +1,10 @@
 #include <userver/formats/msgpack/serialize.hpp>
 #include <userver/formats/msgpack/value.hpp>
 #include <userver/formats/msgpack/value_builder.hpp>
+#include <userver/formats/msgpack/tarantool_types.hpp>
+#include <userver/utils/datetime/date.hpp>
 
-#include <userver/utest/utest.hpp>
+#include <gtest/gtest.h>
 
 USERVER_NAMESPACE_BEGIN
 
@@ -306,6 +308,191 @@ TEST(MsgpackSerialize, ToBytesAndFromBytes) {
     const auto bytes = ToBytes(builder);
     const auto v = FromBytes(bytes);
     EXPECT_EQ(v.As<uint64_t>(), 12345u);
+}
+
+// ======================================================================== //
+//  Tarantool ext types — Phase A+B                                         //
+// ======================================================================== //
+
+TEST(MsgpackValue, UuidPredicateAndAs) {
+    TntUuid uuid;
+    uuid.bytes = {0x12,0x34,0x56,0x78,0x9a,0xbc,0xde,0xf0,
+                  0x11,0x22,0x33,0x44,0x55,0x66,0x77,0x88};
+    ValueBuilder vb{uuid};
+    auto bytes = vb.ToBytes();
+    auto val = Value::FromBytes(bytes.data(), bytes.size());
+    EXPECT_TRUE(val.IsExt());
+    EXPECT_TRUE(val.IsUuid());
+    EXPECT_FALSE(val.IsDatetime());
+    EXPECT_EQ(val.AsUuid(), uuid);
+    EXPECT_EQ(val.As<TntUuid>(), uuid);
+}
+
+TEST(MsgpackValue, UuidToString) {
+    TntUuid uuid;
+    uuid.bytes = {0x12,0x34,0x56,0x78,0x9a,0xbc,0xde,0xf0,
+                  0x11,0x22,0x33,0x44,0x55,0x66,0x77,0x88};
+    EXPECT_EQ(uuid.ToString(), "12345678-9abc-def0-1122-334455667788");
+}
+
+TEST(MsgpackValue, UuidFromString) {
+    const auto uuid = TntUuid::FromString("12345678-9abc-def0-1122-334455667788");
+    EXPECT_EQ(uuid.bytes[0], 0x12);
+    EXPECT_EQ(uuid.bytes[3], 0x78);
+    EXPECT_EQ(uuid.bytes[15], 0x88);
+}
+
+TEST(MsgpackValue, DatetimeTzRoundTrip) {
+    DatetimeTz dt;
+    dt.tp = std::chrono::time_point_cast<std::chrono::seconds>(
+                std::chrono::system_clock::from_time_t(1741267200));
+    dt.tzoffset = 180;
+    dt.tzindex  = 0;
+    ValueBuilder vb{dt};
+    auto bytes = vb.ToBytes();
+    auto val = Value::FromBytes(bytes.data(), bytes.size());
+    EXPECT_TRUE(val.IsDatetime());
+    EXPECT_FALSE(val.IsUuid());
+    auto dt2 = val.AsDatetimeTz();
+    EXPECT_EQ(dt2, dt);
+    EXPECT_EQ(val.As<DatetimeTz>(), dt);
+}
+
+TEST(MsgpackValue, DatetimeWithoutTzRoundTrip) {
+    DatetimeWithoutTz dt;
+    dt.tp = std::chrono::time_point_cast<std::chrono::seconds>(
+                std::chrono::system_clock::from_time_t(1741267200));
+    ValueBuilder vb{dt};
+    auto bytes = vb.ToBytes();
+    auto val = Value::FromBytes(bytes.data(), bytes.size());
+    EXPECT_TRUE(val.IsDatetime());
+    auto dt2 = val.AsDatetimeWithoutTz();
+    EXPECT_EQ(dt2, dt);
+    EXPECT_EQ(val.As<DatetimeWithoutTz>(), dt);
+}
+
+TEST(MsgpackValue, TimestampTzRoundTrip) {
+    TimestampTz ts;
+    ts.tp = std::chrono::time_point_cast<std::chrono::nanoseconds>(
+                std::chrono::system_clock::from_time_t(1000)) +
+            std::chrono::nanoseconds{123456789};
+    ts.tzoffset = 60;
+    ts.tzindex  = 0;
+    ValueBuilder vb{ts};
+    auto bytes = vb.ToBytes();
+    auto val = Value::FromBytes(bytes.data(), bytes.size());
+    EXPECT_TRUE(val.IsDatetime());
+    auto ts2 = val.AsTimestampTz();
+    EXPECT_EQ(ts2, ts);
+}
+
+TEST(MsgpackValue, TimestampWithoutTzRoundTrip) {
+    TimestampWithoutTz ts;
+    ts.tp = std::chrono::time_point_cast<std::chrono::nanoseconds>(
+                std::chrono::system_clock::from_time_t(1000)) +
+            std::chrono::nanoseconds{500000000};
+    ValueBuilder vb{ts};
+    auto bytes = vb.ToBytes();
+    auto val = Value::FromBytes(bytes.data(), bytes.size());
+    EXPECT_TRUE(val.IsDatetime());
+    auto ts2 = val.AsTimestampWithoutTz();
+    EXPECT_EQ(ts2, ts);
+}
+
+TEST(MsgpackValue, DatetimeTzThrowsOnNsec) {
+    TimestampTz ts;
+    ts.tp = std::chrono::time_point_cast<std::chrono::nanoseconds>(
+                std::chrono::system_clock::from_time_t(1000)) +
+            std::chrono::nanoseconds{500};
+    ValueBuilder vb{ts};
+    auto bytes = vb.ToBytes();
+    auto val = Value::FromBytes(bytes.data(), bytes.size());
+    EXPECT_THROW(val.AsDatetimeTz(), ConversionException);
+    EXPECT_NO_THROW(val.AsTimestampTz());
+}
+
+TEST(MsgpackValue, AsDateValidation) {
+    DatetimeTz dt;
+    dt.tp = std::chrono::time_point_cast<std::chrono::seconds>(
+                std::chrono::system_clock::from_time_t(1000));
+    ValueBuilder vb{dt};
+    auto bytes = vb.ToBytes();
+    auto val = Value::FromBytes(bytes.data(), bytes.size());
+    EXPECT_THROW(val.AsDate(), ConversionException);
+}
+
+TEST(MsgpackValue, AsDateSuccess) {
+    // 2025-01-01 00:00:00 UTC = 1735689600 seconds
+    DatetimeWithoutTz dt;
+    dt.tp = std::chrono::time_point_cast<std::chrono::seconds>(
+                std::chrono::system_clock::from_time_t(1735689600));
+    ValueBuilder vb{dt};
+    auto bytes = vb.ToBytes();
+    auto val = Value::FromBytes(bytes.data(), bytes.size());
+    auto date = val.AsDate();
+    EXPECT_EQ(date, utils::datetime::Date(2025, 1, 1));
+    EXPECT_EQ(val.As<utils::datetime::Date>(), utils::datetime::Date(2025, 1, 1));
+}
+
+TEST(MsgpackValue, IntervalRoundTrip) {
+    TntInterval iv;
+    iv.day    = 3;
+    iv.hour   = 2;
+    iv.minute = 30;
+    ValueBuilder vb{iv};
+    auto bytes = vb.ToBytes();
+    auto val = Value::FromBytes(bytes.data(), bytes.size());
+    EXPECT_TRUE(val.IsInterval());
+    EXPECT_FALSE(val.IsUuid());
+    auto iv2 = val.AsInterval();
+    EXPECT_EQ(iv2, iv);
+    EXPECT_EQ(val.As<TntInterval>(), iv);
+}
+
+TEST(MsgpackValue, IntervalAllZeroRoundTrip) {
+    TntInterval iv;
+    ValueBuilder vb{iv};
+    auto bytes = vb.ToBytes();
+    auto val = Value::FromBytes(bytes.data(), bytes.size());
+    EXPECT_TRUE(val.IsInterval());
+    auto iv2 = val.AsInterval();
+    EXPECT_EQ(iv2, iv);
+}
+
+TEST(MsgpackValue, IntervalToNanoseconds) {
+    TntInterval iv;
+    iv.day  = 1;
+    iv.hour = 2;
+    auto ns = iv.ToNanoseconds();
+    EXPECT_EQ(ns.count(), (1LL * 86400 + 2LL * 3600) * 1'000'000'000LL);
+}
+
+TEST(MsgpackValue, IntervalCalendarThrows) {
+    TntInterval iv;
+    iv.year = 1;
+    EXPECT_THROW(iv.ToNanoseconds(), ConversionException);
+}
+
+TEST(MsgpackValue, IntervalMonthThrows) {
+    TntInterval iv;
+    iv.month = 3;
+    EXPECT_THROW(iv.ToNanoseconds(), ConversionException);
+}
+
+TEST(MsgpackValue, IntervalWeekThrows) {
+    TntInterval iv;
+    iv.week = 2;
+    EXPECT_THROW(iv.ToNanoseconds(), ConversionException);
+}
+
+TEST(MsgpackValue, DecimalString) {
+    // Tarantool example: -12.34
+    // fixext4 (0xd6) type=1 (0x01) data={0x02,0x01,0x23,0x4d}
+    const std::vector<uint8_t> bytes = {0xd6, 0x01, 0x02, 0x01, 0x23, 0x4d};
+    auto val = Value::FromBytes(bytes.data(), bytes.size());
+    EXPECT_TRUE(val.IsDecimal());
+    EXPECT_FALSE(val.IsUuid());
+    EXPECT_EQ(val.AsDecimalString(), "-12.34");
 }
 
 USERVER_NAMESPACE_END

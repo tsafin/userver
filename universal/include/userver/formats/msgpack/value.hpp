@@ -10,6 +10,8 @@
 #include <vector>
 
 #include <userver/formats/msgpack/exception.hpp>
+#include <userver/formats/msgpack/tarantool_types.hpp>
+#include <userver/utils/datetime/date.hpp>
 
 USERVER_NAMESPACE_BEGIN
 
@@ -62,6 +64,24 @@ public:
     bool IsObject() const noexcept;
     /// @returns true for any ext type (fixext/ext8/ext16/ext32).
     bool IsExt() const noexcept;
+
+    // ---- Tarantool ext type predicates ----
+    bool IsUuid()     const noexcept;  ///< ext type 2
+    bool IsDatetime() const noexcept;  ///< ext type 4
+    bool IsDecimal()  const noexcept;  ///< ext type 1
+    bool IsInterval() const noexcept;  ///< ext type 6
+
+    // ---- Date/time accessors (all from ext type 4) ----
+    utils::datetime::Date  AsDate()               const;
+    DatetimeWithoutTz      AsDatetimeWithoutTz()  const;
+    DatetimeTz             AsDatetimeTz()         const;
+    TimestampWithoutTz     AsTimestampWithoutTz() const;
+    TimestampTz            AsTimestampTz()        const;
+
+    TntUuid                AsUuid()      const;  ///< ext type 2
+    TntInterval            AsInterval()  const;  ///< ext type 6
+
+    std::string AsDecimalString() const;  ///< ext type 1, always lossless
 
     /// @returns number of elements in an array or map; 0 for scalars.
     std::size_t GetSize() const;
@@ -174,6 +194,14 @@ template <> uint64_t    Value::As<uint64_t>()    const;
 template <> float       Value::As<float>()       const;
 template <> double      Value::As<double>()      const;
 template <> std::string Value::As<std::string>() const;
+
+template <> utils::datetime::Date   Value::As<utils::datetime::Date>()   const;
+template <> DatetimeTz              Value::As<DatetimeTz>()              const;
+template <> DatetimeWithoutTz       Value::As<DatetimeWithoutTz>()       const;
+template <> TimestampTz             Value::As<TimestampTz>()             const;
+template <> TimestampWithoutTz      Value::As<TimestampWithoutTz>()      const;
+template <> TntUuid                 Value::As<TntUuid>()                 const;
+template <> TntInterval             Value::As<TntInterval>()             const;
 
 }  // namespace formats::msgpack
 
