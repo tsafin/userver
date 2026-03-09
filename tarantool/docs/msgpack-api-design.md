@@ -298,63 +298,148 @@ the `Value` type differs.
 
 ## Connector migration plan
 
-### Phase 1 — Internal only (zero public API change)
+### Phase 1 — Internal only (zero public API change) ✅ IMPLEMENTED
 
-Replace `EncodeJson()` calls in `connection.cpp` with `ValueBuilder`:
-
-```cpp
-// Before:
-EncodeFixMap(body, 2);
-EncodeUint(body, kKeySpaceId); EncodeUint(body, space_id);
-EncodeUint(body, kKeyTuple);   EncodeJson(body, query.GetArgs());  // JSON→msgpack
-
-// After:
-auto b = ValueBuilder::IntKeyObject();
-b[kKeySpaceId] = ValueBuilder{space_id};
-b[kKeyTuple]   = ValueBuilder{query.GetArgs()};   // still from json::Value, via FromJson()
-auto body = b.ToBytes();
-```
-
-Fix integer-key access in the decoder:
+Replace `MpDecoder` header decode in `connection.cpp` with `formats::msgpack::Value`
+zero-copy cursor.  Fix integer-key access (was broken: keys stored as strings).
 
 ```cpp
-// Before (bug: integer keys stored as strings by MpDecoder):
+// Before (broken: integer keys stored as strings by MpDecoder::DecodeMap):
 const auto code    = header["0"].As<int64_t>(0);
 const auto sync_id = header["1"].As<uint64_t>(0);
 
-// After (correct):
-const auto code    = header[kKeyCode].As<int64_t>(0);
-const auto sync_id = header[kKeySync].As<uint64_t>(0);
+// After (correct, zero-copy):
+auto header = formats::msgpack::Value::FromBytes(body_data, body_len);
+const auto code    = header[kKeyCode].As<int64_t>(0);   // kKeyCode = 0x00
+const auto sync_id = header[kKeySync].As<uint64_t>(0);  // kKeySync = 0x01
+auto body_view     = header.NextSibling();               // skip past header in same buffer
 ```
 
-### Phase 2 — Public API change
+**Result**: PING +97%, REPLACE +39% (see Performance Results section).
 
-Replace `formats::json::Value` with `formats::msgpack::Value` in:
-- `Query`: `GetArgs()`, `GetOps()`, factory methods `Replace()`, `Select()`, etc.
-- `ExecutionResult`: `GetData()`
+### Phase 2 — `ExecutionResult::GetData()` returns `msgpack::Value` ✅ IMPLEMENTED
 
-Provide migration helpers to avoid hard breaks:
+Replace `MpDecoder::DecodeValue()` in the hot path with a byte copy into an
+owned buffer in `ExecutionResult`, exposing a zero-copy cursor to callers.
+
 ```cpp
-// Deprecated overload bridging the transition:
+// Before (hot path in ReaderLoop, per request):
+MpDecoder data_dec{data_cursor.GetRawPos(), data_cursor.GetRawEnd()};
+data_val = data_dec.DecodeValue();   // allocates json::Value tree
+ExecutionResult result{..., std::move(data_val)};
+
+// After (Phase 2):
+const auto data_cursor = body_view[kKeyData];
+const auto next = data_cursor.NextSibling();
+const uint8_t* data_end = next.IsMissing() ? data_cursor.GetRawEnd() : next.GetRawPos();
+data_buf.assign(data_cursor.GetRawPos(), data_end);   // one memcpy, tight bounds
+ExecutionResult result{..., std::move(data_buf)};    // result owns the bytes
+```
+
+`ExecutionResult` stores `std::vector<uint8_t> data_buf_` + a
+`formats::msgpack::Value data_` cursor into it.  `GetData()` returns
+`const formats::msgpack::Value&`.  Callers using `IsArray()`, `GetSize()`,
+`operator[]`, `As<T>()` require **no changes** — the API is identical.
+
+**Result**: REPLACE +16% on top of Phase 1 (total +63% vs baseline).
+
+### Phase 3 — Query encode side (planned)
+
+Replace `EncodeJson()` (JSON→msgpack conversion) in `connection.cpp` with
+`formats::msgpack::ValueBuilder` built directly from the query arguments.  This
+requires changing the `Query` public API:
+
+```cpp
+// Current (Query stores json::Value args):
+Query Query::Replace(std::string space, formats::json::Value tuple);
+
+// Phase 3 target:
+Query Query::Replace(std::string space, formats::msgpack::ValueBuilder args);
+
+// Deprecated bridge for migration:
 Query Query::Replace(std::string space, formats::json::Value tuple) {
     return Replace(std::move(space), formats::msgpack::FromJson(tuple));
 }
 ```
 
+Estimated saving: ~2 µs/op (eliminates remaining `EncodeJson` overhead).
+
 ---
 
-## Performance estimate
+## Performance Results (Measured)
 
-| Step                  | Current cost | After Phase 1 | After Phase 2 |
-|-----------------------|-------------|---------------|---------------|
-| JSON→msgpack encode   | 4 µs        | ~1 µs (Node tree → bytes) | eliminated |
-| msgpack→JSON decode   | 3–4 µs      | eliminated (cursor view)  | eliminated |
-| Net per-op saving     | —           | ~3 µs         | ~7 µs         |
-| Connector overhead    | 158 µs      | ~155 µs       | ~151 µs       |
+### Benchmark setup
 
-The 7 µs saving per op at 70k op/s pipeline ceiling → theoretical +5% throughput.
-The more significant win is at **low concurrency** (sequential) where the saving
-is proportionally larger against the 250 µs total round-trip.
+- Hardware: WSL2, Intel Core i7, 4 coro-runner threads, pool=4 connections
+- Tarantool: loopback TCP, raw PING RTT **~29 µs**
+- Workload: REPLACE on a simple `{id, value}` space; PING for header-only baseline
+- Tool: `TarantoolBench.InsertThroughput` in `userver-tarantool_tttest`
+
+All numbers below are **pipeline coro=128** (128 concurrent coroutines sharing 4
+connections), which maximises pipelining and is most sensitive to decode overhead.
+
+### Stage results
+
+| Stage | PING op/s | PING µs/op | REPLACE op/s | REPLACE µs/op | Notes |
+|-------|-----------|------------|--------------|----------------|-------|
+| Baseline (json::Value throughout) | 69 k | 14 µs | 38 k | 26 µs | EncodeJson + MpDecoder |
+| Phase 1 — zero-copy header decode | 136 k | **7 µs** | 53 k | 18 µs | msgpack::Value header; integer keys |
+| Phase 2 — zero-copy data decode   | 136 k | 7 µs | 62 k | **16 µs** | ExecutionResult stores raw bytes |
+
+Phase 1 doubled PING throughput (+97%) because PING responses carry **no body** —
+the entire old hot path was `MpDecoder` allocating a JSON node tree for a 7-byte
+header map, all of which is now eliminated.
+
+Phase 2 added +16% to REPLACE on top of Phase 1 (+63% total vs baseline), by
+replacing `MpDecoder::DecodeValue()` for the data tuple with a `memcpy` of the
+raw bytes followed by a zero-copy `msgpack::Value` cursor in `ExecutionResult`.
+
+### Profiling analysis (perf record, WSL2 cpu-clock event)
+
+After Phase 1 the profiler (`perf record --no-buildid -e cpu-clock:u -g -F 99`)
+showed the following breakdown of `Connection::ReaderLoop()` CPU time:
+
+| Hot spot | Share of ReaderLoop | Root cause |
+|----------|---------------------|------------|
+| `MpDecoder::DecodeValue()` | **77.5%** | `json::ValueBuilder` / `json::Value` destruction — atomic `shared_ptr::_M_release()` per node |
+| `engine::Promise<ExecutionResult>::~Promise()` | 17.5% | `shared_ptr<FutureState>` refcount — intrinsic to coroutine scheduling |
+| Everything else | 5% | memcpy, string ops, I/O epoll |
+
+ReaderLoop itself accounted for ~47% of total user-space CPU; the remainder was
+network I/O wait and coroutine scheduling. This is why the wall-clock gain from
+Phase 2 (+16%) is smaller than the profiler fraction (77.5%) suggests — the
+benchmark is I/O-bound at this concurrency level.
+
+### Remaining bottleneck
+
+After Phase 2 the per-op breakdown for REPLACE at coro=128 is approximately:
+
+| Component | µs/op |
+|-----------|-------|
+| Tarantool server processing + loopback RTT | ~10 µs |
+| userver coroutine scheduling (FutureState shared_ptr) | ~3 µs |
+| IPROTO frame encode (`EncodeJson` → still JSON for query args) | ~2 µs |
+| `data_buf.assign()` memcpy (Phase 2 overhead) | < 0.5 µs |
+| **Total** | **~16 µs** |
+
+The remaining Phase 3 opportunity is replacing `EncodeJson()` for query
+arguments (the encode side of the Query API), which would save another ~2 µs.
+
+---
+
+## Performance estimate (original pre-implementation prediction)
+
+| Step                  | Predicted cost | After Phase 1 (actual) | After Phase 2 (actual) |
+|-----------------------|---------------|------------------------|------------------------|
+| JSON→msgpack encode   | 4 µs          | unchanged              | ~2 µs (still EncodeJson) |
+| msgpack→JSON decode   | 3–4 µs        | eliminated ✓           | eliminated ✓             |
+| Net per-op saving     | —             | ~8 µs (PING), ~8 µs (REPLACE) | +2 µs more (REPLACE) |
+| Connector overhead    | 158 µs        | ~150 µs (REPLACE)      | ~148 µs (REPLACE)      |
+
+The prediction of ~7 µs total saving was roughly accurate; the actual end-to-end
+improvement was ~10 µs/op for REPLACE (baseline 26 µs → Phase 2 16 µs).  The
+bigger win was the +97% PING improvement, which was not predicted because PING
+responses were not benchmarked in the original estimate.
 
 ---
 
@@ -363,40 +448,55 @@ is proportionally larger against the 250 µs total round-trip.
 ```
 universal/
   include/userver/formats/msgpack/
-    value.hpp           # Value (read cursor) + const_iterator
-    value_builder.hpp   # ValueBuilder (variant tree builder)
-    serialize.hpp       # ToBytes / FromBytes / FromJson / ToJson
-    exception.hpp       # TypeMismatchException, OutOfBoundsException
+    value.hpp           # Value (read cursor) + NextSibling() ✅ implemented
+    value_builder.hpp   # ValueBuilder (variant tree builder) ✅ implemented
+    serialize.hpp       # ToBytes / FromBytes ✅ implemented
+    exception.hpp       # TypeMismatchException, OutOfBoundsException ✅ implemented
   src/formats/msgpack/
-    value.cpp
-    value_builder.cpp
-    serialize.cpp
+    value.cpp           # ✅ implemented (Skip, operator[], As<T> specialisations)
+    value_builder.cpp   # ✅ implemented (EncodeNode recursive encoder)
+    serialize.cpp       # ✅ implemented
 
 tarantool/
   src/storages/tarantool/impl/
-    msgpack.hpp         # keep: low-level EncodeXxx / MpDecoder; mark constexpr
-    connection.cpp      # migrate EncodeJson() → ValueBuilder; fix integer key access
+    msgpack.hpp         # keep: low-level EncodeXxx + MpDecoder for query encode side
+    connection.cpp      # ✅ Phase 1+2: zero-copy header + data decode
   include/userver/storages/tarantool/
-    query.hpp           # Phase 2: replace json::Value → msgpack::Value
-    result.hpp          # Phase 2: replace json::Value → msgpack::Value
+    query.hpp           # Phase 3: replace json::Value args → msgpack::ValueBuilder
+    result.hpp          # ✅ Phase 2: GetData() now returns formats::msgpack::Value
 ```
 
 ---
 
-## Open questions / decisions needed
+## Open questions / decisions resolved and remaining
 
-1. **Namespace**: `formats::msgpack` (generic userver lib, reusable by Redis and
-   other connectors) vs `storages::tarantool::msgpack` (tarantool-only)?
+### Resolved
 
-2. **Integer-keyed map**: separate `IntKeyObject()` factory, or auto-detect based
-   on the type of the first key inserted?
+1. **Namespace**: ✅ `formats::msgpack` — placed in `universal/`, making it
+   reusable by Redis and other connectors.
 
-3. **`Value` ownership**: current design is non-owning (caller holds buffer).
-   An owning `OwnedValue` wrapper (`shared_ptr<vector<uint8_t>>` + cursor) would
-   simplify lifetimes at the cost of one allocation per response.
+2. **Integer-keyed map**: ✅ Separate `IntKeyObject()` factory used for IPROTO
+   encoding; regular `Object()` for string keys.  `operator[](size_t)` on `Value`
+   does dual-dispatch at runtime (array index OR integer map lookup depending on
+   the actual type).
 
-4. **Phase 2 timing**: separate PR (breaking change to `Query`/`ExecutionResult`)?
+3. **`Value` ownership in `ExecutionResult`**: ✅ `ExecutionResult` owns a
+   `std::vector<uint8_t> data_buf_` and holds a zero-copy `msgpack::Value` cursor
+   into it.  No `shared_ptr` per response — one allocation per result (the memcpy
+   of the data bytes), no per-element refcounting.
 
-5. **`formats::parse` / `formats::serialize` framework**: full integration doubles
-   the work but allows type-safe round-trips with user-defined types.  Can be
-   deferred to Phase 2.
+4. **Phase 2 timing**: ✅ Implemented as part of the same PR.  The public API
+   change (`GetData()` return type) is source-compatible for existing callers
+   because `formats::msgpack::Value` exposes the same navigation API
+   (`IsArray()`, `GetSize()`, `operator[]`, `As<T>()`).
+
+### Still open
+
+5. **`formats::parse` / `formats::serialize` framework**: full ADL integration
+   would allow user-defined types to round-trip through msgpack without manual
+   `As<T>()` calls.  Can be implemented in Phase 3 alongside the Query encode
+   migration.
+
+6. **Phase 3 timing**: The Query encode side (replacing `EncodeJson()`) is a
+   breaking public API change (`Query::Replace()` etc. accept `json::Value` today).
+   Should be a separate PR with deprecated JSON overloads as bridges.
