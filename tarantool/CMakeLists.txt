@@ -36,10 +36,17 @@ target_include_directories(${PROJECT_NAME}
 )
 
 if (USERVER_IS_THE_ROOT_PROJECT)
+    # Also include universal formats/msgpack tests (compiled only here since
+    # USERVER_BUILD_TESTS=OFF in the tarantool-as-root-project build).
+    file(GLOB_RECURSE UNIVERSAL_MSGPACK_TEST_SOURCES
+        ${CMAKE_SOURCE_DIR}/universal/src/formats/msgpack/*_test.cpp)
+    list(APPEND UNIT_TEST_SOURCES ${UNIVERSAL_MSGPACK_TEST_SOURCES})
+
     if (UNIT_TEST_SOURCES)
         add_executable(${PROJECT_NAME}_unittest ${UNIT_TEST_SOURCES})
         target_include_directories(${PROJECT_NAME}_unittest PRIVATE
-            $<TARGET_PROPERTY:${PROJECT_NAME},INCLUDE_DIRECTORIES>)
+            $<TARGET_PROPERTY:${PROJECT_NAME},INCLUDE_DIRECTORIES>
+            $<TARGET_PROPERTY:userver-universal,INCLUDE_DIRECTORIES>)
         if (USERVER_CONAN)
             target_link_libraries(${PROJECT_NAME}_unittest userver-utest ${PROJECT_NAME} tntcxx::tntcxx)
         else()
