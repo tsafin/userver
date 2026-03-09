@@ -351,6 +351,17 @@ Value::Value(const uint8_t* pos, const uint8_t* end, std::string path) noexcept
 std::string Value::GetPath() const { return path_.empty() ? "/" : path_; }
 
 // ======================================================================== //
+//  NextSibling                                                              //
+// ======================================================================== //
+
+Value Value::NextSibling() const {
+    if (IsMissing()) return Value{};
+    const uint8_t* next = Skip(pos_, end_, path_);
+    if (next >= end_) return Value{};
+    return Value{next, end_, path_};
+}
+
+// ======================================================================== //
 //  CheckNotMissing / ThrowTypeMismatch                                      //
 // ======================================================================== //
 

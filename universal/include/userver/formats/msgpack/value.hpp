@@ -127,9 +127,13 @@ public:
     using ParseException = formats::msgpack::ParseException;
     using ExceptionWithPath = formats::msgpack::ExceptionWithPath;
 
-    // ------------------------------------------------------------------ //
-    //  Raw access (advanced)                                               //
-    // ------------------------------------------------------------------ //
+    /// @brief Returns a cursor pointing to the byte immediately after this value.
+    ///
+    /// Useful when a buffer contains two consecutive msgpack values (e.g. the
+    /// IPROTO header followed by the IPROTO body in the same receive buffer).
+    /// Returns a missing Value if this value extends to the very end of the
+    /// buffer (no bytes remain).
+    Value NextSibling() const;
 
     /// @returns pointer to the first byte of this value in the buffer.
     const uint8_t* GetRawPos() const noexcept { return pos_; }

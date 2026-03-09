@@ -18,6 +18,7 @@
 #include <userver/engine/io/socket.hpp>
 #include <userver/engine/sleep.hpp>
 #include <userver/formats/json/value_builder.hpp>
+#include <userver/formats/msgpack/value.hpp>
 #include <userver/logging/log.hpp>
 #include <userver/tracing/span.hpp>
 #include <userver/tracing/tags.hpp>
@@ -247,9 +248,8 @@ void Connection::DoAuth(const AuthSettings& auth,
     std::vector<uint8_t> resp(body_len);
     static_cast<void>(socket_.RecvAll(resp.data(), body_len, deadline));
 
-    MpDecoder dec{resp.data(), resp.data() + body_len};
-    auto header = dec.DecodeValue();
-    if (header["0"].As<int64_t>(0) != 0) {
+    auto header = formats::msgpack::Value::FromBytes(resp.data(), body_len);
+    if (header[kKeyCode].As<int64_t>(0) != 0) {
         throw TarantoolAuthException{"authentication failed"};
     }
 }
@@ -296,24 +296,35 @@ void Connection::ReaderLoop() {
             // Decode directly from the buffer (zero-copy): set body_data before
             // advancing rpos so the pointer stays valid during decode.
             const uint8_t* body_data = rbuf.data() + rpos;
-            MpDecoder dec{body_data, body_data + body_len};
             rpos += body_len;
 
-            auto header = dec.DecodeValue();
-            const auto sync_id = header["1"].As<uint64_t>(0);
-            const auto code    = header["0"].As<int64_t>(0);
+            // Zero-copy header parse: scan the header map for code/sync keys
+            // without allocating any JSON nodes.
+            auto header = formats::msgpack::Value::FromBytes(body_data, body_len);
+            const auto sync_id = header[kKeySync].As<uint64_t>(0);
+            const auto code    = header[kKeyCode].As<int64_t>(0);
+
+            // Body starts immediately after the header in the same buffer.
+            auto body_view = header.NextSibling();
 
             formats::json::Value data_val{};
             std::string error_msg;
             if (code != 0) {
-                if (dec.p < dec.end) {
-                    auto body_map = dec.DecodeValue();
-                    error_msg = body_map["49"].As<std::string>("tarantool error");
+                if (!body_view.IsMissing()) {
+                    error_msg = body_view[kKeyError].As<std::string>(
+                        "tarantool error");
                 }
             } else {
-                if (dec.p < dec.end) {
-                    auto body_map = dec.DecodeValue();
-                    data_val = body_map["48"];
+                if (!body_view.IsMissing()) {
+                    // Navigate to the data array via integer key (0x30).
+                    // Then decode only that sub-value into json::Value for the
+                    // public API (Phase 2 will replace this with msgpack::Value).
+                    auto data_cursor = body_view[kKeyData];
+                    if (!data_cursor.IsMissing()) {
+                        MpDecoder data_dec{data_cursor.GetRawPos(),
+                                           data_cursor.GetRawEnd()};
+                        data_val = data_dec.DecodeValue();
+                    }
                 }
             }
             ExecutionResult result{code == 0,
