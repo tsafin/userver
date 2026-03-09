@@ -1,6 +1,7 @@
 #include <userver/utest/utest.hpp>
 
 #include <userver/formats/msgpack/value.hpp>
+#include <userver/formats/msgpack/value_builder.hpp>
 #include <userver/storages/tarantool/error_info.hpp>
 #include <storages/tarantool/impl/msgpack.hpp>
 
@@ -8,16 +9,13 @@ USERVER_NAMESPACE_BEGIN
 
 using namespace storages::tarantool::impl;
 
-// Helper: encode a JSON value and return raw bytes
-static std::vector<uint8_t> Encode(const formats::json::Value& v) {
-    std::vector<uint8_t> buf;
-    EncodeJson(buf, v);
-    return buf;
+// Helper: build bytes via ValueBuilder and round-trip through MsgPackDecode
+static std::vector<uint8_t> EncodeVb(formats::msgpack::ValueBuilder vb) {
+    return vb.ToBytes();
 }
 
-// Helper: round-trip a JSON value through encode+decode
-static formats::json::Value RoundTrip(const formats::json::Value& v) {
-    return MsgPackDecode(Encode(v));
+static formats::json::Value RoundTrip(formats::msgpack::ValueBuilder vb) {
+    return MsgPackDecode(EncodeVb(std::move(vb)));
 }
 
 // ---- EncodeUint / positive integers ----
@@ -110,149 +108,146 @@ TEST(MsgPackEncode, Array16) {
     EXPECT_EQ(buf, (std::vector<uint8_t>{mp::kArray16, 0x00, 0x10}));
 }
 
-// ---- EncodeJson scalars ----
+// ---- ValueBuilder byte encoding tests ----
 
-TEST(MsgPackEncodeJson, Null) {
-    auto buf = Encode(formats::json::Value{});
+TEST(MsgPackEncodeVb, Null) {
+    auto buf = EncodeVb(formats::msgpack::ValueBuilder{});
     EXPECT_EQ(buf, (std::vector<uint8_t>{mp::kNil}));
 }
 
-TEST(MsgPackEncodeJson, BoolTrue) {
-    auto buf = Encode(formats::json::ValueBuilder{true}.ExtractValue());
+TEST(MsgPackEncodeVb, BoolTrue) {
+    auto buf = EncodeVb(formats::msgpack::ValueBuilder{true});
     EXPECT_EQ(buf, (std::vector<uint8_t>{mp::kTrue}));
 }
 
-TEST(MsgPackEncodeJson, BoolFalse) {
-    auto buf = Encode(formats::json::ValueBuilder{false}.ExtractValue());
+TEST(MsgPackEncodeVb, BoolFalse) {
+    auto buf = EncodeVb(formats::msgpack::ValueBuilder{false});
     EXPECT_EQ(buf, (std::vector<uint8_t>{mp::kFalse}));
 }
 
-TEST(MsgPackEncodeJson, NegativeFixint) {
-    // -1 -> negative fixint 0xff
-    auto buf = Encode(formats::json::ValueBuilder{int64_t{-1}}.ExtractValue());
+TEST(MsgPackEncodeVb, NegativeFixint) {
+    auto buf = EncodeVb(formats::msgpack::ValueBuilder{int8_t{-1}});
     EXPECT_EQ(buf, (std::vector<uint8_t>{0xff}));
 
-    // -32 -> negative fixint 0xe0
-    buf = Encode(formats::json::ValueBuilder{int64_t{-32}}.ExtractValue());
+    buf = EncodeVb(formats::msgpack::ValueBuilder{int8_t{-32}});
     EXPECT_EQ(buf, (std::vector<uint8_t>{0xe0}));
 }
 
-TEST(MsgPackEncodeJson, NegativeInt8) {
-    auto buf = Encode(formats::json::ValueBuilder{int64_t{-33}}.ExtractValue());
+TEST(MsgPackEncodeVb, NegativeInt8) {
+    auto buf = EncodeVb(formats::msgpack::ValueBuilder{int8_t{-33}});
     EXPECT_EQ(buf[0], mp::kInt8);
     EXPECT_EQ(buf.size(), 2u);
 }
 
-TEST(MsgPackEncodeJson, String) {
-    auto buf = Encode(formats::json::ValueBuilder{std::string{"abc"}}.ExtractValue());
+TEST(MsgPackEncodeVb, String) {
+    auto buf = EncodeVb(formats::msgpack::ValueBuilder{std::string_view{"abc"}});
     EXPECT_EQ(buf, (std::vector<uint8_t>{0xa3, 'a', 'b', 'c'}));
 }
 
 // ---- DecodeValue: scalar round-trips ----
 
 TEST(MsgPackRoundTrip, Zero) {
-    auto v = RoundTrip(formats::json::ValueBuilder{int64_t{0}}.ExtractValue());
+    auto v = RoundTrip(formats::msgpack::ValueBuilder{int64_t{0}});
     EXPECT_EQ(v.As<int64_t>(), 0);
 }
 
 TEST(MsgPackRoundTrip, PositiveFixint) {
-    auto v = RoundTrip(formats::json::ValueBuilder{int64_t{42}}.ExtractValue());
+    auto v = RoundTrip(formats::msgpack::ValueBuilder{int64_t{42}});
     EXPECT_EQ(v.As<int64_t>(), 42);
 }
 
 TEST(MsgPackRoundTrip, Uint255) {
-    auto v = RoundTrip(formats::json::ValueBuilder{int64_t{255}}.ExtractValue());
+    auto v = RoundTrip(formats::msgpack::ValueBuilder{int64_t{255}});
     EXPECT_EQ(v.As<int64_t>(), 255);
 }
 
 TEST(MsgPackRoundTrip, Uint65535) {
-    auto v = RoundTrip(formats::json::ValueBuilder{int64_t{65535}}.ExtractValue());
+    auto v = RoundTrip(formats::msgpack::ValueBuilder{int64_t{65535}});
     EXPECT_EQ(v.As<int64_t>(), 65535);
 }
 
 TEST(MsgPackRoundTrip, LargeUint) {
-    auto v = RoundTrip(formats::json::ValueBuilder{uint64_t{0xDEADBEEFULL}}.ExtractValue());
+    auto v = RoundTrip(formats::msgpack::ValueBuilder{uint64_t{0xDEADBEEFULL}});
     EXPECT_EQ(v.As<int64_t>(), static_cast<int64_t>(0xDEADBEEF));
 }
 
 TEST(MsgPackRoundTrip, NegativeFixint) {
-    auto v = RoundTrip(formats::json::ValueBuilder{int64_t{-1}}.ExtractValue());
+    auto v = RoundTrip(formats::msgpack::ValueBuilder{int8_t{-1}});
     EXPECT_EQ(v.As<int64_t>(), -1);
 }
 
 TEST(MsgPackRoundTrip, NegativeInt8) {
-    auto v = RoundTrip(formats::json::ValueBuilder{int64_t{-100}}.ExtractValue());
+    auto v = RoundTrip(formats::msgpack::ValueBuilder{int8_t{-100}});
     EXPECT_EQ(v.As<int64_t>(), -100);
 }
 
 TEST(MsgPackRoundTrip, NegativeInt16) {
-    auto v = RoundTrip(formats::json::ValueBuilder{int64_t{-1000}}.ExtractValue());
+    auto v = RoundTrip(formats::msgpack::ValueBuilder{int16_t{-1000}});
     EXPECT_EQ(v.As<int64_t>(), -1000);
 }
 
 TEST(MsgPackRoundTrip, NegativeInt32) {
-    auto v = RoundTrip(formats::json::ValueBuilder{int64_t{-100000}}.ExtractValue());
+    auto v = RoundTrip(formats::msgpack::ValueBuilder{int32_t{-100000}});
     EXPECT_EQ(v.As<int64_t>(), -100000);
 }
 
 TEST(MsgPackRoundTrip, NegativeInt64) {
     constexpr int64_t kVal = -(1LL << 40);
-    auto v = RoundTrip(formats::json::ValueBuilder{kVal}.ExtractValue());
+    auto v = RoundTrip(formats::msgpack::ValueBuilder{kVal});
     EXPECT_EQ(v.As<int64_t>(), kVal);
 }
 
 TEST(MsgPackRoundTrip, BoolTrue) {
-    auto v = RoundTrip(formats::json::ValueBuilder{true}.ExtractValue());
+    auto v = RoundTrip(formats::msgpack::ValueBuilder{true});
     EXPECT_TRUE(v.As<bool>());
 }
 
 TEST(MsgPackRoundTrip, BoolFalse) {
-    auto v = RoundTrip(formats::json::ValueBuilder{false}.ExtractValue());
+    auto v = RoundTrip(formats::msgpack::ValueBuilder{false});
     EXPECT_FALSE(v.As<bool>());
 }
 
 TEST(MsgPackRoundTrip, Null) {
-    auto v = RoundTrip(formats::json::Value{});
+    auto v = RoundTrip(formats::msgpack::ValueBuilder{});
     EXPECT_TRUE(v.IsNull());
 }
 
 TEST(MsgPackRoundTrip, EmptyString) {
-    auto v = RoundTrip(formats::json::ValueBuilder{std::string{}}.ExtractValue());
+    auto v = RoundTrip(formats::msgpack::ValueBuilder{std::string_view{""}});
     EXPECT_EQ(v.As<std::string>(), "");
 }
 
 TEST(MsgPackRoundTrip, ShortString) {
-    auto v = RoundTrip(formats::json::ValueBuilder{std::string{"hello"}}.ExtractValue());
+    auto v = RoundTrip(formats::msgpack::ValueBuilder{std::string_view{"hello"}});
     EXPECT_EQ(v.As<std::string>(), "hello");
 }
 
 TEST(MsgPackRoundTrip, LongString) {
     // 256-char string -> str16
     std::string s(256, 'z');
-    auto v = RoundTrip(formats::json::ValueBuilder{s}.ExtractValue());
+    auto v = RoundTrip(formats::msgpack::ValueBuilder{s});
     EXPECT_EQ(v.As<std::string>(), s);
 }
 
 TEST(MsgPackRoundTrip, Float64) {
-    auto v = RoundTrip(formats::json::ValueBuilder{3.14}.ExtractValue());
+    auto v = RoundTrip(formats::msgpack::ValueBuilder{3.14});
     EXPECT_DOUBLE_EQ(v.As<double>(), 3.14);
 }
 
 // ---- Array round-trips ----
 
 TEST(MsgPackRoundTrip, EmptyArray) {
-    formats::json::ValueBuilder b(formats::json::Type::kArray);
-    auto v = RoundTrip(b.ExtractValue());
+    auto v = RoundTrip(formats::msgpack::ValueBuilder::Array());
     EXPECT_TRUE(v.IsArray());
     EXPECT_EQ(v.GetSize(), 0u);
 }
 
 TEST(MsgPackRoundTrip, MixedArray) {
-    formats::json::ValueBuilder b(formats::json::Type::kArray);
-    b.PushBack(int64_t{1});
-    b.PushBack(std::string{"two"});
-    b.PushBack(true);
-    auto v = RoundTrip(b.ExtractValue());
+    auto b = formats::msgpack::ValueBuilder::Array();
+    b.PushBack(formats::msgpack::ValueBuilder{int64_t{1}});
+    b.PushBack(formats::msgpack::ValueBuilder{std::string_view{"two"}});
+    b.PushBack(formats::msgpack::ValueBuilder{true});
+    auto v = RoundTrip(std::move(b));
     ASSERT_TRUE(v.IsArray());
     ASSERT_EQ(v.GetSize(), 3u);
     EXPECT_EQ(v[0].As<int64_t>(), 1);
@@ -261,11 +256,11 @@ TEST(MsgPackRoundTrip, MixedArray) {
 }
 
 TEST(MsgPackRoundTrip, NestedArray) {
-    formats::json::ValueBuilder inner(formats::json::Type::kArray);
-    inner.PushBack(int64_t{7});
-    formats::json::ValueBuilder outer(formats::json::Type::kArray);
-    outer.PushBack(inner.ExtractValue());
-    auto v = RoundTrip(outer.ExtractValue());
+    auto inner = formats::msgpack::ValueBuilder::Array();
+    inner.PushBack(formats::msgpack::ValueBuilder{int64_t{7}});
+    auto outer = formats::msgpack::ValueBuilder::Array();
+    outer.PushBack(std::move(inner));
+    auto v = RoundTrip(std::move(outer));
     ASSERT_TRUE(v.IsArray());
     ASSERT_EQ(v.GetSize(), 1u);
     ASSERT_TRUE(v[0].IsArray());
@@ -275,10 +270,10 @@ TEST(MsgPackRoundTrip, NestedArray) {
 // ---- Map round-trips ----
 
 TEST(MsgPackRoundTrip, StringKeyMap) {
-    formats::json::ValueBuilder b(formats::json::Type::kObject);
-    b["name"] = std::string{"tarantool"};
-    b["version"] = int64_t{3};
-    auto v = RoundTrip(b.ExtractValue());
+    auto b = formats::msgpack::ValueBuilder::Object();
+    b["name"] = formats::msgpack::ValueBuilder{std::string_view{"tarantool"}};
+    b["version"] = formats::msgpack::ValueBuilder{int64_t{3}};
+    auto v = RoundTrip(std::move(b));
     ASSERT_TRUE(v.IsObject());
     EXPECT_EQ(v["name"].As<std::string>(), "tarantool");
     EXPECT_EQ(v["version"].As<int64_t>(), 3);

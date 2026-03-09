@@ -8,43 +8,44 @@ USERVER_NAMESPACE_BEGIN
 namespace storages::tarantool {
 
 Query::Query(Type type, std::string space_or_func,
-             formats::json::Value args, formats::json::Value ops,
+             formats::msgpack::ValueBuilder args,
+             formats::msgpack::ValueBuilder ops,
              std::uint32_t limit)
     : type_{type},
       space_or_func_{std::move(space_or_func)},
-      args_{std::move(args)},
-      ops_{std::move(ops)},
+      args_bytes_{args.ToBytes()},
+      ops_bytes_{ops.ToBytes()},
       limit_{limit} {}
 
-Query Query::Call(std::string func_name, formats::json::Value args) {
+Query Query::Call(std::string func_name, formats::msgpack::ValueBuilder args) {
     return Query{Type::kCall, std::move(func_name), std::move(args)};
 }
 
-Query Query::Select(std::string space, formats::json::Value key,
+Query Query::Select(std::string space, formats::msgpack::ValueBuilder key,
                     std::uint32_t limit) {
     return Query{Type::kSelect, std::move(space), std::move(key), {}, limit};
 }
 
-Query Query::Insert(std::string space, formats::json::Value tuple) {
+Query Query::Insert(std::string space, formats::msgpack::ValueBuilder tuple) {
     return Query{Type::kInsert, std::move(space), std::move(tuple)};
 }
 
-Query Query::Replace(std::string space, formats::json::Value tuple) {
+Query Query::Replace(std::string space, formats::msgpack::ValueBuilder tuple) {
     return Query{Type::kReplace, std::move(space), std::move(tuple)};
 }
 
-Query Query::Delete(std::string space, formats::json::Value key) {
+Query Query::Delete(std::string space, formats::msgpack::ValueBuilder key) {
     return Query{Type::kDelete, std::move(space), std::move(key)};
 }
 
-Query Query::Update(std::string space, formats::json::Value key,
-                    formats::json::Value ops) {
+Query Query::Update(std::string space, formats::msgpack::ValueBuilder key,
+                    formats::msgpack::ValueBuilder ops) {
     return Query{Type::kUpdate, std::move(space), std::move(key),
                  std::move(ops)};
 }
 
-Query Query::Upsert(std::string space, formats::json::Value tuple,
-                    formats::json::Value ops) {
+Query Query::Upsert(std::string space, formats::msgpack::ValueBuilder tuple,
+                    formats::msgpack::ValueBuilder ops) {
     return Query{Type::kUpsert, std::move(space), std::move(tuple),
                  std::move(ops)};
 }

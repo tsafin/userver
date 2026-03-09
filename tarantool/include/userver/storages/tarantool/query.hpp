@@ -6,8 +6,9 @@
 #include <cstdint>
 #include <string>
 #include <string_view>
+#include <vector>
 
-#include <userver/formats/json/value.hpp>
+#include <userver/formats/msgpack/value_builder.hpp>
 
 #include <userver/storages/tarantool/options.hpp>
 
@@ -34,33 +35,33 @@ class Query final {
     kUpsert,
   };
 
-  static Query Call(std::string func_name, formats::json::Value args);
-  static Query Select(std::string space, formats::json::Value key,
+  static Query Call(std::string func_name, formats::msgpack::ValueBuilder args);
+  static Query Select(std::string space, formats::msgpack::ValueBuilder key,
                       std::uint32_t limit = 0xFFFFFFFFu);
-  static Query Insert(std::string space, formats::json::Value tuple);
-  static Query Replace(std::string space, formats::json::Value tuple);
-  static Query Delete(std::string space, formats::json::Value key);
-  static Query Update(std::string space, formats::json::Value key,
-                      formats::json::Value ops);
-  static Query Upsert(std::string space, formats::json::Value tuple,
-                      formats::json::Value ops);
+  static Query Insert(std::string space, formats::msgpack::ValueBuilder tuple);
+  static Query Replace(std::string space, formats::msgpack::ValueBuilder tuple);
+  static Query Delete(std::string space, formats::msgpack::ValueBuilder key);
+  static Query Update(std::string space, formats::msgpack::ValueBuilder key,
+                      formats::msgpack::ValueBuilder ops);
+  static Query Upsert(std::string space, formats::msgpack::ValueBuilder tuple,
+                      formats::msgpack::ValueBuilder ops);
 
   Type GetType() const noexcept { return type_; }
   const std::string& GetSpaceOrFunc() const noexcept { return space_or_func_; }
-  const formats::json::Value& GetArgs() const noexcept { return args_; }
-  const formats::json::Value& GetOps() const noexcept { return ops_; }
+  const std::vector<uint8_t>& GetArgBytes() const noexcept { return args_bytes_; }
+  const std::vector<uint8_t>& GetOpsBytes() const noexcept { return ops_bytes_; }
   std::uint32_t GetLimit() const noexcept { return limit_; }
 
   void FillSpanTags(tracing::Span&) const;
 
  private:
-  Query(Type type, std::string space_or_func, formats::json::Value args,
-        formats::json::Value ops = {}, std::uint32_t limit = 0xFFFFFFFFu);
+  Query(Type type, std::string space_or_func, formats::msgpack::ValueBuilder args,
+        formats::msgpack::ValueBuilder ops = {}, std::uint32_t limit = 0xFFFFFFFFu);
 
   Type type_;
   std::string space_or_func_;
-  formats::json::Value args_;
-  formats::json::Value ops_;
+  std::vector<uint8_t> args_bytes_;
+  std::vector<uint8_t> ops_bytes_;
   std::uint32_t limit_{0xFFFFFFFFu};
 };
 

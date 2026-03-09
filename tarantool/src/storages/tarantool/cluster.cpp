@@ -47,50 +47,50 @@ ExecutionResult Cluster::DoExecute(OptionalCommandControl cc,
 }
 
 ExecutionResult Cluster::Call(std::string_view func_name,
-                              formats::json::Value args,
+                              formats::msgpack::ValueBuilder args,
                               OptionalCommandControl cc) {
     return DoExecute(cc, Query::Call(std::string{func_name}, std::move(args)));
 }
 
 ExecutionResult Cluster::Select(std::string_view space,
-                                formats::json::Value key,
+                                formats::msgpack::ValueBuilder key,
                                 OptionalCommandControl cc) {
     return DoExecute(
         cc, Query::Select(std::string{space}, std::move(key)));
 }
 
 ExecutionResult Cluster::Insert(std::string_view space,
-                                formats::json::Value tuple,
+                                formats::msgpack::ValueBuilder tuple,
                                 OptionalCommandControl cc) {
     return DoExecute(
         cc, Query::Insert(std::string{space}, std::move(tuple)));
 }
 
 ExecutionResult Cluster::Replace(std::string_view space,
-                                 formats::json::Value tuple,
+                                 formats::msgpack::ValueBuilder tuple,
                                  OptionalCommandControl cc) {
     return DoExecute(
         cc, Query::Replace(std::string{space}, std::move(tuple)));
 }
 
 ExecutionResult Cluster::Delete(std::string_view space,
-                                formats::json::Value key,
+                                formats::msgpack::ValueBuilder key,
                                 OptionalCommandControl cc) {
     return DoExecute(
         cc, Query::Delete(std::string{space}, std::move(key)));
 }
 
 ExecutionResult Cluster::Update(std::string_view space,
-                                formats::json::Value key,
-                                formats::json::Value ops,
+                                formats::msgpack::ValueBuilder key,
+                                formats::msgpack::ValueBuilder ops,
                                 OptionalCommandControl cc) {
     return DoExecute(
         cc, Query::Update(std::string{space}, std::move(key), std::move(ops)));
 }
 
 ExecutionResult Cluster::Upsert(std::string_view space,
-                                formats::json::Value tuple,
-                                formats::json::Value ops,
+                                formats::msgpack::ValueBuilder tuple,
+                                formats::msgpack::ValueBuilder ops,
                                 OptionalCommandControl cc) {
     return DoExecute(
         cc, Query::Upsert(std::string{space}, std::move(tuple),

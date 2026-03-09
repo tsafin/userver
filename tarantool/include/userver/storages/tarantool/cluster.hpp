@@ -10,6 +10,7 @@
 
 #include <userver/clients/dns/resolver_fwd.hpp>
 #include <userver/components/component_fwd.hpp>
+#include <userver/formats/msgpack/value_builder.hpp>
 #include <userver/utils/statistics/writer.hpp>
 
 #include <userver/storages/tarantool/fwd.hpp>
@@ -41,33 +42,40 @@ class Cluster final {
   Cluster(const Cluster&) = delete;
 
   /// @brief Execute a stored procedure call
-  ExecutionResult Call(std::string_view func_name, formats::json::Value args,
+  ExecutionResult Call(std::string_view func_name,
+                       formats::msgpack::ValueBuilder args,
                        OptionalCommandControl = {});
 
   /// @brief Select tuples by key from a space
-  ExecutionResult Select(std::string_view space, formats::json::Value key,
+  ExecutionResult Select(std::string_view space,
+                         formats::msgpack::ValueBuilder key,
                          OptionalCommandControl = {});
 
   /// @brief Insert a tuple into a space
-  ExecutionResult Insert(std::string_view space, formats::json::Value tuple,
+  ExecutionResult Insert(std::string_view space,
+                         formats::msgpack::ValueBuilder tuple,
                          OptionalCommandControl = {});
 
   /// @brief Insert or replace a tuple in a space
-  ExecutionResult Replace(std::string_view space, formats::json::Value tuple,
+  ExecutionResult Replace(std::string_view space,
+                          formats::msgpack::ValueBuilder tuple,
                           OptionalCommandControl = {});
 
   /// @brief Delete tuples matching a key from a space
-  ExecutionResult Delete(std::string_view space, formats::json::Value key,
+  ExecutionResult Delete(std::string_view space,
+                         formats::msgpack::ValueBuilder key,
                          OptionalCommandControl = {});
 
   /// @brief Update fields of a tuple identified by key
-  ExecutionResult Update(std::string_view space, formats::json::Value key,
-                         formats::json::Value ops,
+  ExecutionResult Update(std::string_view space,
+                         formats::msgpack::ValueBuilder key,
+                         formats::msgpack::ValueBuilder ops,
                          OptionalCommandControl = {});
 
   /// @brief Update or insert a tuple
-  ExecutionResult Upsert(std::string_view space, formats::json::Value tuple,
-                         formats::json::Value ops,
+  ExecutionResult Upsert(std::string_view space,
+                         formats::msgpack::ValueBuilder tuple,
+                         formats::msgpack::ValueBuilder ops,
                          OptionalCommandControl = {});
 
   /// Write cluster statistics

@@ -7,6 +7,7 @@
 
 #include <userver/utest/utest.hpp>
 
+#include <userver/formats/msgpack/value_builder.hpp>
 #include <storages/tarantool/impl/msgpack.hpp>
 
 // tntcxx mpp and Buffer
@@ -232,9 +233,8 @@ TEST(MsgPackXCheck, OurEncodeStr_TntDecode) {
     EXPECT_EQ(s, "tarantool");
 }
 
-TEST(MsgPackXCheck, OurEncodeJsonInt_TntDecode) {
-    std::vector<uint8_t> bytes;
-    EncodeJson(bytes, formats::json::ValueBuilder{int64_t{42}}.ExtractValue());
+TEST(MsgPackXCheck, OurEncodeVbInt_TntDecode) {
+    auto bytes = formats::msgpack::ValueBuilder{int64_t{42}}.ToBytes();
     auto buf = BytesToTntBuf(bytes);
     auto run = buf.begin<true>();
     int64_t val = 0;
@@ -242,9 +242,8 @@ TEST(MsgPackXCheck, OurEncodeJsonInt_TntDecode) {
     EXPECT_EQ(val, 42);
 }
 
-TEST(MsgPackXCheck, OurEncodeJsonNegInt_TntDecode) {
-    std::vector<uint8_t> bytes;
-    EncodeJson(bytes, formats::json::ValueBuilder{int64_t{-1000}}.ExtractValue());
+TEST(MsgPackXCheck, OurEncodeVbNegInt_TntDecode) {
+    auto bytes = formats::msgpack::ValueBuilder{int16_t{-1000}}.ToBytes();
     auto buf = BytesToTntBuf(bytes);
     auto run = buf.begin<true>();
     int64_t val = 0;
@@ -252,9 +251,8 @@ TEST(MsgPackXCheck, OurEncodeJsonNegInt_TntDecode) {
     EXPECT_EQ(val, -1000);
 }
 
-TEST(MsgPackXCheck, OurEncodeJsonBool_TntDecode) {
-    std::vector<uint8_t> bytes;
-    EncodeJson(bytes, formats::json::ValueBuilder{true}.ExtractValue());
+TEST(MsgPackXCheck, OurEncodeVbBool_TntDecode) {
+    auto bytes = formats::msgpack::ValueBuilder{true}.ToBytes();
     auto buf = BytesToTntBuf(bytes);
     auto run = buf.begin<true>();
     bool val = false;
@@ -262,10 +260,8 @@ TEST(MsgPackXCheck, OurEncodeJsonBool_TntDecode) {
     EXPECT_TRUE(val);
 }
 
-TEST(MsgPackXCheck, OurEncodeJsonString_TntDecode) {
-    std::vector<uint8_t> bytes;
-    EncodeJson(bytes,
-               formats::json::ValueBuilder{std::string{"hello"}}.ExtractValue());
+TEST(MsgPackXCheck, OurEncodeVbString_TntDecode) {
+    auto bytes = formats::msgpack::ValueBuilder{std::string_view{"hello"}}.ToBytes();
     auto buf = BytesToTntBuf(bytes);
     auto run = buf.begin<true>();
     std::string s;
@@ -273,9 +269,8 @@ TEST(MsgPackXCheck, OurEncodeJsonString_TntDecode) {
     EXPECT_EQ(s, "hello");
 }
 
-TEST(MsgPackXCheck, OurEncodeJsonDouble_TntDecode) {
-    std::vector<uint8_t> bytes;
-    EncodeJson(bytes, formats::json::ValueBuilder{2.718}.ExtractValue());
+TEST(MsgPackXCheck, OurEncodeVbDouble_TntDecode) {
+    auto bytes = formats::msgpack::ValueBuilder{2.718}.ToBytes();
     auto buf = BytesToTntBuf(bytes);
     auto run = buf.begin<true>();
     double val = 0.0;
@@ -316,8 +311,7 @@ TEST(MsgPackXCheck, WireBytesMatchForNegInts) {
         EXPECT_EQ(decoded.As<int64_t>(), v) << "our decode failed for " << v;
 
         // Direction 2: our encode → tntcxx decode
-        std::vector<uint8_t> our_bytes;
-        EncodeJson(our_bytes, formats::json::ValueBuilder{v}.ExtractValue());
+        std::vector<uint8_t> our_bytes = formats::msgpack::ValueBuilder{v}.ToBytes();
         auto buf2 = BytesToTntBuf(our_bytes);
         auto run = buf2.begin<true>();
         int64_t tnt_val = 0;

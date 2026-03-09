@@ -14,6 +14,9 @@
 #include <userver/clients/http/middlewares/pipeline_component.hpp>
 #include <userver/components/component.hpp>
 #include <userver/components/minimal_server_component_list.hpp>
+#include <userver/formats/json/serialize.hpp>
+#include <userver/formats/json/value_builder.hpp>
+#include <userver/formats/msgpack/value_builder.hpp>
 #include <userver/server/handlers/http_handler_base.hpp>
 #include <userver/server/handlers/tests_control.hpp>
 #include <userver/storages/secdist/component.hpp>
@@ -51,11 +54,9 @@ class HandlerKv final : public server::handlers::HttpHandlerBase {
         const auto method = request.GetMethod();
 
         if (method == server::http::HttpMethod::kGet) {
-            auto res = tnt_->Select(
-                "kv",
-                formats::json::ValueBuilder{formats::json::MakeArray(id)}
-                    .ExtractValue(),
-                {});
+            auto key = formats::msgpack::ValueBuilder::Array();
+            key.PushBack(formats::msgpack::ValueBuilder{id});
+            auto res = tnt_->Select("kv", std::move(key), {});
             const auto& data = res.GetData();
             if (!data.IsArray() || data.GetSize() == 0 ||
                 data[0].GetSize() == 0) {
@@ -73,28 +74,24 @@ class HandlerKv final : public server::handlers::HttpHandlerBase {
 
         } else if (method == server::http::HttpMethod::kPost) {
             const auto value = request.GetArg("value");
-            tnt_->Insert(
-                "kv",
-                formats::json::ValueBuilder{formats::json::MakeArray(id, value)}
-                    .ExtractValue(),
-                {});
+            auto tuple = formats::msgpack::ValueBuilder::Array();
+            tuple.PushBack(formats::msgpack::ValueBuilder{id});
+            tuple.PushBack(formats::msgpack::ValueBuilder{value});
+            tnt_->Insert("kv", std::move(tuple), {});
             return "ok";
 
         } else if (method == server::http::HttpMethod::kPut) {
             const auto value = request.GetArg("value");
-            tnt_->Replace(
-                "kv",
-                formats::json::ValueBuilder{formats::json::MakeArray(id, value)}
-                    .ExtractValue(),
-                {});
+            auto tuple = formats::msgpack::ValueBuilder::Array();
+            tuple.PushBack(formats::msgpack::ValueBuilder{id});
+            tuple.PushBack(formats::msgpack::ValueBuilder{value});
+            tnt_->Replace("kv", std::move(tuple), {});
             return "ok";
 
         } else if (method == server::http::HttpMethod::kDelete) {
-            tnt_->Delete(
-                "kv",
-                formats::json::ValueBuilder{formats::json::MakeArray(id)}
-                    .ExtractValue(),
-                {});
+            auto key = formats::msgpack::ValueBuilder::Array();
+            key.PushBack(formats::msgpack::ValueBuilder{id});
+            tnt_->Delete("kv", std::move(key), {});
             return "ok";
         }
 

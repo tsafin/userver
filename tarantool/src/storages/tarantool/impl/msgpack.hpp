@@ -200,67 +200,6 @@ inline void EncodeDateTime(std::vector<uint8_t>& out, const TntDatetime& dt) {
     out.insert(out.end(), bytes.begin(), bytes.end());
 }
 
-inline void EncodeJson(std::vector<uint8_t>& out,
-                       const formats::json::Value& v) {
-    if (v.IsNull()) {
-        out.push_back(mp::kNil);
-    } else if (v.IsBool()) {
-        out.push_back(v.As<bool>() ? mp::kTrue : mp::kFalse);
-    } else if (v.IsInt64()) {
-        const int64_t i = v.As<int64_t>();
-        if (i >= 0) {
-            EncodeUint(out, static_cast<uint64_t>(i));
-        } else {
-            if (i >= -32) {
-                out.push_back(static_cast<uint8_t>(i & 0xFF));
-            } else if (i >= -128) {
-                out.push_back(mp::kInt8);
-                out.push_back(static_cast<uint8_t>(i));
-            } else if (i >= -32768) {
-                out.push_back(mp::kInt16);
-                out.push_back(static_cast<uint8_t>(i >> 8));
-                out.push_back(static_cast<uint8_t>(i));
-            } else if (i >= -2147483648LL) {
-                out.push_back(mp::kInt32);
-                for (int s = 24; s >= 0; s -= 8)
-                    out.push_back(static_cast<uint8_t>(i >> s));
-            } else {
-                out.push_back(mp::kInt64);
-                for (int s = 56; s >= 0; s -= 8)
-                    out.push_back(static_cast<uint8_t>(i >> s));
-            }
-        }
-    } else if (v.IsUInt64()) {
-        EncodeUint(out, v.As<uint64_t>());
-    } else if (v.IsDouble()) {
-        double d = v.As<double>();
-        out.push_back(0xcb);  // float64
-        uint64_t bits;
-        std::memcpy(&bits, &d, 8);
-        for (int s = 56; s >= 0; s -= 8)
-            out.push_back(static_cast<uint8_t>(bits >> s));
-    } else if (v.IsString()) {
-        EncodeStr(out, v.As<std::string>());
-    } else if (v.IsArray()) {
-        EncodeArray(out, static_cast<uint32_t>(v.GetSize()));
-        for (const auto& elem : v) EncodeJson(out, elem);
-    } else if (v.IsObject()) {
-        uint32_t count = 0;
-        for (const auto& [k, val] : Items(v)) ++count;
-        if (count <= 15)
-            out.push_back(static_cast<uint8_t>(mp::kFixMapMin | count));
-        else {
-            out.push_back(0xde);  // map16
-            out.push_back(static_cast<uint8_t>(count >> 8));
-            out.push_back(static_cast<uint8_t>(count));
-        }
-        for (const auto& [k, val] : Items(v)) {
-            EncodeStr(out, k);
-            EncodeJson(out, val);
-        }
-    }
-}
-
 // ---- Minimal MsgPack decoder ----
 
 struct MpDecoder {

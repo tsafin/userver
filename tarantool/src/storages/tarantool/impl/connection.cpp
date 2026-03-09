@@ -560,6 +560,10 @@ engine::Future<ExecutionResult> Connection::ExecuteAsync(
     std::vector<uint8_t> body;
     uint32_t request_type = kIprotoCall;
 
+    const auto AppendBytes = [&body](const std::vector<uint8_t>& bytes) {
+        body.insert(body.end(), bytes.begin(), bytes.end());
+    };
+
     switch (query.GetType()) {
         case Query::Type::kCall: {
             request_type = kIprotoCall;
@@ -567,7 +571,7 @@ engine::Future<ExecutionResult> Connection::ExecuteAsync(
             EncodeUint(body, kKeyFunctionName);
             EncodeStr(body, query.GetSpaceOrFunc());
             EncodeUint(body, kKeyTuple);
-            EncodeJson(body, query.GetArgs());
+            AppendBytes(query.GetArgBytes());
             break;
         }
         case Query::Type::kSelect: {
@@ -578,21 +582,21 @@ engine::Future<ExecutionResult> Connection::ExecuteAsync(
             EncodeUint(body, kKeyLimit);     EncodeUint(body, query.GetLimit());
             EncodeUint(body, kKeyOffset);    EncodeUint(body, 0);
             EncodeUint(body, kKeyIterator);  EncodeUint(body, 0);
-            EncodeUint(body, kKeyKey);       EncodeJson(body, query.GetArgs());
+            EncodeUint(body, kKeyKey);       AppendBytes(query.GetArgBytes());
             break;
         }
         case Query::Type::kInsert: {
             request_type = kIprotoInsert;
             EncodeFixMap(body, 2);
             EncodeUint(body, kKeySpaceId); EncodeUint(body, space_id);
-            EncodeUint(body, kKeyTuple);   EncodeJson(body, query.GetArgs());
+            EncodeUint(body, kKeyTuple);   AppendBytes(query.GetArgBytes());
             break;
         }
         case Query::Type::kReplace: {
             request_type = kIprotoReplace;
             EncodeFixMap(body, 2);
             EncodeUint(body, kKeySpaceId); EncodeUint(body, space_id);
-            EncodeUint(body, kKeyTuple);   EncodeJson(body, query.GetArgs());
+            EncodeUint(body, kKeyTuple);   AppendBytes(query.GetArgBytes());
             break;
         }
         case Query::Type::kDelete: {
@@ -600,7 +604,7 @@ engine::Future<ExecutionResult> Connection::ExecuteAsync(
             EncodeFixMap(body, 3);
             EncodeUint(body, kKeySpaceId); EncodeUint(body, space_id);
             EncodeUint(body, kKeyIndexId); EncodeUint(body, 0);
-            EncodeUint(body, kKeyKey);     EncodeJson(body, query.GetArgs());
+            EncodeUint(body, kKeyKey);     AppendBytes(query.GetArgBytes());
             break;
         }
         case Query::Type::kUpdate: {
@@ -608,16 +612,16 @@ engine::Future<ExecutionResult> Connection::ExecuteAsync(
             EncodeFixMap(body, 4);
             EncodeUint(body, kKeySpaceId);  EncodeUint(body, space_id);
             EncodeUint(body, kKeyIndexId);  EncodeUint(body, 0);
-            EncodeUint(body, kKeyKey);      EncodeJson(body, query.GetArgs());
-            EncodeUint(body, kKeyTupleOps); EncodeJson(body, query.GetOps());
+            EncodeUint(body, kKeyKey);      AppendBytes(query.GetArgBytes());
+            EncodeUint(body, kKeyTupleOps); AppendBytes(query.GetOpsBytes());
             break;
         }
         case Query::Type::kUpsert: {
             request_type = kIprotoUpsert;
             EncodeFixMap(body, 3);
             EncodeUint(body, kKeySpaceId);  EncodeUint(body, space_id);
-            EncodeUint(body, kKeyTuple);    EncodeJson(body, query.GetArgs());
-            EncodeUint(body, kKeyTupleOps); EncodeJson(body, query.GetOps());
+            EncodeUint(body, kKeyTuple);    AppendBytes(query.GetArgBytes());
+            EncodeUint(body, kKeyTupleOps); AppendBytes(query.GetOpsBytes());
             break;
         }
     }
