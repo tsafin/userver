@@ -143,7 +143,6 @@ std::vector<uint8_t> EncodeUuid(const TntUuid& uuid) {
 }
 
 std::vector<uint8_t> EncodeDate(utils::datetime::Date date) {
-    using Days = utils::datetime::Date::Days;
     const int64_t day_count = date.GetSysDays().time_since_epoch().count();
     DatetimeRaw r;
     r.seconds = day_count * 86400LL;
