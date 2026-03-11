@@ -1,18 +1,15 @@
 #!/usr/bin/env bash
 # bench_compare.sh — run net.box and userver connector benchmarks side-by-side.
 #
+# Self-contained: starts its own Tarantool instance on a random free port and
+# stops it on exit.  No pre-existing Tarantool required.
+#
 # Usage:
-#   ./bench_compare.sh [host] [port] [binary]
+#   ./bench_compare.sh
 #
-# Defaults:
-#   host   = 127.0.0.1
-#   port   = 3301
-#   binary = auto-detected from build_release or build_debug under the repo root
-#
-# Environment variables (override defaults):
-#   TARANTOOL_HOST   — Tarantool host
-#   TARANTOOL_PORT   — Tarantool port
+# Environment variables:
 #   TTTEST_BINARY    — explicit path to userver-tarantool_tttest
+#                      (auto-detected from common build dirs if not set)
 #   BENCH_OUTPUT     — directory for individual output files (default: /tmp)
 #
 # Output:
@@ -29,8 +26,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
-HOST="${TARANTOOL_HOST:-${1:-127.0.0.1}}"
-PORT="${TARANTOOL_PORT:-${2:-3301}}"
+HOST="127.0.0.1"
 OUTPUT_DIR="${BENCH_OUTPUT:-/tmp}"
 
 # ── locate userver-tarantool_tttest binary ────────────────────────────────────
@@ -38,7 +34,6 @@ OUTPUT_DIR="${BENCH_OUTPUT:-/tmp}"
 if [[ -n "${TTTEST_BINARY:-}" ]]; then
     BINARY="${TTTEST_BINARY}"
 else
-    # Search in common build locations
     for candidate in \
         "${REPO_ROOT}/build_release/tarantool/userver-tarantool_tttest" \
         "${REPO_ROOT}/build_debug/tarantool/userver-tarantool_tttest" \
@@ -68,23 +63,74 @@ if ! command -v tarantool &>/dev/null; then
     exit 1
 fi
 
-# ── connectivity check ────────────────────────────────────────────────────────
+# ── pick a random free port ───────────────────────────────────────────────────
 
-echo "Checking Tarantool connectivity at ${HOST}:${PORT} ..."
-if ! tarantool -e "
-local ok, err = pcall(function()
-    local c = require('net.box').connect('${HOST}:${PORT}', {wait_connected=2})
-    assert(c:ping(), 'ping failed')
+pick_free_port() {
+    python3 -c "
+import socket
+s = socket.socket()
+s.bind(('127.0.0.1', 0))
+print(s.getsockname()[1])
+s.close()
+"
+}
+
+PORT="$(pick_free_port)"
+
+# ── start a dedicated Tarantool instance ─────────────────────────────────────
+
+TT_WORKDIR="$(mktemp -d /tmp/tt_bench.XXXXXX)"
+TT_PID=""
+
+cleanup() {
+    if [[ -n "${TT_PID}" ]]; then
+        kill "${TT_PID}" 2>/dev/null || true
+        wait "${TT_PID}" 2>/dev/null || true
+    fi
+    rm -rf "${TT_WORKDIR}"
+}
+trap cleanup EXIT
+
+echo "Starting Tarantool on ${HOST}:${PORT} (workdir: ${TT_WORKDIR}) ..."
+
+tarantool -e "
+box.cfg{
+    listen        = '${HOST}:${PORT}',
+    work_dir      = '${TT_WORKDIR}',
+    log_level     = 1,
+    wal_mode      = 'none',
+    memtx_memory  = 67108864,
+}
+box.once('schema', function()
+    local s = box.schema.space.create('test', {if_not_exists=true})
+    s:format({{name='id',type='unsigned'},{name='val',type='string'}})
+    s:create_index('primary', {type='hash', parts={'id'}, if_not_exists=true})
+    box.schema.user.grant('guest','read,write,execute,create,drop','universe',
+                          nil, {if_not_exists=true})
+end)
+require('fiber').sleep(3600)
+" &>/dev/null &
+TT_PID=$!
+
+# Wait until the port is accepting connections (up to 10 s)
+for i in $(seq 1 20); do
+    if tarantool -e "
+local ok = pcall(function()
+    local c = require('net.box').connect('${HOST}:${PORT}',{wait_connected=2})
+    assert(c:ping())
     c:close()
 end)
-if not ok then print('FAIL: '..tostring(err)); os.exit(1) end
-print('OK')
-os.exit(0)
-" 2>/dev/null | grep -q OK; then
-    echo "ERROR: cannot reach Tarantool at ${HOST}:${PORT}" >&2
-    exit 1
-fi
-echo "OK"
+os.exit(ok and 0 or 1)
+" &>/dev/null; then
+        break
+    fi
+    sleep 0.5
+    if [[ $i -eq 20 ]]; then
+        echo "ERROR: Tarantool on port ${PORT} did not start in time" >&2
+        exit 1
+    fi
+done
+echo "OK (pid ${TT_PID})"
 echo
 
 # ── run net.box benchmark ─────────────────────────────────────────────────────
