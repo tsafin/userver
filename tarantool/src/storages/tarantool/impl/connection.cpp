@@ -257,7 +257,13 @@ void Connection::DoAuth(const AuthSettings& auth,
                         const std::string& salt_b64) {
     if (auth.user.empty() || auth.user == "guest") return;
 
-    auto salt     = Base64Decode(salt_b64);
+    auto salt = Base64Decode(salt_b64);
+    if (salt.size() < 20) {
+        throw TarantoolAuthException{
+            "Tarantool greeting salt too short (" +
+            std::to_string(salt.size()) +
+            " bytes decoded, need at least 20 for CHAP-SHA1)"};
+    }
     auto scramble = Scramble(auth.password, salt);
 
     std::vector<uint8_t> body;
@@ -472,12 +478,23 @@ void Connection::FlushLoop() {
 // ---- Core pipelining primitive ----
 
 engine::Future<ExecutionResult> Connection::SendAndRegister(
-        engine::Deadline /*deadline*/,
+        engine::Deadline deadline,
         uint32_t request_type,
         std::vector<uint8_t> body) {
 
     engine::Promise<ExecutionResult> promise;
     auto future = promise.get_future();
+
+    // Reject immediately if the caller's deadline has already expired.
+    // This prevents staging a frame that nobody will wait for — particularly
+    // important for mutating operations (REPLACE/UPDATE/DELETE) where a timed-
+    // out caller might retry, and a late-delivered frame would cause a
+    // duplicate side effect.
+    if (deadline.IsReached()) {
+        promise.set_exception(std::make_exception_ptr(
+            TarantoolException{"Request deadline exceeded before send"}));
+        return future;
+    }
 
     const uint64_t sync_id = ++sync_counter_;
     {

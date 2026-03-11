@@ -21,6 +21,35 @@ ExecutionResult::ExecutionResult(bool ok, uint32_t error_code,
     }
 }
 
+ExecutionResult::ExecutionResult(ExecutionResult&& other) noexcept
+    : ok_{other.ok_},
+      error_code_{other.error_code_},
+      error_message_{std::move(other.error_message_)},
+      error_info_{std::move(other.error_info_)},
+      data_buf_{std::move(other.data_buf_)} {
+    // Rebind cursor to the new owner's buffer (other.data_ would point at the
+    // now-empty source buffer after the vector move above).
+    if (!data_buf_.empty()) {
+        data_ = formats::msgpack::Value::FromBytes(data_buf_.data(),
+                                                   data_buf_.size());
+    }
+}
+
+ExecutionResult& ExecutionResult::operator=(ExecutionResult&& other) noexcept {
+    if (this != &other) {
+        ok_            = other.ok_;
+        error_code_    = other.error_code_;
+        error_message_ = std::move(other.error_message_);
+        error_info_    = std::move(other.error_info_);
+        data_buf_      = std::move(other.data_buf_);
+        data_          = data_buf_.empty()
+                             ? formats::msgpack::Value{}
+                             : formats::msgpack::Value::FromBytes(
+                                   data_buf_.data(), data_buf_.size());
+    }
+    return *this;
+}
+
 void ExecutionResult::AssertOk() const {
     if (!ok_) {
         throw CommandException{error_code_, error_message_, error_info_};

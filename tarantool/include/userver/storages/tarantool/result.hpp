@@ -31,6 +31,15 @@ class ExecutionResult final {
                            std::vector<uint8_t> data_buf,
                            std::optional<TntErrorInfo> error_info = std::nullopt);
 
+  // Move-only: data_ is a non-owning cursor into data_buf_, so copying would
+  // leave the cursor pointing at the source's buffer (dangling after source
+  // destruction).  Move is safe because std::vector move preserves the
+  // internal buffer address.
+  ExecutionResult(const ExecutionResult&) = delete;
+  ExecutionResult& operator=(const ExecutionResult&) = delete;
+  ExecutionResult(ExecutionResult&&) noexcept;
+  ExecutionResult& operator=(ExecutionResult&&) noexcept;
+
   /// @throws CommandException if the server returned an error
   void AssertOk() const;
 
