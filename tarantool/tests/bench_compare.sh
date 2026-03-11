@@ -102,7 +102,7 @@ box.cfg{
     memtx_memory  = 67108864,
 }
 box.once('schema', function()
-    local s = box.schema.space.create('test', {if_not_exists=true})
+    local s = box.schema.space.create('kv', {if_not_exists=true})
     s:format({{name='id',type='unsigned'},{name='val',type='string'}})
     s:create_index('primary', {type='hash', parts={'id'}, if_not_exists=true})
     box.schema.user.grant('guest','read,write,execute,create,drop','universe',
@@ -139,7 +139,7 @@ NETBOX_OUT="${OUTPUT_DIR}/netbox_bench.out"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo "  net.box benchmark  (Lua / Tarantool $(tarantool --version 2>&1 | head -1))"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-tarantool "${LUA_SCRIPT}" "${HOST}" "${PORT}" 2>/dev/null | tee "${NETBOX_OUT}"
+tarantool "${LUA_SCRIPT}" "${HOST}" "${PORT}" 2>/dev/null | tee "${NETBOX_OUT}" || true
 
 echo
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -150,7 +150,7 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 USERVER_OUT="${OUTPUT_DIR}/userver_bench.out"
 TARANTOOL_HOST="${HOST}" TARANTOOL_PORT="${PORT}" \
     "${BINARY}" --gtest_filter="TarantoolBench.InsertThroughput" 2>/dev/null \
-    | tee "${USERVER_OUT}"
+    | tee "${USERVER_OUT}" || true
 
 # ── summary table ─────────────────────────────────────────────────────────────
 
