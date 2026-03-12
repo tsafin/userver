@@ -1,5 +1,5 @@
-# tntcxx is vendored in third_party/tntcxx (header-only library).
-# See third_party/Readme.md for the upstream commit reference.
+# tntcxx is a git submodule at third_party/tntcxx (header-only library).
+# Upstream: https://github.com/tarantool/tntcxx.git (pinned commit: 467efeb)
 if (TARGET tntcxx)
   return()
 endif()

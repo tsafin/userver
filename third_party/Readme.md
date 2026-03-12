@@ -9,4 +9,4 @@ This folder contains source codes from following open source projects:
 * uboost_coro: see uboost_coro/README.md
 * llhttp: https://github.com/nodejs/llhttp/tree/release/v9.2.0
 * http-parser: https://github.com/nodejs/http-parser/releases/tag/v2.9.4
-* tntcxx: https://github.com/tarantool/tntcxx/commit/467efeb (header-only MsgPack/IPROTO library for Tarantool)
+* tntcxx: https://github.com/tarantool/tntcxx.git (git submodule, pinned to 467efeb — header-only MsgPack/IPROTO library for Tarantool)
