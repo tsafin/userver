@@ -1,8 +1,9 @@
 #include "connection.hpp"
 
 #include <array>
-#include <cstring>
 #include <stdexcept>
+
+#include <Buffer/Buffer.hpp>
 
 #include <netinet/tcp.h>
 
@@ -296,50 +297,48 @@ void Connection::DoAuth(const AuthSettings& auth,
 // ---- Background reader task ----
 
 void Connection::ReaderLoop() {
-    // Streaming read buffer: a single RecvSome call fills as many bytes as the
-    // socket has available.  When the server has pipelined many responses back-
-    // to-back, we decode all of them out of this buffer without extra syscalls,
-    // reducing recv overhead from 2×N to ~N/K (K = avg responses per segment).
-    constexpr size_t kReadBufSize = 65536;
-    std::vector<uint8_t> rbuf(kReadBufSize);
-    size_t rpos = 0;  // start of unconsumed data
-    size_t rend = 0;  // end of received data
+    // Ring-based receive buffer: tnt::Buffer<16384> is a linked list of 16 KiB
+    // blocks.  Consumed bytes are freed in O(1) via dropFront() — no memmove,
+    // no compaction — unlike the previous flat vector that required O(unread)
+    // memmove whenever more than half the buffer was consumed.
+    using RecvBuf = tnt::Buffer<16384>;
+    constexpr size_t kRecvBufSize = 65536;
+    char recv_tmp[kRecvBufSize];
+    RecvBuf rbuf;
+    auto rpos = rbuf.begin();
 
-    // Refill buffer: compact if more than half is consumed, grow if needed,
-    // then read as much as the socket has available (at least 1 byte).
+    // Append newly received bytes to rbuf.
     auto fill = [&] {
-        if (rpos > kReadBufSize / 2) {
-            const size_t avail = rend - rpos;
-            std::memmove(rbuf.data(), rbuf.data() + rpos, avail);
-            rpos = 0;
-            rend = avail;
-        }
-        if (rbuf.size() < rend + kReadBufSize) rbuf.resize(rend + kReadBufSize);
-        const size_t n = socket_.RecvSome(rbuf.data() + rend,
-                                          rbuf.size() - rend, {});
+        const size_t n = socket_.RecvSome(recv_tmp, kRecvBufSize, {});
         if (n == 0) throw std::runtime_error{"connection closed by peer"};
-        rend += n;
+        rbuf.write(RecvBuf::WData{recv_tmp, n});
     };
 
     auto ensure_bytes = [&](size_t n) {
-        while (rend - rpos < n) fill();
+        while (!rbuf.has(rpos, n)) fill();
     };
 
     try {
         while (true) {
             ensure_bytes(kPreheaderSize);
-            const uint32_t body_len = DecodePreheaderLength(rbuf.data() + rpos);
-            rpos += kPreheaderSize;
+            uint8_t prehdr[kPreheaderSize];
+            rpos.read(RecvBuf::RData{reinterpret_cast<char*>(prehdr), kPreheaderSize});
+            const uint32_t body_len = DecodePreheaderLength(prehdr);
 
             ensure_bytes(body_len);
-            // Decode directly from the buffer (zero-copy): set body_data before
-            // advancing rpos so the pointer stays valid during decode.
-            const uint8_t* body_data = rbuf.data() + rpos;
-            rpos += body_len;
+            // Copy the body into an owned vector. tnt::Buffer blocks are not
+            // guaranteed contiguous across block boundaries, so a raw pointer
+            // into the buffer is not safe.  The copy cost (~50–200 bytes/frame)
+            // is negligible compared to the memmove it replaces.
+            std::vector<uint8_t> body_vec(body_len);
+            rpos.read(RecvBuf::RData{reinterpret_cast<char*>(body_vec.data()), body_len});
 
-            // Zero-copy header parse: scan the header map for code/sync keys
-            // without allocating any JSON nodes.
-            auto header = formats::msgpack::Value::FromBytes(body_data, body_len);
+            // Release the consumed bytes; rpos has already advanced past them,
+            // so no registered iterator points into the freed region.
+            rbuf.dropFront(kPreheaderSize + body_len);
+
+            // Parse header and response body from the owned buffer.
+            auto header = formats::msgpack::Value::FromBytes(body_vec.data(), body_len);
             const auto sync_id = header[kKeySync].As<uint64_t>(0);
             const auto code    = header[kKeyCode].As<int64_t>(0);
 
@@ -366,8 +365,8 @@ void Connection::ReaderLoop() {
             } else {
                 if (!body_view.IsMissing()) {
                     // Navigate to the data array via integer key (0x30).
-                    // Copy the raw msgpack bytes so ExecutionResult can own them
-                    // independently of the receive buffer (rbuf may be reused).
+                    // Copy the raw msgpack bytes into data_buf; body_vec owns
+                    // the source bytes and outlives this assignment.
                     const auto data_cursor = body_view[kKeyData];
                     if (!data_cursor.IsMissing()) {
                         const uint8_t* data_begin = data_cursor.GetRawPos();
