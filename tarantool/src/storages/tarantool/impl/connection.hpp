@@ -109,6 +109,13 @@ class Connection final {
   /// Background reader task started at the end of the constructor.
   engine::TaskWithResult<void> reader_task_;
 
+  /// Reusable flat buffer for copying each IPROTO response body out of the
+  /// non-contiguous tnt::Buffer before parsing.  Owned exclusively by
+  /// ReaderLoop — no locking needed.  capacity() grows monotonically to the
+  /// largest response seen, so after warmup there are zero malloc calls per
+  /// response on this buffer.
+  std::vector<uint8_t> reader_body_buf_;
+
   /// Space-name → numeric-id cache (populated lazily on first Execute).
   std::unordered_map<std::string, uint32_t> space_id_cache_;
   engine::Mutex space_cache_mutex_;

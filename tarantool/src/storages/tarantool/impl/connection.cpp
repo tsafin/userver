@@ -327,12 +327,13 @@ void Connection::ReaderLoop() {
             const uint32_t body_len = DecodePreheaderLength(prehdr);
 
             ensure_bytes(body_len);
-            // Copy the body into an owned vector. tnt::Buffer blocks are not
-            // guaranteed contiguous across block boundaries, so a raw pointer
-            // into the buffer is not safe.  The copy cost (~50–200 bytes/frame)
-            // is negligible compared to the memmove it replaces.
-            std::vector<uint8_t> body_vec(body_len);
-            rpos.read(RecvBuf::RData{reinterpret_cast<char*>(body_vec.data()), body_len});
+            // Copy body into a reusable per-connection flat buffer.
+            // tnt::Buffer blocks are not contiguous across block boundaries so
+            // we need a flat pointer before calling ParseIprotoResponse.
+            // reader_body_buf_ grows to the high-water-mark of response sizes
+            // and never shrinks — zero malloc after the first few responses.
+            reader_body_buf_.resize(body_len);
+            rpos.read(RecvBuf::RData{reinterpret_cast<char*>(reader_body_buf_.data()), body_len});
 
             // Release the consumed bytes; rpos has already advanced past them,
             // so no registered iterator points into the freed region.
@@ -340,7 +341,7 @@ void Connection::ReaderLoop() {
 
             // Parse header and response body using the zero-allocation scanner.
             // Eliminates Value::FromBytes() Node-tree allocation on every frame.
-            const auto resp = ParseIprotoResponse(body_vec.data(), body_len);
+            const auto resp = ParseIprotoResponse(reader_body_buf_.data(), body_len);
             const auto sync_id = resp.sync;
             const auto code    = resp.code;
 
