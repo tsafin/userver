@@ -46,6 +46,13 @@ class Query final {
   static Query Upsert(std::string space, formats::msgpack::ValueBuilder tuple,
                       formats::msgpack::ValueBuilder ops);
 
+  /// @brief Create a query with pre-encoded msgpack bytes, bypassing
+  ///        ValueBuilder entirely.  Use this from the typed mpp API
+  ///        (`storages::tarantool::typed`) to avoid intermediate allocations.
+  static Query WithRawArgs(Type type, std::string space,
+                           std::vector<uint8_t> args_bytes,
+                           std::uint32_t limit = 0xFFFFFFFFu);
+
   Type GetType() const noexcept { return type_; }
   const std::string& GetSpaceOrFunc() const noexcept { return space_or_func_; }
   const std::vector<uint8_t>& GetArgBytes() const noexcept { return args_bytes_; }
@@ -57,6 +64,10 @@ class Query final {
  private:
   Query(Type type, std::string space_or_func, formats::msgpack::ValueBuilder args,
         formats::msgpack::ValueBuilder ops = {}, std::uint32_t limit = 0xFFFFFFFFu);
+
+  // Raw-bytes ctor: args_bytes already serialised (e.g. via mpp::encode).
+  Query(Type type, std::string space_or_func,
+        std::vector<uint8_t> args_bytes, std::uint32_t limit);
 
   Type type_;
   std::string space_or_func_;

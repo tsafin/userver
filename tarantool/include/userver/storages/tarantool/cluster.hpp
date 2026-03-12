@@ -41,6 +41,9 @@ class Cluster final {
 
   Cluster(const Cluster&) = delete;
 
+  /// @brief Execute a raw Query object (for use with typed mpp API)
+  ExecutionResult Execute(const Query& query, OptionalCommandControl = {});
+
   /// @brief Execute a stored procedure call
   ExecutionResult Call(std::string_view func_name,
                        formats::msgpack::ValueBuilder args,

@@ -20,6 +20,19 @@ Query::Query(Type type, std::string space_or_func,
     ops.AppendTo(ops_bytes_);
 }
 
+Query::Query(Type type, std::string space_or_func,
+             std::vector<uint8_t> args_bytes, std::uint32_t limit)
+    : type_{type},
+      space_or_func_{std::move(space_or_func)},
+      args_bytes_{std::move(args_bytes)},
+      limit_{limit} {}
+
+Query Query::WithRawArgs(Type type, std::string space,
+                         std::vector<uint8_t> args_bytes,
+                         std::uint32_t limit) {
+    return Query{type, std::move(space), std::move(args_bytes), limit};
+}
+
 Query Query::Call(std::string func_name, formats::msgpack::ValueBuilder args) {
     return Query{Type::kCall, std::move(func_name), std::move(args)};
 }

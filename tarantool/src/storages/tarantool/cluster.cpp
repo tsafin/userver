@@ -46,6 +46,10 @@ ExecutionResult Cluster::DoExecute(OptionalCommandControl cc,
     return GetPool().Execute(cc, query);
 }
 
+ExecutionResult Cluster::Execute(const Query& query, OptionalCommandControl cc) {
+    return DoExecute(cc, query);
+}
+
 ExecutionResult Cluster::Call(std::string_view func_name,
                               formats::msgpack::ValueBuilder args,
                               OptionalCommandControl cc) {

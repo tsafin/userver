@@ -3,6 +3,7 @@
 #include <userver/formats/msgpack/value.hpp>
 #include <userver/formats/msgpack/value_builder.hpp>
 #include <userver/storages/tarantool/error_info.hpp>
+#include <userver/storages/tarantool/typed.hpp>
 #include <storages/tarantool/impl/iproto_frames.hpp>
 #include <storages/tarantool/impl/msgpack.hpp>
 #include <storages/tarantool/impl/vspace_tuple.hpp>
@@ -815,6 +816,89 @@ TEST(VspaceTuple, LargeSpaceIdRoundTrips) {
     ASSERT_EQ(tuples.size(), 1u);
     EXPECT_EQ(tuples[0].id, 0xFFFFFFFFu);
     EXPECT_EQ(tuples[0].engine, "vinyl");
+}
+
+// ---- MppEncode / MppDecode (storages::tarantool typed API) ----
+
+namespace {
+
+struct Point {
+    uint32_t x;
+    uint32_t y;
+    std::string label;
+
+    static constexpr auto mpp = std::make_tuple(
+        &Point::x, &Point::y, &Point::label);
+
+    bool operator==(const Point& o) const noexcept {
+        return x == o.x && y == o.y && label == o.label;
+    }
+};
+
+// Encode a single Point as a msgpack array using ValueBuilder as oracle.
+static std::vector<uint8_t> EncodePointVb(const Point& p) {
+    auto vb = formats::msgpack::ValueBuilder::Array();
+    vb.PushBack(formats::msgpack::ValueBuilder{p.x});
+    vb.PushBack(formats::msgpack::ValueBuilder{p.y});
+    vb.PushBack(formats::msgpack::ValueBuilder{p.label});
+    return vb.ToBytes();
+}
+
+}  // namespace
+
+TEST(MppTyped, MppEncodeMatchesValueBuilder) {
+    const Point p{7, 42, "hello"};
+    const auto mpp_bytes = storages::tarantool::MppEncode(p);
+    const auto vb_bytes  = EncodePointVb(p);
+    EXPECT_EQ(mpp_bytes, vb_bytes);
+}
+
+TEST(MppTyped, MppEncodeEmptyStringField) {
+    const Point p{0, 0, ""};
+    const auto mpp_bytes = storages::tarantool::MppEncode(p);
+    const auto vb_bytes  = EncodePointVb(p);
+    EXPECT_EQ(mpp_bytes, vb_bytes);
+}
+
+TEST(MppTyped, MppDecodeRoundTrip) {
+    // Encode a vector of Points, then decode back.
+    const std::vector<Point> original{
+        {1, 2, "a"}, {100, 200, "foo"}, {0, 0, ""}};
+
+    // Encode as outer array using tntcxx mpp (matches IPROTO_DATA layout).
+    tnt::Buffer<4096> buf;
+    mpp::encode(buf, original);
+    std::vector<uint8_t> raw;
+    for (auto it = buf.begin(); it != buf.end(); ++it)
+        raw.push_back(it.get<uint8_t>());
+
+    const auto decoded = storages::tarantool::MppDecode<Point>(
+        {raw.data(), raw.size()});
+    ASSERT_EQ(decoded.size(), original.size());
+    for (std::size_t i = 0; i < original.size(); ++i)
+        EXPECT_EQ(decoded[i], original[i]) << "row " << i;
+}
+
+TEST(MppTyped, MppDecodeEmptySpanReturnsEmpty) {
+    const auto decoded = storages::tarantool::MppDecode<Point>({});
+    EXPECT_TRUE(decoded.empty());
+}
+
+TEST(MppTyped, MppEncodeDecodeRoundTrip) {
+    // MppDecode(MppEncode(single element wrapped in outer array))
+    const Point p{99, 1, "roundtrip"};
+
+    // Build outer array with one element manually (like IPROTO response).
+    tnt::Buffer<4096> buf;
+    mpp::encode(buf, std::make_tuple(p));  // outer fixarray1
+    std::vector<uint8_t> raw;
+    for (auto it = buf.begin(); it != buf.end(); ++it)
+        raw.push_back(it.get<uint8_t>());
+
+    const auto decoded = storages::tarantool::MppDecode<Point>(
+        {raw.data(), raw.size()});
+    ASSERT_EQ(decoded.size(), 1u);
+    EXPECT_EQ(decoded[0], p);
 }
 
 USERVER_NAMESPACE_END
