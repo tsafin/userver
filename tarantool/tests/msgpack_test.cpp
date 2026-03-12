@@ -5,6 +5,7 @@
 #include <userver/storages/tarantool/error_info.hpp>
 #include <storages/tarantool/impl/iproto_frames.hpp>
 #include <storages/tarantool/impl/msgpack.hpp>
+#include <storages/tarantool/impl/vspace_tuple.hpp>
 
 USERVER_NAMESPACE_BEGIN
 
@@ -762,6 +763,58 @@ TEST(IprotoFrames, PingFrameSyncVaries) {
     // At least one sync byte differs
     EXPECT_NE(std::vector<uint8_t>(f1.begin()+10, f1.end()),
               std::vector<uint8_t>(f2.begin()+10, f2.end()));
+}
+
+// ---- VspaceTuple / DecodeVspaceTuples ----
+
+// Helper: encode a minimal _vspace-like response array using tntcxx mpp.
+// Returns the msgpack bytes for: [[id, owner, name, engine, field_count]]
+static std::vector<uint8_t> EncodeVspaceResponse(
+        uint32_t id, uint32_t owner, const std::string& name,
+        const std::string& engine, uint32_t field_count) {
+    tnt::Buffer<4096> buf;
+    mpp::encode(buf, std::make_tuple(
+        std::make_tuple(id, owner, name, engine, field_count)
+    ));
+    std::vector<uint8_t> out;
+    for (auto it = buf.begin(); it != buf.end(); ++it)
+        out.push_back(it.get<uint8_t>());
+    return out;
+}
+
+TEST(VspaceTuple, DecodesIdFromTypicalResponse) {
+    const auto raw = EncodeVspaceResponse(512, 1, "kv", "memtx", 2);
+    const auto tuples = DecodeVspaceTuples(
+        {raw.data(), raw.size()});
+    ASSERT_EQ(tuples.size(), 1u);
+    EXPECT_EQ(tuples[0].id, 512u);
+    EXPECT_EQ(tuples[0].owner, 1u);
+    EXPECT_EQ(tuples[0].name, "kv");
+    EXPECT_EQ(tuples[0].engine, "memtx");
+    EXPECT_EQ(tuples[0].field_count, 2u);
+}
+
+TEST(VspaceTuple, EmptyResponseReturnsEmptyVector) {
+    const auto tuples = DecodeVspaceTuples({});
+    EXPECT_TRUE(tuples.empty());
+}
+
+TEST(VspaceTuple, SpaceIdZeroIsValid) {
+    const auto raw = EncodeVspaceResponse(0, 0, "_space", "memtx", 7);
+    const auto tuples = DecodeVspaceTuples(
+        {raw.data(), raw.size()});
+    ASSERT_EQ(tuples.size(), 1u);
+    EXPECT_EQ(tuples[0].id, 0u);
+    EXPECT_EQ(tuples[0].name, "_space");
+}
+
+TEST(VspaceTuple, LargeSpaceIdRoundTrips) {
+    const auto raw = EncodeVspaceResponse(0xFFFFFFFFu, 1, "huge", "vinyl", 0);
+    const auto tuples = DecodeVspaceTuples(
+        {raw.data(), raw.size()});
+    ASSERT_EQ(tuples.size(), 1u);
+    EXPECT_EQ(tuples[0].id, 0xFFFFFFFFu);
+    EXPECT_EQ(tuples[0].engine, "vinyl");
 }
 
 USERVER_NAMESPACE_END

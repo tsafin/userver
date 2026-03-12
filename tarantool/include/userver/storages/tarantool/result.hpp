@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -49,6 +50,12 @@ class ExecutionResult final {
   /// Returns the decoded data array from the response as a MessagePack cursor.
   /// The cursor is valid for the lifetime of this ExecutionResult.
   const formats::msgpack::Value& GetData() const noexcept { return data_; }
+
+  /// Returns the raw MessagePack bytes of the IPROTO_DATA array.
+  /// Useful for typed decode (e.g. via tntcxx mpp).
+  std::span<const uint8_t> GetRawBytes() const noexcept {
+    return {data_buf_.data(), data_buf_.size()};
+  }
 
   /// Converts the value to `T` via formats::msgpack::Value::As<T>().
   template <typename T>

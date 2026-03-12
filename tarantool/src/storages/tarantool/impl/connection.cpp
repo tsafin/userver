@@ -29,6 +29,7 @@
 #include <storages/tarantool/impl/iproto_frames.hpp>
 #include <storages/tarantool/impl/msgpack.hpp>
 #include <storages/tarantool/impl/tracing_tags.hpp>
+#include <storages/tarantool/impl/vspace_tuple.hpp>
 
 USERVER_NAMESPACE_BEGIN
 
@@ -565,12 +566,14 @@ uint32_t Connection::ResolveSpaceId(const std::string& space_name,
         throw TarantoolException{
             fmt::format("failed to resolve space '{}'", space_name)};
     }
-    auto data = result.GetData();
-    if (!data.IsArray() || data.GetSize() == 0) {
+
+    // Decode the response via mpp into a typed VspaceTuple for safety.
+    auto tuples = DecodeVspaceTuples(result.GetRawBytes());
+    if (tuples.empty()) {
         throw TarantoolException{
             fmt::format("space '{}' not found", space_name)};
     }
-    const auto space_id = data[0][0].As<uint32_t>();
+    const uint32_t space_id = tuples[0].id;
 
     {
         std::lock_guard lock(space_cache_mutex_);
