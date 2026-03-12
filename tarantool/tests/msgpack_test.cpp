@@ -901,4 +901,104 @@ TEST(MppTyped, MppEncodeDecodeRoundTrip) {
     EXPECT_EQ(decoded[0], p);
 }
 
+// ---- ParseIprotoResponse (Rec6) ----
+
+// Helper: build a minimal IPROTO response buffer.
+// header: fixmap(2) {0x00: code, 0x01: sync}
+// body:   fixmap(1) {body_key: body_value_bytes}
+static std::vector<uint8_t> BuildIprotoResponse(
+        uint64_t sync, int64_t code,
+        uint8_t body_key,
+        const std::vector<uint8_t>& body_value) {
+    std::vector<uint8_t> buf;
+    buf.push_back(0x82);            // fixmap(2)
+    buf.push_back(0x00);            // key: code
+    // encode code
+    if (code == 0) {
+        buf.push_back(0x00);        // fixuint 0
+    } else {
+        buf.push_back(0xce);        // uint32
+        buf.push_back(uint8_t(code >> 24));
+        buf.push_back(uint8_t(code >> 16));
+        buf.push_back(uint8_t(code >> 8));
+        buf.push_back(uint8_t(code));
+    }
+    buf.push_back(0x01);            // key: sync
+    buf.push_back(0xcf);            // uint64 marker
+    for (int i = 7; i >= 0; --i) buf.push_back(uint8_t(sync >> (i*8)));
+
+    buf.push_back(0x81);            // fixmap(1)
+    buf.push_back(body_key);
+    buf.insert(buf.end(), body_value.begin(), body_value.end());
+    return buf;
+}
+
+TEST(ParseIprotoResponse, SuccessWithData) {
+    using namespace storages::tarantool::impl;
+    // body: 0x30 → fixarray(1)[fixuint(7)]
+    std::vector<uint8_t> data_value = {0x91, 0x07};  // fixarray(1)[7]
+    const auto buf = BuildIprotoResponse(42, 0, 0x30, data_value);
+
+    const auto resp = ParseIprotoResponse(buf.data(), buf.size());
+    EXPECT_EQ(resp.sync, 42u);
+    EXPECT_EQ(resp.code, 0);
+    ASSERT_NE(resp.data_begin, nullptr);
+    EXPECT_EQ(resp.data_end - resp.data_begin, 2);
+    EXPECT_EQ(resp.data_begin[0], 0x91);
+    EXPECT_EQ(resp.error_begin, nullptr);
+}
+
+TEST(ParseIprotoResponse, ErrorWithLegacyString) {
+    using namespace storages::tarantool::impl;
+    // body: 0x31 → fixstr "oops"
+    std::vector<uint8_t> err_value = {0xa4, 'o', 'o', 'p', 's'};
+    const auto buf = BuildIprotoResponse(7, 0x8000, 0x31, err_value);
+
+    const auto resp = ParseIprotoResponse(buf.data(), buf.size());
+    EXPECT_EQ(resp.sync, 7u);
+    EXPECT_EQ(resp.code, int64_t(0x8000));
+    EXPECT_EQ(resp.data_begin, nullptr);
+    ASSERT_NE(resp.error_begin, nullptr);
+    EXPECT_EQ(std::string(resp.error_begin + 1,
+                          resp.error_end),   // skip fixstr marker
+              "oops");
+}
+
+TEST(ParseIprotoResponse, EmptyBuffer) {
+    using namespace storages::tarantool::impl;
+    const auto resp = ParseIprotoResponse(nullptr, 0);
+    EXPECT_EQ(resp.sync, 0u);
+    EXPECT_EQ(resp.code, 0);
+    EXPECT_EQ(resp.data_begin, nullptr);
+}
+
+TEST(ParseIprotoResponse, SyncIsUint64) {
+    using namespace storages::tarantool::impl;
+    const uint64_t big_sync = 0x0102030405060708ULL;
+    std::vector<uint8_t> data_value = {0x90};  // empty fixarray
+    const auto buf = BuildIprotoResponse(big_sync, 0, 0x30, data_value);
+
+    const auto resp = ParseIprotoResponse(buf.data(), buf.size());
+    EXPECT_EQ(resp.sync, big_sync);
+    EXPECT_EQ(resp.code, 0);
+}
+
+TEST(ParseIprotoResponse, DataBytesMatchExpected) {
+    using namespace storages::tarantool::impl;
+    // Encode a real mpp response body and check we get the right slice.
+    tnt::Buffer<256> mbuf;
+    // IPROTO DATA = [[42, "hello"]] = outer fixarray(1) of fixarray(2)
+    mpp::encode(mbuf, std::make_tuple(std::make_tuple(uint32_t(42), std::string("hello"))));
+    std::vector<uint8_t> data_bytes;
+    for (auto it = mbuf.begin(); it != mbuf.end(); ++it)
+        data_bytes.push_back(it.get<uint8_t>());
+
+    const auto buf = BuildIprotoResponse(99, 0, 0x30, data_bytes);
+    const auto resp = ParseIprotoResponse(buf.data(), buf.size());
+
+    ASSERT_NE(resp.data_begin, nullptr);
+    const std::vector<uint8_t> got(resp.data_begin, resp.data_end);
+    EXPECT_EQ(got, data_bytes);
+}
+
 USERVER_NAMESPACE_END

@@ -3,6 +3,11 @@
 /// Run: TARANTOOL_HOST=127.0.0.1 TARANTOOL_PORT=3301 ./userver-tarantool_tttest --gtest_filter="TarantoolBench*"
 /// CPU-only benchmarks: ./userver-tarantool_tttest --gtest_filter="TarantoolCpuBench*"
 
+// `volatile sink +=` is a standard benchmark anti-DCE idiom; C++20 deprecated
+// the compound-assignment operator on volatile lvalues, but the intent here is
+// correct.  Suppress the diagnostic for this file.
+#pragma GCC diagnostic ignored "-Wvolatile"
+
 #include <chrono>
 #include <cstdlib>
 #include <iostream>
@@ -23,6 +28,8 @@
 #include <userver/yaml_config/yaml_config.hpp>
 
 #include <userver/storages/tarantool/query.hpp>
+#include <userver/storages/tarantool/typed.hpp>
+#include <storages/tarantool/impl/iproto_frames.hpp>
 #include <storages/tarantool/impl/pool.hpp>
 #include <storages/tarantool/impl/settings.hpp>
 #include <storages/tarantool/impl/msgpack.hpp>
@@ -33,7 +40,6 @@ USERVER_NAMESPACE_BEGIN
 namespace {
 
 // ---- timing helpers --------------------------------------------------------
-
 struct BenchResult {
     std::size_t ops;
     std::chrono::microseconds elapsed;
@@ -57,6 +63,14 @@ void Print(const std::string& label, const BenchResult& r) {
               << "  [" << r.ops << " / " << r.elapsed.count()/1000 << "ms]\n"
               << std::flush;
 }
+
+/// Struct used by the MppEncode<T> (Rec3) bench row — at namespace scope
+/// because local classes cannot have static constexpr data members pre-C++17.
+struct KvRow {
+    uint64_t id;
+    std::string val;
+    static constexpr auto mpp = std::make_tuple(&KvRow::id, &KvRow::val);
+};
 
 // ---- settings helpers ------------------------------------------------------
 
@@ -158,12 +172,24 @@ void BenchEncodeComparison(std::size_t n, const std::string& val) {
     });
     Print("encode: ValueBuilder → AppendTo (Rec2)", r_appendto);
 
+    // --- Rec 3 path: MppEncode<T> (tntcxx, zero ValueBuilder allocation) ---
+    const auto r_mpp = Time(n, [&] {
+        for (std::size_t i = 0; i < n; ++i) {
+            auto bytes = storages::tarantool::MppEncode(KvRow{i, val});
+            sink += bytes.size();
+        }
+    });
+    Print("encode: MppEncode<T>   (Rec3/typed)", r_mpp);
+
     const double speedup_new = static_cast<double>(r_old.elapsed.count()) /
                                static_cast<double>(r_new.elapsed.count());
     const double speedup_appendto = static_cast<double>(r_old.elapsed.count()) /
                                     static_cast<double>(r_appendto.elapsed.count());
+    const double speedup_mpp = static_cast<double>(r_old.elapsed.count()) /
+                               static_cast<double>(r_mpp.elapsed.count());
     std::cout << "  speedup vs OLD (ToBytes):  " << std::fixed << std::setprecision(2) << speedup_new << "x\n";
     std::cout << "  speedup vs OLD (AppendTo): " << std::fixed << std::setprecision(2) << speedup_appendto << "x\n";
+    std::cout << "  speedup vs OLD (MppEncode):" << std::fixed << std::setprecision(2) << speedup_mpp << "x\n";
     (void)sink;
 }
 
@@ -258,7 +284,59 @@ void BenchDecodeSkipExt(std::size_t n) {
     (void)sink;
 }
 
-// ---- ping benchmark (measures pure client+protocol overhead, no server work) -
+// ---- CPU decode: Value::FromBytes vs ParseIprotoResponse --------------------
+
+void BenchResponseParse(std::size_t n) {
+    using namespace storages::tarantool::impl;
+
+    // Build a realistic IPROTO success response: header{code=0, sync=42} +
+    // body{0x30: [[99, "hello_world"]]}  (a single-row REPLACE result)
+    std::vector<uint8_t> response;
+    // Header map: fixmap(2) {0x00: 0, 0x01: 42}
+    response.push_back(0x82);              // fixmap(2)
+    response.push_back(0x00); response.push_back(0x00); // code=0
+    response.push_back(0x01); response.push_back(0x2a); // sync=42 (fixuint)
+    // Body map: fixmap(1) {0x30: fixarray(1)[fixarray(2)[99, "hello_world"]]}
+    response.push_back(0x81);             // fixmap(1)
+    response.push_back(0x30);             // key 0x30 (DATA)
+    response.push_back(0x91);             // fixarray(1)
+    response.push_back(0x92);             // fixarray(2)
+    response.push_back(0x63);             // fixuint 99
+    response.push_back(0xab);             // fixstr(11)
+    for (char c : std::string("hello_world")) response.push_back(uint8_t(c));
+
+    volatile std::size_t sink = 0;
+
+    // --- OLD: Value::FromBytes + map navigation ---
+    const auto r_old = Time(n, [&] {
+        for (std::size_t i = 0; i < n; ++i) {
+            auto v = formats::msgpack::Value::FromBytes(
+                response.data(), response.size());
+            sink += v[0x01u].As<uint64_t>(0);
+            sink += static_cast<std::size_t>(v[0x00u].As<int64_t>(0));
+        }
+    });
+    Print("response: Value::FromBytes (OLD)", r_old);
+
+    // --- NEW: ParseIprotoResponse (Rec6, zero allocation) ---
+    const auto r_new = Time(n, [&] {
+        for (std::size_t i = 0; i < n; ++i) {
+            const auto resp = ParseIprotoResponse(
+                response.data(), response.size());
+            sink += resp.sync;
+            sink += static_cast<std::size_t>(resp.code);
+        }
+    });
+    Print("response: ParseIprotoResponse (Rec6)", r_new);
+
+    const double speedup = static_cast<double>(r_old.elapsed.count()) /
+                           static_cast<double>(r_new.elapsed.count());
+    std::cout << "  speedup (response parse): " << std::fixed
+              << std::setprecision(2) << speedup << "x\n";
+    (void)sink;
+}
+
+
 
 void BenchPing(const std::string& host, int port,
                std::size_t pool_size, int concurrency,
@@ -349,6 +427,8 @@ TEST(TarantoolCpuBench, EncodeDecodeComparison) {
     BenchDecodeComparison(kN);
     std::cout << "╠══ Phase B/D decode (skip ext): lazy zero-cost skip ══════╣\n";
     BenchDecodeSkipExt(kN);
+    std::cout << "╠══ Phase Rec6: FromBytes vs ParseIprotoResponse ══════════╣\n";
+    BenchResponseParse(kN);
     std::cout << "╚════════════════════════════════════════════════════════╝\n";
 }
 

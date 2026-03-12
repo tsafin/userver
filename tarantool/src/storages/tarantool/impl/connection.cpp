@@ -338,47 +338,37 @@ void Connection::ReaderLoop() {
             // so no registered iterator points into the freed region.
             rbuf.dropFront(kPreheaderSize + body_len);
 
-            // Parse header and response body from the owned buffer.
-            auto header = formats::msgpack::Value::FromBytes(body_vec.data(), body_len);
-            const auto sync_id = header[kKeySync].As<uint64_t>(0);
-            const auto code    = header[kKeyCode].As<int64_t>(0);
-
-            // Body starts immediately after the header in the same buffer.
-            auto body_view = header.NextSibling();
+            // Parse header and response body using the zero-allocation scanner.
+            // Eliminates Value::FromBytes() Node-tree allocation on every frame.
+            const auto resp = ParseIprotoResponse(body_vec.data(), body_len);
+            const auto sync_id = resp.sync;
+            const auto code    = resp.code;
 
             std::vector<uint8_t> data_buf{};
             std::string error_msg;
             std::optional<TntErrorInfo> error_info;
             if (code != 0) {
-                if (!body_view.IsMissing()) {
-                    // Prefer structured error (Tarantool 2.4+)
-                    const auto ext_err = body_view[kKeyErrorExtended];
-                    if (!ext_err.IsMissing()) {
-                        error_info = DecodeErrorInfo(ext_err);
-                        error_msg = error_info->Message();
-                    }
-                    // Always populate legacy string as fallback/override
-                    if (error_msg.empty()) {
-                        error_msg = body_view[kKeyError].As<std::string>(
-                            "tarantool error");
-                    }
+                // Error path (cold): use Value::FromBytes only for the relevant
+                // sub-value, not the entire buffer.
+                if (resp.ext_error_begin) {
+                    const auto ext_val = formats::msgpack::Value::FromBytes(
+                        resp.ext_error_begin,
+                        static_cast<std::size_t>(
+                            resp.ext_error_end - resp.ext_error_begin));
+                    error_info = DecodeErrorInfo(ext_val);
+                    error_msg  = error_info->Message();
                 }
+                if (error_msg.empty() && resp.error_begin) {
+                    const auto err_val = formats::msgpack::Value::FromBytes(
+                        resp.error_begin,
+                        static_cast<std::size_t>(
+                            resp.error_end - resp.error_begin));
+                    error_msg = err_val.As<std::string>("tarantool error");
+                }
+                if (error_msg.empty()) error_msg = "tarantool error";
             } else {
-                if (!body_view.IsMissing()) {
-                    // Navigate to the data array via integer key (0x30).
-                    // Copy the raw msgpack bytes into data_buf; body_vec owns
-                    // the source bytes and outlives this assignment.
-                    const auto data_cursor = body_view[kKeyData];
-                    if (!data_cursor.IsMissing()) {
-                        const uint8_t* data_begin = data_cursor.GetRawPos();
-                        // NextSibling() gives the tight end of this value;
-                        // if data is the last item, fall back to buffer end.
-                        const auto next = data_cursor.NextSibling();
-                        const uint8_t* data_end = next.IsMissing()
-                            ? data_cursor.GetRawEnd()
-                            : next.GetRawPos();
-                        data_buf.assign(data_begin, data_end);
-                    }
+                if (resp.data_begin) {
+                    data_buf.assign(resp.data_begin, resp.data_end);
                 }
             }
             ExecutionResult result{code == 0,
