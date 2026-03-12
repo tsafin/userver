@@ -457,10 +457,14 @@ std::size_t ValueBuilder::GetSize() const {
 
 // ---- Serialisation -----------------------------------------------------
 
+void ValueBuilder::AppendTo(std::vector<uint8_t>& dest) const {
+    EncodeNode(dest, *node_);
+}
+
 std::vector<uint8_t> ValueBuilder::ToBytes() const {
     std::vector<uint8_t> out;
     out.reserve(64);
-    EncodeNode(out, *node_);
+    AppendTo(out);
     return out;
 }
 

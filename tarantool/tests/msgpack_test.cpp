@@ -655,4 +655,64 @@ TEST(MsgPackDecodeExt, ErrorDecodesToJsonObject) {
     EXPECT_TRUE(v.IsObject());
 }
 
+// ---- ValueBuilder::AppendTo ----
+
+// AppendTo output must be byte-for-byte identical to ToBytes().
+TEST(MsgPackValueBuilder, AppendToMatchesToBytes) {
+    using VB = formats::msgpack::ValueBuilder;
+    auto check = [](VB vb) {
+        const auto expected = vb.ToBytes();
+        std::vector<uint8_t> actual;
+        vb.AppendTo(actual);
+        EXPECT_EQ(actual, expected);
+    };
+
+    check(VB{});                              // null
+    check(VB{true});
+    check(VB{false});
+    check(VB{int64_t{0}});
+    check(VB{int64_t{42}});
+    check(VB{int64_t{-1}});
+    check(VB{int64_t{-1000}});
+    check(VB{uint64_t{0xDEADBEEFULL}});
+    check(VB{double{3.14}});
+    check(VB{std::string_view{""}});
+    check(VB{std::string_view{"hello world"}});
+
+    // Array
+    auto arr = VB::Array();
+    arr.PushBack(VB{int64_t{1}});
+    arr.PushBack(VB{std::string_view{"two"}});
+    arr.PushBack(VB{true});
+    check(arr);
+
+    // IntKeyObject (IPROTO body pattern)
+    auto obj = VB::IntKeyObject();
+    obj[0x10U] = VB{uint32_t{512}};
+    obj[0x21U] = VB{std::string_view{"test"}};
+    check(obj);
+}
+
+// AppendTo appends to whatever is already in the buffer — it does not clear it.
+TEST(MsgPackValueBuilder, AppendToPreservesExistingContent) {
+    std::vector<uint8_t> buf = {0xAA, 0xBB};
+    formats::msgpack::ValueBuilder{int64_t{42}}.AppendTo(buf);
+    ASSERT_EQ(buf.size(), 3u);
+    EXPECT_EQ(buf[0], 0xAA);
+    EXPECT_EQ(buf[1], 0xBB);
+    EXPECT_EQ(buf[2], 0x2A);  // msgpack positive fixint 42
+}
+
+// Calling AppendTo twice on the same builder should append two copies.
+TEST(MsgPackValueBuilder, AppendToTwiceDoubles) {
+    formats::msgpack::ValueBuilder vb{uint64_t{0}};
+    const auto once = vb.ToBytes();
+    std::vector<uint8_t> buf;
+    vb.AppendTo(buf);
+    vb.AppendTo(buf);
+    ASSERT_EQ(buf.size(), once.size() * 2);
+    EXPECT_EQ(std::vector<uint8_t>(buf.begin(), buf.begin() + once.size()), once);
+    EXPECT_EQ(std::vector<uint8_t>(buf.begin() + once.size(), buf.end()), once);
+}
+
 USERVER_NAMESPACE_END

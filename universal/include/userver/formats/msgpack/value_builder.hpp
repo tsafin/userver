@@ -141,6 +141,12 @@ public:
     /// Serialise the current value to a MessagePack byte vector.
     std::vector<uint8_t> ToBytes() const;
 
+    /// Append the serialised MessagePack bytes of this value to @p dest.
+    /// Unlike `ToBytes()`, this does not allocate a new vector — it writes
+    /// directly into the caller-provided buffer, enabling zero-copy encoding
+    /// when the caller already owns a staging buffer (e.g. `staging_buf_`).
+    void AppendTo(std::vector<uint8_t>& dest) const;
+
     /// Serialise to bytes and wrap them in a non-owning Value cursor.
     /// @note The returned Value borrows from the returned vector; the vector
     ///       must outlive the Value.

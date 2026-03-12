@@ -502,13 +502,27 @@ engine::Future<ExecutionResult> Connection::SendAndRegister(
         pending_.emplace(sync_id, std::move(promise));
     }
 
-    auto frame = BuildFrame(request_type, sync_id, body);
-
-    // Stage the encoded frame; the flush coroutine sends it after coalescing
-    // with frames from all other concurrent callers.
+    // Build the IPROTO frame directly into staging_buf_ — two-phase approach:
+    // 1. Reserve 5 bytes for the preheader (0xce + 4-byte big-endian length).
+    // 2. Append the header map (request type + sync id).
+    // 3. Append the body bytes.
+    // 4. Back-patch the preheader length field.
+    // This eliminates the intermediate BuildFrame() vector allocation and the
+    // subsequent insert() copy, saving one heap allocation + one memcpy per
+    // request on the hot path.
     {
         std::lock_guard lock(staging_mutex_);
-        staging_buf_.insert(staging_buf_.end(), frame.begin(), frame.end());
+        const auto prehdr_pos = staging_buf_.size();
+        staging_buf_.resize(prehdr_pos + 5);   // slot for prehdr (filled last)
+        BuildHeader(staging_buf_, request_type, sync_id);
+        staging_buf_.insert(staging_buf_.end(), body.begin(), body.end());
+        const uint32_t len =
+            static_cast<uint32_t>(staging_buf_.size() - prehdr_pos - 5);
+        staging_buf_[prehdr_pos]     = 0xce;
+        staging_buf_[prehdr_pos + 1] = static_cast<uint8_t>(len >> 24);
+        staging_buf_[prehdr_pos + 2] = static_cast<uint8_t>(len >> 16);
+        staging_buf_[prehdr_pos + 3] = static_cast<uint8_t>(len >> 8);
+        staging_buf_[prehdr_pos + 4] = static_cast<uint8_t>(len);
     }
     flush_event_.Send();  // Signal the flush coroutine (non-blocking, multi-producer safe)
 

@@ -140,9 +140,30 @@ void BenchEncodeComparison(std::size_t n, const std::string& val) {
     });
     Print("encode: ValueBuilder → ToBytes (NEW)", r_new);
 
-    const double speedup = static_cast<double>(r_old.elapsed.count()) /
-                           static_cast<double>(r_new.elapsed.count());
-    std::cout << "  speedup: " << std::fixed << std::setprecision(2) << speedup << "x\n";
+    // --- Rec 2 path: AppendTo into a reused staging buffer ---
+    // Simulates SendAndRegister writing directly into staging_buf_ without
+    // the intermediate BuildFrame() vector allocation.
+    const auto r_appendto = Time(n, [&] {
+        std::vector<uint8_t> staging;
+        staging.reserve(256);
+        for (std::size_t i = 0; i < n; ++i) {
+            const auto pos = staging.size();
+            auto b = formats::msgpack::ValueBuilder::Array();
+            b.PushBack(formats::msgpack::ValueBuilder{static_cast<uint64_t>(i)});
+            b.PushBack(formats::msgpack::ValueBuilder{val});
+            b.AppendTo(staging);
+            sink += staging.size() - pos;
+            staging.clear();
+        }
+    });
+    Print("encode: ValueBuilder → AppendTo (Rec2)", r_appendto);
+
+    const double speedup_new = static_cast<double>(r_old.elapsed.count()) /
+                               static_cast<double>(r_new.elapsed.count());
+    const double speedup_appendto = static_cast<double>(r_old.elapsed.count()) /
+                                    static_cast<double>(r_appendto.elapsed.count());
+    std::cout << "  speedup vs OLD (ToBytes):  " << std::fixed << std::setprecision(2) << speedup_new << "x\n";
+    std::cout << "  speedup vs OLD (AppendTo): " << std::fixed << std::setprecision(2) << speedup_appendto << "x\n";
     (void)sink;
 }
 

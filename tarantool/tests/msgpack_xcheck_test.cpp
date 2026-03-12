@@ -337,4 +337,49 @@ TEST(MsgPackXCheck, WireBytesMatchForStrings) {
     }
 }
 
+// ---- AppendTo cross-check: output must equal ToBytes() for all scalar types.
+// We also verify via tntcxx decode to confirm both produce valid MsgPack.
+
+TEST(MsgPackXCheck, AppendToMatchesToBytesAndRoundTrips) {
+    using VB = formats::msgpack::ValueBuilder;
+
+    auto check = [](VB vb) {
+        const auto expected = vb.ToBytes();
+        std::vector<uint8_t> actual;
+        vb.AppendTo(actual);
+        EXPECT_EQ(actual, expected) << "AppendTo differs from ToBytes";
+    };
+
+    check(VB{uint64_t{0}});
+    check(VB{uint64_t{127}});
+    check(VB{uint64_t{128}});
+    check(VB{uint64_t{0xDEADBEEFULL}});
+    check(VB{uint64_t{0x100000000ULL}});
+    check(VB{int64_t{-1}});
+    check(VB{int64_t{-32}});
+    check(VB{int64_t{-1000}});
+    check(VB{int64_t{-2147483649LL}});
+    check(VB{true});
+    check(VB{false});
+    check(VB{});  // null
+    check(VB{std::string_view{"hello"}});
+    check(VB{double{3.14}});
+
+    // Array via AppendTo → tntcxx round-trip
+    {
+        auto arr = VB::Array();
+        arr.PushBack(VB{int64_t{10}});
+        arr.PushBack(VB{std::string_view{"x"}});
+
+        std::vector<uint8_t> bytes;
+        arr.AppendTo(bytes);
+        auto buf = BytesToTntBuf(bytes);
+        auto run = buf.begin<true>();
+        std::tuple<int64_t, std::string> decoded;
+        ASSERT_TRUE(mpp::decode(run, decoded));
+        EXPECT_EQ(std::get<0>(decoded), 10);
+        EXPECT_EQ(std::get<1>(decoded), "x");
+    }
+}
+
 USERVER_NAMESPACE_END

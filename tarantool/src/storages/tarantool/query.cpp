@@ -13,9 +13,12 @@ Query::Query(Type type, std::string space_or_func,
              std::uint32_t limit)
     : type_{type},
       space_or_func_{std::move(space_or_func)},
-      args_bytes_{args.ToBytes()},
-      ops_bytes_{ops.ToBytes()},
-      limit_{limit} {}
+      limit_{limit} {
+    args_bytes_.reserve(64);
+    args.AppendTo(args_bytes_);
+    ops_bytes_.reserve(64);
+    ops.AppendTo(ops_bytes_);
+}
 
 Query Query::Call(std::string func_name, formats::msgpack::ValueBuilder args) {
     return Query{Type::kCall, std::move(func_name), std::move(args)};
