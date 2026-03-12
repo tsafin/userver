@@ -8,6 +8,7 @@
 #include <userver/utest/utest.hpp>
 
 #include <userver/formats/msgpack/value_builder.hpp>
+#include <storages/tarantool/impl/iproto_frames.hpp>
 #include <storages/tarantool/impl/msgpack.hpp>
 
 // tntcxx mpp and Buffer
@@ -380,6 +381,34 @@ TEST(MsgPackXCheck, AppendToMatchesToBytesAndRoundTrips) {
         EXPECT_EQ(std::get<0>(decoded), 10);
         EXPECT_EQ(std::get<1>(decoded), "x");
     }
+}
+
+// ---- BuildPingFrame cross-check: header bytes must be valid msgpack ----
+// Verify via tntcxx decode that the sync_id bytes of BuildPingFrame are
+// correctly encoded as a big-endian uint64.
+
+TEST(MsgPackXCheck, PingFrameSyncDecodedByTntcxx) {
+    constexpr uint64_t kSync = 12345678ULL;
+    const auto frame = BuildPingFrame(kSync);
+
+    // The sync value starts at byte 9 (0xcf uint64 marker + 8 bytes).
+    // Load those 9 bytes and decode as uint64 via tntcxx.
+    auto buf = BytesToTntBuf({frame.begin() + 9, frame.end()});
+    auto run = buf.begin<true>();
+    uint64_t decoded_sync = 0;
+    ASSERT_TRUE(mpp::decode(run, decoded_sync));
+    EXPECT_EQ(decoded_sync, kSync);
+}
+
+TEST(MsgPackXCheck, PingFrameSyncLargeValueByTntcxx) {
+    constexpr uint64_t kSync = 0xDEADBEEF00C0FFEEULL;
+    const auto frame = BuildPingFrame(kSync);
+
+    auto buf = BytesToTntBuf({frame.begin() + 9, frame.end()});
+    auto run = buf.begin<true>();
+    uint64_t decoded_sync = 0;
+    ASSERT_TRUE(mpp::decode(run, decoded_sync));
+    EXPECT_EQ(decoded_sync, kSync);
 }
 
 USERVER_NAMESPACE_END

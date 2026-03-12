@@ -25,6 +25,7 @@
 #include <userver/storages/tarantool/exceptions.hpp>
 #include <userver/storages/tarantool/error_info.hpp>
 
+#include <storages/tarantool/impl/iproto_frames.hpp>
 #include <storages/tarantool/impl/msgpack.hpp>
 #include <storages/tarantool/impl/tracing_tags.hpp>
 
@@ -677,13 +678,36 @@ ExecutionResult Connection::Execute(engine::Deadline deadline,
 // ---- Ping ----
 
 engine::Future<ExecutionResult> Connection::PingAsync(engine::Deadline deadline) {
-    std::vector<uint8_t> body;
-    return SendAndRegister(deadline, kIprotoPing, std::move(body));
+    engine::Promise<ExecutionResult> promise;
+    auto future = promise.get_future();
+
+    if (deadline.IsReached()) {
+        promise.set_exception(std::make_exception_ptr(
+            TarantoolException{"Request deadline exceeded before send"}));
+        return future;
+    }
+
+    const uint64_t sync_id = ++sync_counter_;
+    {
+        std::lock_guard lock(pending_mutex_);
+        pending_.emplace(sync_id, std::move(promise));
+    }
+
+    // PING frames are always 18 bytes (fixed layout: see iproto_frames.hpp).
+    // Writing a pre-built array directly into staging_buf_ avoids the
+    // BuildHeader() push_back loop used by the generic SendAndRegister path.
+    const auto frame = BuildPingFrame(sync_id);
+    {
+        std::lock_guard lock(staging_mutex_);
+        staging_buf_.insert(staging_buf_.end(), frame.begin(), frame.end());
+    }
+    flush_event_.Send();
+
+    return future;
 }
 
 void Connection::Ping(engine::Deadline deadline) {
-    std::vector<uint8_t> body;  // empty body for ping
-    auto future = SendAndRegister(deadline, kIprotoPing, body);
+    auto future = PingAsync(deadline);
     const auto status = future.wait_until(deadline);
     if (status != engine::FutureStatus::kReady) {
         broken_.store(true, std::memory_order_release);

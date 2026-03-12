@@ -3,6 +3,7 @@
 #include <userver/formats/msgpack/value.hpp>
 #include <userver/formats/msgpack/value_builder.hpp>
 #include <userver/storages/tarantool/error_info.hpp>
+#include <storages/tarantool/impl/iproto_frames.hpp>
 #include <storages/tarantool/impl/msgpack.hpp>
 
 USERVER_NAMESPACE_BEGIN
@@ -713,6 +714,54 @@ TEST(MsgPackValueBuilder, AppendToTwiceDoubles) {
     ASSERT_EQ(buf.size(), once.size() * 2);
     EXPECT_EQ(std::vector<uint8_t>(buf.begin(), buf.begin() + once.size()), once);
     EXPECT_EQ(std::vector<uint8_t>(buf.begin() + once.size(), buf.end()), once);
+}
+
+// ---- BuildPingFrame ----
+
+// prehdr: 0xce + 4-byte big-endian length
+// header: fixmap{0x00:64, 0x01:sync_id}
+// body:   empty
+TEST(IprotoFrames, PingFrameSize) {
+    const auto f = BuildPingFrame(1);
+    EXPECT_EQ(f.size(), kPingFrameSize);
+    EXPECT_EQ(kPingFrameSize, 18u);
+}
+
+TEST(IprotoFrames, PingFramePrehdrLength) {
+    const auto f = BuildPingFrame(42);
+    // bytes[0..4]: 0xce + uint32 big-endian length of the rest
+    EXPECT_EQ(f[0], 0xce);
+    const uint32_t len = (uint32_t(f[1]) << 24) | (uint32_t(f[2]) << 16)
+                       | (uint32_t(f[3]) << 8)  |  uint32_t(f[4]);
+    // header = 13 bytes, body = 0 bytes → total past prehdr = 13
+    EXPECT_EQ(len, 13u);
+}
+
+TEST(IprotoFrames, PingFrameHeaderDecodes) {
+    // Use a value fitting in int64 to avoid sign-bit issues in the decoder.
+    constexpr uint64_t kSync = 0x0102030405060708ULL;
+    const auto f = BuildPingFrame(kSync);
+
+    // Parse the header map (bytes [5..17]) as msgpack
+    auto hdr = formats::msgpack::Value::FromBytes(f.data() + 5, f.size() - 5);
+    ASSERT_FALSE(hdr.IsMissing());
+
+    // IPROTO_CODE (key 0x00) must be 64 (PING)
+    EXPECT_EQ(hdr[uint64_t{0x00}].As<uint32_t>(), 64u);
+
+    // IPROTO_SYNC (key 0x01) must round-trip exactly
+    EXPECT_EQ(hdr[uint64_t{0x01}].As<uint64_t>(), kSync);
+}
+
+TEST(IprotoFrames, PingFrameSyncVaries) {
+    const auto f1 = BuildPingFrame(1);
+    const auto f2 = BuildPingFrame(2);
+    // Only sync bytes differ (bytes 10–17); everything else is identical
+    for (std::size_t i = 0; i < 10; ++i)
+        EXPECT_EQ(f1[i], f2[i]) << "byte " << i << " should be identical";
+    // At least one sync byte differs
+    EXPECT_NE(std::vector<uint8_t>(f1.begin()+10, f1.end()),
+              std::vector<uint8_t>(f2.begin()+10, f2.end()));
 }
 
 USERVER_NAMESPACE_END
