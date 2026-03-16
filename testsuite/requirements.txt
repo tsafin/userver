@@ -14,3 +14,5 @@ websockets >= 11.0.3, < 13.0.0
 # https://github.com/pytest-dev/pytest/issues/13248
 pytest >= 8.4
 zstd >= 1.5.5.0
+redis >= 4.4.0
+tarantool >= 1.0.0

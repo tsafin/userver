@@ -1,0 +1,40 @@
+#!/bin/sh
+# Start/stop Tarantool for userver functional tests.
+# Follows the same ScriptService protocol as other testsuite service scripts.
+
+. "$TESTSUITE_LIB_UTILS"
+
+if [ -z "$TARANTOOL_PORT" ]; then
+    die "TARANTOOL_PORT must be set"
+fi
+if [ -z "$TARANTOOL_TMPDIR" ]; then
+    die "TARANTOOL_TMPDIR must be set"
+fi
+if [ -z "$TARANTOOL_INIT_LUA" ]; then
+    die "TARANTOOL_INIT_LUA must be set"
+fi
+
+TARANTOOL_LOG="$TARANTOOL_TMPDIR/tarantool.log"
+TARANTOOL_PID="$TARANTOOL_TMPDIR/tarantool.pid"
+
+start() {
+    mkdir -p "$TARANTOOL_TMPDIR"
+    TARANTOOL_PORT="$TARANTOOL_PORT" \
+    TARANTOOL_LOG="$TARANTOOL_LOG" \
+    TARANTOOL_PID="$TARANTOOL_PID" \
+    TARANTOOL_BACKGROUND=1 \
+        tarantool "$TARANTOOL_INIT_LUA" || {
+        dump_log_stderr "$TARANTOOL_LOG"
+        exit 1
+    }
+}
+
+stop() {
+    if [ -f "$TARANTOOL_PID" ]; then
+        kill "$(cat "$TARANTOOL_PID")" 2>/dev/null || true
+        sleep 0.5
+    fi
+    rm -rf "$TARANTOOL_TMPDIR"
+}
+
+script_main "$@"

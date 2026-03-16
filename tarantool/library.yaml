@@ -1,0 +1,14 @@
+project-name: userver-tarantool
+project-alt-names:
+  - yandex-userver-tarantool
+maintainers:
+  - Common components
+description: Tarantool driver
+
+libraries:
+  - userver-core
+
+configs:
+    names:
+      - TARANTOOL_DEFAULT_COMMAND_CONTROL
+      - TARANTOOL_DEADLINE_PROPAGATION_ENABLED

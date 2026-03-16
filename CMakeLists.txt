@@ -168,6 +168,8 @@ option(USERVER_FEATURE_OTLP "Provide asynchronous OTLP exporters" "${USERVER_LIB
 option(USERVER_FEATURE_SQLITE "Provide asynchronous driver for SQLite" "${USERVER_LIB_ENABLED_DEFAULT}")
 # @ingroup libraries
 option(USERVER_FEATURE_ODBC "Provide asynchronous wrapper around ODBC" "${USERVER_LIB_ENABLED_DEFAULT}")
+# @ingroup libraries
+option(USERVER_FEATURE_TARANTOOL "Provide asynchronous driver for Tarantool" OFF)
 
 set(CMAKE_DEBUG_POSTFIX d)
 
@@ -345,6 +347,12 @@ if(USERVER_FEATURE_ODBC)
     _require_userver_core("USERVER_FEATURE_ODBC")
     add_subdirectory(odbc)
     list(APPEND USERVER_AVAILABLE_COMPONENTS odbc)
+endif()
+
+if(USERVER_FEATURE_TARANTOOL)
+    _require_userver_core("USERVER_FEATURE_TARANTOOL")
+    add_subdirectory(tarantool "${CMAKE_BINARY_DIR}/userver/tarantool")
+    list(APPEND USERVER_AVAILABLE_COMPONENTS tarantool)
 endif()
 
 add_subdirectory(libraries)
