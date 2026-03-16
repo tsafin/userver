@@ -327,10 +327,17 @@ ValueBuilder::ValueBuilder(const Value& v)
         }
         node_->data = std::move(arr);
     } else if (v.IsObject()) {
-        // We don't know if keys are int or string; scan both.
-        // For simplicity, try int keys first.
-        // In practice for connector use this path is rarely hit.
-        node_->data = std::monostate{};
+        // Store the raw msgpack bytes verbatim so that AppendTo() re-emits the
+        // map without loss.  Value has no public key-iterator, so we cannot
+        // reconstruct a node tree here.  EncodeNode for ExtData appends raw
+        // bytes directly, which is exactly what we need for round-tripping.
+        const uint8_t* obj_start = v.GetRawPos();
+        const Value next = v.NextSibling();
+        const uint8_t* obj_end =
+            next.IsMissing() ? v.GetRawEnd() : next.GetRawPos();
+        impl::ExtData raw;
+        raw.raw.assign(obj_start, obj_end);
+        node_->data = std::move(raw);
     }
 }
 

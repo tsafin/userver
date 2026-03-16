@@ -539,4 +539,46 @@ TEST(MsgpackADL, ParseScalarsViaADL) {
     EXPECT_EQ(Parse(v, formats::parse::To<uint32_t>{}), 42u);
 }
 
+// ======================================================================== //
+//  Bug-fix regression tests                                                  //
+// ======================================================================== //
+
+// Regression: 0xcf (uint64) values > INT64_MAX were previously misread as
+// negative by ReadUnsignedInt and thrown as ConversionException.
+TEST(MsgpackValue, Uint64AboveInt64MaxRoundTrip) {
+    const uint64_t big = UINT64_MAX;  // 0xffffffffffffffff
+    auto b = ValueBuilder{big};
+    const auto bytes = b.ToBytes();
+    // Wire format: 0xcf followed by 8 big-endian bytes
+    ASSERT_EQ(bytes[0], 0xcf);
+    const auto v = Value::FromBytes(bytes.data(), bytes.size());
+    EXPECT_EQ(v.As<uint64_t>(), big);
+}
+
+TEST(MsgpackValue, Uint64HalfAboveInt64Max) {
+    const uint64_t val = static_cast<uint64_t>(INT64_MAX) + 1;  // 2^63
+    auto b = ValueBuilder{val};
+    const auto bytes = b.ToBytes();
+    const auto v = Value::FromBytes(bytes.data(), bytes.size());
+    EXPECT_EQ(v.As<uint64_t>(), val);
+}
+
+// Regression: ValueBuilder(const Value&) for an object previously stored
+// std::monostate (nil), silently dropping all keys on AppendTo.
+TEST(MsgpackValueBuilder, ObjectRoundTripViaValueCtor) {
+    // Build a fixmap {0x01: 42} using ValueBuilder directly
+    ValueBuilder orig = ValueBuilder::IntKeyObject();
+    orig[1] = ValueBuilder{int64_t{42}};
+    const auto orig_bytes = orig.ToBytes();
+
+    // Wrap as a Value and convert back to ValueBuilder
+    const auto v = Value::FromBytes(orig_bytes.data(), orig_bytes.size());
+    ASSERT_TRUE(v.IsObject());
+    ValueBuilder rebuilt{v};
+    const auto rebuilt_bytes = rebuilt.ToBytes();
+
+    // The re-encoded bytes must match the original — no data loss
+    EXPECT_EQ(orig_bytes, rebuilt_bytes);
+}
+
 USERVER_NAMESPACE_END

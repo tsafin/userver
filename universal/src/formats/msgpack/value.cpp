@@ -610,6 +610,16 @@ int64_t ReadSignedInt(const Value& v) {
 }
 
 uint64_t ReadUnsignedInt(const Value& v) {
+    // 0xcf is the msgpack uint64 wire type.  Reading it through ReadSignedInt
+    // would cast to int64_t first, making values above INT64_MAX appear
+    // negative and then throw.  Handle it directly to preserve all 64 bits.
+    const uint8_t* p = v.GetRawPos();
+    const uint8_t* e = v.GetRawEnd();
+    BoundsCheck(p, e, 1, v.GetPath());
+    if (*p == 0xcf) {
+        BoundsCheck(p + 1, e, 8, v.GetPath());
+        return Read64(p + 1);
+    }
     const int64_t s = ReadSignedInt(v);
     if (s < 0) {
         throw ConversionException(
@@ -925,20 +935,20 @@ TntInterval Value::AsInterval() const {
         if (b <= 0x7f) { ++p; return b; }
         if ((b & 0xe0) == 0xe0) { ++p; return static_cast<int64_t>(static_cast<int8_t>(b)); }
         if (b == 0xd0) {
+            if (p + 2 > end) throw ParseException{"Interval: truncated int8"};
             p += 2;
-            if (p - 1 >= end) throw ParseException{"Interval: truncated int8"};
             return static_cast<int64_t>(static_cast<int8_t>(*(p - 1)));
         }
         if (b == 0xd1) {
+            if (p + 3 > end) throw ParseException{"Interval: truncated int16"};
             p += 3;
-            if (p - 2 >= end) throw ParseException{"Interval: truncated int16"};
             const int16_t v = static_cast<int16_t>(
                 (static_cast<uint16_t>(*(p-2)) << 8) | *(p-1));
             return static_cast<int64_t>(v);
         }
         if (b == 0xd2) {
+            if (p + 5 > end) throw ParseException{"Interval: truncated int32"};
             p += 5;
-            if (p - 4 >= end) throw ParseException{"Interval: truncated int32"};
             const int32_t v = static_cast<int32_t>(
                 (static_cast<uint32_t>(*(p-4)) << 24) |
                 (static_cast<uint32_t>(*(p-3)) << 16) |
@@ -946,8 +956,8 @@ TntInterval Value::AsInterval() const {
             return static_cast<int64_t>(v);
         }
         if (b == 0xd3) {
+            if (p + 9 > end) throw ParseException{"Interval: truncated int64"};
             p += 9;
-            if (p - 8 >= end) throw ParseException{"Interval: truncated int64"};
             int64_t v = 0;
             for (int i = 8; i >= 1; --i)
                 v = (v << 8) | static_cast<int64_t>(*(p - i));
