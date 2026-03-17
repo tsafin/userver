@@ -715,7 +715,7 @@ vshard provides `vshard.router.map_callrw(func, args, opts)` to call a function 
 ```cpp
 // VshardProxy::MapCallRW
 std::vector<VshardResult> VshardProxy::MapCallRW(
-    std::string_view func, formats::json::Value args, CommandControl cc) {
+    std::string_view func, formats::msgpack::Value args, CommandControl cc) {
 
     auto snapshot = routing_table_.Read();
     std::vector<engine::TaskWithResult<VshardResult>> tasks;
@@ -1078,7 +1078,7 @@ This phase is fully optional — the proxy works correctly without it (falls bac
 
 - [ ] **VshardResult** (`impl/vshard_result.hpp/cpp`)
   - Unwraps `[app_result, null]` envelope
-  - `GetData()` → raw MsgPack buffer or `formats::json::Value`
+  - `GetData()` → raw MsgPack buffer or `formats::msgpack::Value`
   - Raises `VshardException` on in-band vshard errors
 
 - [ ] **Exception hierarchy** (`impl/vshard_exceptions.hpp`)
@@ -1139,12 +1139,12 @@ class VshardProxy final {
     // or on a replica (RO/BRO/BRE). Handles MOVED with one automatic retry.
     VshardResult CallRW(std::string_view sharding_key,
                         std::string_view func,
-                        formats::json::Value args,
+                        formats::msgpack::Value args,
                         OptionalCommandControl = {});
 
     VshardResult CallRO(std::string_view sharding_key,
                         std::string_view func,
-                        formats::json::Value args,
+                        formats::msgpack::Value args,
                         OptionalCommandControl = {});
 
     // Same but with Best-Effort replica selection:
@@ -1152,25 +1152,25 @@ class VshardProxy final {
     // BRE: prefer replica, throw ReplicaUnavailableError on error
     VshardResult CallBRO(std::string_view sharding_key,
                          std::string_view func,
-                         formats::json::Value args,
+                         formats::msgpack::Value args,
                          OptionalCommandControl = {});
 
     VshardResult CallBRE(std::string_view sharding_key,
                          std::string_view func,
-                         formats::json::Value args,
+                         formats::msgpack::Value args,
                          OptionalCommandControl = {});
 
     // Pre-computed bucket_id variant (when caller already knows the bucket)
     VshardResult Call(BucketId bucket_id,
                       CallMode mode,
                       std::string_view func,
-                      formats::json::Value args,
+                      formats::msgpack::Value args,
                       OptionalCommandControl = {});
 
     // Scatter: fan out to all replicasets in parallel, collect results.
     // Uses utils::Async fan-out; respects CommandControl deadline.
     std::vector<VshardResult> MapCallRW(std::string_view func,
-                                        formats::json::Value args,
+                                        formats::msgpack::Value args,
                                         OptionalCommandControl = {});
 
     BucketId ComputeBucketId(std::string_view sharding_key) const;
@@ -1599,7 +1599,7 @@ Client: triggers topology refresh, retries.
 ### Example 2 — MapCallRW (scatter)
 
 ```cpp
-auto results = client.MapCallRW("stats.aggregate", formats::json::MakeObject());
+auto results = client.MapCallRW("stats.aggregate", formats::msgpack::Value{});
 // Spawns one coroutine per replicaset via utils::Async, waits all with engine::GetAll
 ```
 
