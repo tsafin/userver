@@ -75,4 +75,5 @@ if (USERVER_IS_THE_ROOT_PROJECT)
     endif()
 
     add_subdirectory(functional_tests)
+    add_subdirectory(vshard)
 endif()
