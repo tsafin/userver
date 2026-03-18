@@ -1001,4 +1001,170 @@ TEST(ParseIprotoResponse, DataBytesMatchExpected) {
     EXPECT_EQ(got, data_bytes);
 }
 
+// ---- ParseCallForRoute -------------------------------------------------------
+
+namespace {
+
+/// Build a minimal vshard.router.call IPROTO CALL body:
+///   fixmap(2) + FUNCTION_NAME:"vshard.router.call" + TUPLE:[bucket_id,mode,fn,args]
+std::vector<uint8_t> BuildRouterCallBody(uint32_t bucket_id,
+                                         std::string_view mode = "write",
+                                         std::string_view fn = "box.space.test:get",
+                                         uint32_t arg = 42) {
+    using namespace storages::tarantool::impl;
+    std::vector<uint8_t> buf;
+
+    // fixmap(2)
+    buf.push_back(static_cast<uint8_t>(0x80 | 2));
+
+    // key: FUNCTION_NAME (0x22)
+    buf.push_back(0x22);
+    // val: fixstr "vshard.router.call" (18 chars)
+    const std::string_view fname = "vshard.router.call";
+    buf.push_back(static_cast<uint8_t>(0xa0 | fname.size()));
+    buf.insert(buf.end(), fname.begin(), fname.end());
+
+    // key: TUPLE (0x21)
+    buf.push_back(0x21);
+    // val: fixarray(4) = [bucket_id, mode, fn, [arg]]
+    buf.push_back(static_cast<uint8_t>(0x90 | 4));
+
+    // bucket_id: encode as minimal uint
+    if (bucket_id <= 127) {
+        buf.push_back(static_cast<uint8_t>(bucket_id));
+    } else if (bucket_id <= 0xff) {
+        buf.push_back(0xcc);
+        buf.push_back(static_cast<uint8_t>(bucket_id));
+    } else {
+        buf.push_back(0xcd);
+        buf.push_back(static_cast<uint8_t>(bucket_id >> 8));
+        buf.push_back(static_cast<uint8_t>(bucket_id));
+    }
+    // mode
+    buf.push_back(static_cast<uint8_t>(0xa0 | mode.size()));
+    buf.insert(buf.end(), mode.begin(), mode.end());
+    // fn
+    buf.push_back(static_cast<uint8_t>(0xa0 | fn.size()));
+    buf.insert(buf.end(), fn.begin(), fn.end());
+    // args: fixarray(1) = [arg]
+    buf.push_back(0x91);
+    buf.push_back(static_cast<uint8_t>(arg));
+
+    return buf;
+}
+
+}  // namespace
+
+TEST(ParseCallForRoute, ExtractsBucketId_Fixuint) {
+    using namespace storages::tarantool::impl;
+    const auto body = BuildRouterCallBody(100);
+    const auto result = ParseCallForRoute(body.data(), body.size());
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result->bucket_id, 100u);
+    EXPECT_NE(result->tuple_begin, nullptr);
+    EXPECT_GT(result->tuple_end, result->tuple_begin);
+}
+
+TEST(ParseCallForRoute, ExtractsBucketId_Uint8) {
+    using namespace storages::tarantool::impl;
+    const auto body = BuildRouterCallBody(200);  // > 127, uses uint8 encoding
+    const auto result = ParseCallForRoute(body.data(), body.size());
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result->bucket_id, 200u);
+}
+
+TEST(ParseCallForRoute, ExtractsBucketId_Uint16) {
+    using namespace storages::tarantool::impl;
+    const auto body = BuildRouterCallBody(3000);
+    const auto result = ParseCallForRoute(body.data(), body.size());
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result->bucket_id, 3000u);
+}
+
+TEST(ParseCallForRoute, TupleSpanCoversEntirePayload) {
+    using namespace storages::tarantool::impl;
+    const auto body = BuildRouterCallBody(42);
+    const auto result = ParseCallForRoute(body.data(), body.size());
+    ASSERT_TRUE(result.has_value());
+    // tuple_end must point to packet end
+    EXPECT_EQ(result->tuple_end, body.data() + body.size());
+    // tuple_begin must be within the body
+    EXPECT_GE(result->tuple_begin, body.data());
+    EXPECT_LT(result->tuple_begin, result->tuple_end);
+}
+
+TEST(ParseCallForRoute, InvalidBucketZeroReturnsNull) {
+    using namespace storages::tarantool::impl;
+    const auto body = BuildRouterCallBody(0);  // bucket_id=0 is invalid
+    EXPECT_FALSE(ParseCallForRoute(body.data(), body.size()).has_value());
+}
+
+TEST(ParseCallForRoute, EmptyBodyReturnsNull) {
+    using namespace storages::tarantool::impl;
+    EXPECT_FALSE(ParseCallForRoute(nullptr, 0).has_value());
+    const uint8_t dummy = 0xc0;  // nil
+    EXPECT_FALSE(ParseCallForRoute(&dummy, 1).has_value());
+}
+
+// ---- BuildStorageCallFrame / StorageCallFrame --------------------------------
+
+TEST(BuildStorageCallFrame, PreheaderLengthIsCorrect) {
+    using namespace storages::tarantool::impl;
+    const auto body = BuildRouterCallBody(42);
+    const auto result = ParseCallForRoute(body.data(), body.size());
+    ASSERT_TRUE(result.has_value());
+
+    const auto frame = BuildStorageCallFrame(*result, 99);
+
+    // tuple size
+    const std::size_t tuple_size =
+        static_cast<std::size_t>(result->tuple_end - result->tuple_begin);
+    // expected total = hdr(13) + body_prefix(23) + tuple_size
+    const uint32_t expected_total =
+        static_cast<uint32_t>(13 + sizeof(kStorageCallBodyPrefix) + tuple_size);
+
+    // preheader: bytes[0]=0xce, [1..4] = big-endian length
+    EXPECT_EQ(frame.preheader.bytes[0], 0xce);
+    const uint32_t encoded_len =
+        (static_cast<uint32_t>(frame.preheader.bytes[1]) << 24) |
+        (static_cast<uint32_t>(frame.preheader.bytes[2]) << 16) |
+        (static_cast<uint32_t>(frame.preheader.bytes[3]) <<  8) |
+         static_cast<uint32_t>(frame.preheader.bytes[4]);
+    EXPECT_EQ(encoded_len, expected_total);
+}
+
+TEST(BuildStorageCallFrame, CallHeaderEncodesSyncAndCallType) {
+    using namespace storages::tarantool::impl;
+    const auto body = BuildRouterCallBody(1);
+    const auto result = ParseCallForRoute(body.data(), body.size());
+    ASSERT_TRUE(result.has_value());
+
+    const uint64_t new_sync = 0xDEADBEEF12345678ULL;
+    const auto frame = BuildStorageCallFrame(*result, new_sync);
+
+    // bytes[0] = fixmap(2) = 0x82
+    EXPECT_EQ(frame.call_header.bytes[0], static_cast<uint8_t>(0x80 | 2));
+    // bytes[1] = REQUEST_TYPE key, bytes[2] = CALL (10 = 0x0a)
+    EXPECT_EQ(frame.call_header.bytes[1], static_cast<uint8_t>(Iproto::REQUEST_TYPE));
+    EXPECT_EQ(frame.call_header.bytes[2], static_cast<uint8_t>(Iproto::CALL));
+    // bytes[3] = SYNC key, bytes[4] = 0xcf (uint64 marker)
+    EXPECT_EQ(frame.call_header.bytes[3], static_cast<uint8_t>(Iproto::SYNC));
+    EXPECT_EQ(frame.call_header.bytes[4], 0xcf);
+    // bytes[5..12] = new_sync big-endian
+    uint64_t decoded_sync = 0;
+    for (int i = 5; i <= 12; ++i)
+        decoded_sync = decoded_sync << 8 | frame.call_header.bytes[i];
+    EXPECT_EQ(decoded_sync, new_sync);
+}
+
+TEST(BuildStorageCallFrame, BodyPrefixIsStorageCall) {
+    // kStorageCallBodyPrefix must start with "vshard.storage.call" string
+    using namespace storages::tarantool::impl;
+    const std::string_view prefix_str(
+        reinterpret_cast<const char*>(kStorageCallBodyPrefix + 3), 19);
+    EXPECT_EQ(prefix_str, "vshard.storage.call");
+    // Last byte of prefix must be IPROTO_TUPLE key (0x21)
+    EXPECT_EQ(kStorageCallBodyPrefix[22], static_cast<uint8_t>(Iproto::TUPLE));
+}
+
 USERVER_NAMESPACE_END

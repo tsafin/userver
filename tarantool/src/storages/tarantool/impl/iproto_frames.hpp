@@ -34,6 +34,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 
 #include <Client/IprotoConstants.hpp>
 
@@ -369,6 +370,180 @@ inline std::size_t SkipValue(const uint8_t* p, std::size_t len, std::size_t pos,
         }
     }
     return r;
+}
+
+// ── Zero-copy CALL routing ────────────────────────────────────────────────────
+
+/// Result of scanning an IPROTO CALL body for zero-copy vshard routing.
+/// All pointers are into the caller-owned receive buffer; the buffer must
+/// outlive this struct.
+struct CallRouteInfo {
+    uint32_t bucket_id;          ///< vshard bucket id (1-based)
+    const uint8_t* tuple_begin;  ///< first byte of the IPROTO_TUPLE value
+    const uint8_t* tuple_end;    ///< one-past-last byte (== packet_end)
+};
+
+/// Scan an IPROTO CALL body (starting at the body fixmap byte) to extract
+/// the vshard bucket_id and locate the raw IPROTO_TUPLE bytes for
+/// scatter-gather forwarding.  Cost: ~23 bytes scanned regardless of payload.
+///
+/// @param p    Pointer to the first byte of the IPROTO body map.
+/// @param len  Number of bytes available from @p p.
+/// @returns    Populated CallRouteInfo on success, or std::nullopt on any
+///             parse error (malformed packet, missing TUPLE key, bucket out
+///             of valid vshard range).
+[[nodiscard]] inline std::optional<CallRouteInfo>
+ParseCallForRoute(const uint8_t* p, std::size_t len) noexcept {
+    using namespace msgpack_scan;
+    std::size_t pos = 0;
+
+    // ── body map header ───────────────────────────────────────────────────────
+    if (pos >= len) return std::nullopt;
+    const uint8_t b = p[pos++];
+    std::size_t body_n = 0;
+    if ((b & 0xf0u) == mp::kFixMapMin) {
+        body_n = b & 0x0fu;
+    } else if (b == mp::kMap16 && pos + 2 <= len) {
+        body_n = (std::size_t)p[pos] << 8 | p[pos + 1];
+        pos += 2;
+    } else if (b == mp::kMap32 && pos + 4 <= len) {
+        body_n = (std::size_t)p[pos] << 24 | (std::size_t)p[pos + 1] << 16 |
+                 (std::size_t)p[pos + 2] << 8 | p[pos + 3];
+        pos += 4;
+    } else {
+        return std::nullopt;
+    }
+
+    // ── scan for IPROTO_TUPLE key (0x21) ─────────────────────────────────────
+    const uint8_t* tuple_begin = nullptr;
+    for (std::size_t i = 0; i < body_n && pos < len; ++i) {
+        auto [key, kpos] = ReadUint(p, len, pos);
+        pos = kpos;
+        if (key == Iproto::TUPLE) {
+            tuple_begin = p + pos;
+            break;
+        }
+        pos = SkipValue(p, len, pos);  // skip non-TUPLE values
+    }
+    if (!tuple_begin) return std::nullopt;
+
+    // ── decode the TUPLE array header to reach bucket_id ─────────────────────
+    std::size_t apos = static_cast<std::size_t>(tuple_begin - p);
+    if (apos >= len) return std::nullopt;
+    const uint8_t ah = p[apos++];
+    std::size_t arr_n = 0;
+    if ((ah & 0xf0u) == mp::kFixArrayMin) {
+        arr_n = ah & 0x0fu;
+    } else if (ah == mp::kArray16 && apos + 2 <= len) {
+        arr_n = (std::size_t)p[apos] << 8 | p[apos + 1];
+        apos += 2;
+    } else if (ah == mp::kArray32 && apos + 4 <= len) {
+        arr_n = (std::size_t)p[apos] << 24 | (std::size_t)p[apos + 1] << 16 |
+                (std::size_t)p[apos + 2] << 8 | p[apos + 3];
+        apos += 4;
+    } else {
+        return std::nullopt;
+    }
+    if (arr_n < 2) return std::nullopt;  // need at least [bucket_id, mode, ...]
+
+    auto [bucket_id, after_bid] = ReadUint(p, len, apos);
+    (void)after_bid;
+    if (bucket_id == 0 || bucket_id > 65535u) return std::nullopt;
+
+    return CallRouteInfo{static_cast<uint32_t>(bucket_id), tuple_begin, p + len};
+}
+
+// ── Scatter-gather forwarding ─────────────────────────────────────────────────
+
+/// Pre-computed body prefix for vshard.storage.call:
+///   fixmap(2) + IPROTO_FUNCTION_NAME + fixstr(19) + "vshard.storage.call"
+///             + IPROTO_TUPLE key (value = raw TUPLE bytes that follow)
+/// 23 bytes total.  The TUPLE value bytes are supplied separately as iov[3].
+inline constexpr uint8_t kStorageCallBodyPrefix[] = {
+    static_cast<uint8_t>(mp::kFixMapMin | 2),   // fixmap(2)
+    static_cast<uint8_t>(Iproto::FUNCTION_NAME),
+    static_cast<uint8_t>(mp::kFixStrMin | 19),  // fixstr(19)
+    'v', 's', 'h', 'a', 'r', 'd', '.', 's', 't', 'o', 'r', 'a', 'g', 'e', '.', 'c', 'a', 'l', 'l',
+    static_cast<uint8_t>(Iproto::TUPLE),        // key 0x21; value = TUPLE bytes follow
+};
+static_assert(sizeof(kStorageCallBodyPrefix) == 23);
+
+/// IPROTO header map for a CALL request with a given sync_id (13 bytes).
+///   fixmap(2) + REQUEST_TYPE + CALL + SYNC + uint64(sync_id)
+struct IprotoCallHeader {
+    uint8_t bytes[13];
+};
+
+[[nodiscard]] inline IprotoCallHeader
+BuildIprotoCallHeader(uint64_t sync_id) noexcept {
+    IprotoCallHeader h{};
+    h.bytes[0]  = static_cast<uint8_t>(mp::kFixMapMin | 2);
+    h.bytes[1]  = static_cast<uint8_t>(Iproto::REQUEST_TYPE);
+    h.bytes[2]  = static_cast<uint8_t>(Iproto::CALL);
+    h.bytes[3]  = static_cast<uint8_t>(Iproto::SYNC);
+    h.bytes[4]  = mp::kUint64;
+    h.bytes[5]  = static_cast<uint8_t>(sync_id >> 56);
+    h.bytes[6]  = static_cast<uint8_t>(sync_id >> 48);
+    h.bytes[7]  = static_cast<uint8_t>(sync_id >> 40);
+    h.bytes[8]  = static_cast<uint8_t>(sync_id >> 32);
+    h.bytes[9]  = static_cast<uint8_t>(sync_id >> 24);
+    h.bytes[10] = static_cast<uint8_t>(sync_id >> 16);
+    h.bytes[11] = static_cast<uint8_t>(sync_id >>  8);
+    h.bytes[12] = static_cast<uint8_t>(sync_id);
+    return h;
+}
+
+/// 5-byte IPROTO preheader: 0xce (uint32 marker) + big-endian packet length.
+struct IprotoPreheader {
+    uint8_t bytes[5];
+};
+
+[[nodiscard]] inline IprotoPreheader
+BuildIprotoPreheader(uint32_t packet_len) noexcept {
+    IprotoPreheader ph{};
+    ph.bytes[0] = mp::kUint32;
+    ph.bytes[1] = static_cast<uint8_t>(packet_len >> 24);
+    ph.bytes[2] = static_cast<uint8_t>(packet_len >> 16);
+    ph.bytes[3] = static_cast<uint8_t>(packet_len >>  8);
+    ph.bytes[4] = static_cast<uint8_t>(packet_len);
+    return ph;
+}
+
+/// Holds the 41 bytes of generated header data for a forwarded storage call.
+/// The TUPLE bytes are referenced from the original receive buffer (zero-copy).
+///
+/// Usage with engine::io::Socket::SendAll(IoData*, size_t, Deadline):
+/// @code
+///   auto frame = BuildStorageCallFrame(info, new_sync);
+///   const engine::io::IoData iovs[] = {
+///       {frame.preheader.bytes, sizeof(frame.preheader.bytes)},
+///       {frame.call_header.bytes, sizeof(frame.call_header.bytes)},
+///       {kStorageCallBodyPrefix, sizeof(kStorageCallBodyPrefix)},
+///       {info.tuple_begin, static_cast<std::size_t>(info.tuple_end - info.tuple_begin)},
+///   };
+///   socket.SendAll(iovs, 4, deadline);
+/// @endcode
+struct StorageCallFrame {
+    IprotoPreheader  preheader;    ///< 5 bytes: length prefix
+    IprotoCallHeader call_header;  ///< 13 bytes: IPROTO header map
+    // kStorageCallBodyPrefix (23 bytes) is a compile-time constant
+    // TUPLE bytes are referenced from the original receive buffer
+};
+
+/// Build the 18 generated bytes for forwarding a vshard.router.call to
+/// vshard.storage.call.  Only 41 bytes total are written to storage per
+/// request; the TUPLE payload is forwarded zero-copy from the receive buffer.
+[[nodiscard]] inline StorageCallFrame
+BuildStorageCallFrame(const CallRouteInfo& info, uint64_t new_sync) noexcept {
+    const std::size_t tuple_size = static_cast<std::size_t>(info.tuple_end - info.tuple_begin);
+    const std::size_t body_size  = sizeof(kStorageCallBodyPrefix) + tuple_size;
+    constexpr std::size_t kHdrSize = sizeof(IprotoCallHeader::bytes);  // 13
+    const uint32_t total = static_cast<uint32_t>(kHdrSize + body_size);
+
+    StorageCallFrame f{};
+    f.preheader   = BuildIprotoPreheader(total);
+    f.call_header = BuildIprotoCallHeader(new_sync);
+    return f;
 }
 
 }  // namespace storages::tarantool::impl
