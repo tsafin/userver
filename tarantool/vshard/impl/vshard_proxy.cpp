@@ -1,6 +1,7 @@
 #include <vshard/impl/vshard_proxy.hpp>
 
 #include <chrono>
+#include <cstdint>
 
 #include <userver/engine/deadline.hpp>
 #include <userver/engine/sleep.hpp>
@@ -8,6 +9,8 @@
 #include <userver/logging/log.hpp>
 #include <userver/storages/tarantool/query.hpp>
 #include <userver/utils/async.hpp>
+
+#include <storages/tarantool/impl/iproto_frames.hpp>
 
 USERVER_NAMESPACE_BEGIN
 
@@ -211,6 +214,124 @@ formats::msgpack::Value VshardProxy::DoCall(
         }
 
         // Any other vshard error
+        throw VshardStorageError{
+            env.vshard_error.code,
+            std::to_string(static_cast<uint32_t>(env.vshard_error.type)),
+            env.vshard_error.message};
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ForwardCall — zero-copy routing
+// ---------------------------------------------------------------------------
+
+formats::msgpack::Value VshardProxy::ForwardCall(
+    const uint8_t* iproto_body,
+    std::size_t body_len,
+    impl::CallMode mode,
+    storages::tarantool::OptionalCommandControl cc) {
+
+    const auto route = storages::tarantool::impl::ParseCallForRoute(iproto_body, body_len);
+    if (!route) {
+        throw VshardException{
+            "ForwardCall: malformed IPROTO body or invalid bucket_id"};
+    }
+    const BucketId bucket_id = route->bucket_id;
+
+    if (bucket_id < 1 || bucket_id > calculator_.GetBucketCount()) {
+        throw NoReplicasetError{bucket_id};
+    }
+
+    auto snapshot = routing_table_.Read();
+    impl::ReplicasetPool* rs = snapshot->FindReplicaset(bucket_id);
+    if (!rs) throw NoReplicasetError{bucket_id};
+
+    uint32_t attempt = 0;
+    while (true) {
+        storages::tarantool::ExecutionResult raw;
+        try {
+            raw = rs->ForwardStorageCall(mode, *route, cc);
+        } catch (const storages::tarantool::TarantoolException& ex) {
+            LOG_WARNING() << "vshard.storage.call forward error (bucket="
+                          << bucket_id << " attempt=" << attempt
+                          << "): " << ex.what();
+            throw;
+        }
+
+        impl::VshardEnvelope env;
+        try {
+            env = impl::DecodeEnvelope(raw);
+        } catch (const storages::tarantool::CommandException&) {
+            throw;
+        }
+
+        if (env.vshard_error.IsNull()) {
+            return env.app_result;
+        }
+
+        if (env.vshard_error.IsWrongBucket()) {
+            if (attempt >= settings_.max_moved_retries) {
+                throw MovedError{
+                    bucket_id,
+                    env.vshard_error.destination_uuid.value_or(""),
+                    env.vshard_error.message};
+            }
+            ++attempt;
+
+            if (env.vshard_error.destination_uuid.has_value()) {
+                routing_table_.PatchBucketOwner(
+                    bucket_id, *env.vshard_error.destination_uuid);
+                snapshot = routing_table_.Read();
+                rs = snapshot->FindReplicaset(bucket_id);
+            }
+
+            if (!rs) {
+                const auto now = std::chrono::steady_clock::now();
+                if (now - last_moved_refresh_ >
+                    settings_.moved_refresh_min_interval) {
+                    last_moved_refresh_ = now;
+                    try {
+                        routing_table_.Assign(fetcher_->RefreshFull());
+                    } catch (const std::exception& ex) {
+                        LOG_WARNING() << "vshard MOVED refresh failed: "
+                                      << ex.what();
+                    }
+                    snapshot = routing_table_.Read();
+                    rs = snapshot->FindReplicaset(bucket_id);
+                }
+                if (!rs) throw NoReplicasetError{bucket_id};
+            }
+            continue;
+        }
+
+        if (env.vshard_error.IsTransfer()) {
+            if (attempt >= settings_.max_moved_retries) {
+                throw TransferError{env.vshard_error.message};
+            }
+            ++attempt;
+            engine::SleepFor(std::chrono::milliseconds{100});
+            continue;
+        }
+
+        if (env.vshard_error.IsNonMaster()) {
+            if (attempt >= settings_.max_moved_retries) {
+                throw VshardStorageError{
+                    env.vshard_error.code, "NON_MASTER",
+                    env.vshard_error.message};
+            }
+            ++attempt;
+            try {
+                routing_table_.Assign(fetcher_->RefreshFull());
+            } catch (const std::exception& ex) {
+                LOG_WARNING() << "vshard NON_MASTER refresh failed: "
+                              << ex.what();
+            }
+            snapshot = routing_table_.Read();
+            rs = snapshot->FindReplicaset(bucket_id);
+            if (!rs) throw NoReplicasetError{bucket_id};
+            continue;
+        }
+
         throw VshardStorageError{
             env.vshard_error.code,
             std::to_string(static_cast<uint32_t>(env.vshard_error.type)),

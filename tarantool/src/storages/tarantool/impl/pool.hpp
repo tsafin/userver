@@ -9,6 +9,7 @@
 #include <userver/storages/tarantool/result.hpp>
 #include <userver/utils/statistics/writer.hpp>
 
+#include <storages/tarantool/impl/iproto_frames.hpp>
 #include <storages/tarantool/impl/settings.hpp>
 
 USERVER_NAMESPACE_BEGIN
@@ -26,6 +27,12 @@ class Pool final {
     Pool(Pool&&) = default;
 
     ExecutionResult Execute(OptionalCommandControl cc, const Query& query);
+
+    /// Forward a pre-parsed IPROTO CALL body to storage as vshard.storage.call.
+    /// Builds body from kStorageCallBodyPrefix + raw TUPLE bytes (one memcpy);
+    /// no msgpack re-encoding. Returns the raw IPROTO response.
+    ExecutionResult ForwardStorageCall(const CallRouteInfo& info,
+                                       OptionalCommandControl cc);
 
     /// Send an IPROTO PING and wait for the empty response.
     /// Useful for latency/throughput benchmarking without any server-side work.

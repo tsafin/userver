@@ -92,6 +92,50 @@ ExecutionResult Pool::Execute(OptionalCommandControl cc, const Query& query) {
     }
 }
 
+ExecutionResult Pool::ForwardStorageCall(const CallRouteInfo& info,
+                                          OptionalCommandControl cc) {
+    const engine::Deadline deadline =
+        cc ? engine::Deadline::FromDuration(cc->execute)
+           : engine::Deadline::FromDuration(impl_->GetSettings().queue_timeout);
+
+    tracing::Span span{scopes::kCall};
+    span.AddTag(tracing::kDatabaseType, "tarantool");
+    span.AddTag(tracing::kDatabaseInstance, impl_->GetHostName());
+
+    auto& req_stats = impl_->GetStatistics().calls;
+    ++req_stats.total;
+
+    engine::Future<ExecutionResult> fut;
+    try {
+        auto conn_ptr = std::make_unique<ConnectionPtr>(impl_->Acquire(deadline));
+        fut = (*conn_ptr)->ForwardStorageCallAsync(info, deadline);
+        conn_ptr.reset();  // release pool slot immediately (pipelining)
+    } catch (...) {
+        ++req_stats.error;
+        throw;
+    }
+
+    const auto status = fut.wait_until(deadline);
+    if (status == engine::FutureStatus::kTimeout) {
+        ++req_stats.error;
+        throw TarantoolException{"forward deadline expired"};
+    }
+    if (status != engine::FutureStatus::kReady) {
+        ++req_stats.error;
+        engine::current_task::CancellationPoint();
+        throw TarantoolException{"forward cancelled"};
+    }
+
+    try {
+        auto result = fut.get();
+        if (!result.IsOk()) ++req_stats.error;
+        return result;
+    } catch (...) {
+        ++req_stats.error;
+        throw;
+    }
+}
+
 void Pool::Ping(OptionalCommandControl cc) {
     const engine::Deadline deadline =
         cc ? engine::Deadline::FromDuration(cc->execute)

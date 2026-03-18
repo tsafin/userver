@@ -90,6 +90,23 @@ class VshardProxy final {
         formats::msgpack::ValueBuilder args,
         storages::tarantool::OptionalCommandControl = {});
 
+    // ---- Zero-copy forwarding -----------------------------------------------
+
+    /// Forward a raw IPROTO CALL body directly to the appropriate storage node.
+    ///
+    /// @p iproto_body must point to the first byte of the IPROTO CALL body
+    /// (the msgpack map that contains IPROTO_FUNCTION_NAME + IPROTO_TUPLE).
+    /// ParseCallForRoute() scans ~23 bytes to extract bucket_id and locate
+    /// the raw TUPLE, which is then forwarded without msgpack re-encoding.
+    ///
+    /// @param mode  Master vs replica routing; caller determines from context.
+    /// @throws VshardException  on bad parse, routing failure, or retry limit.
+    formats::msgpack::Value ForwardCall(
+        const uint8_t* iproto_body,
+        std::size_t body_len,
+        impl::CallMode mode = impl::CallMode::kReadWrite,
+        storages::tarantool::OptionalCommandControl = {});
+
     // ---- Scatter / Map-Reduce -----------------------------------------------
 
     /// Fan out to all replicasets in parallel; collect all results.

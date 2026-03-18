@@ -13,6 +13,7 @@
 #include <userver/storages/tarantool/result.hpp>
 #include <userver/utils/statistics/writer.hpp>
 
+#include <storages/tarantool/impl/iproto_frames.hpp>
 #include <storages/tarantool/impl/pool.hpp>
 
 USERVER_NAMESPACE_BEGIN
@@ -47,6 +48,13 @@ class ReplicasetPool final {
     storages::tarantool::ExecutionResult Execute(
         CallMode mode,
         const storages::tarantool::Query& query,
+        storages::tarantool::OptionalCommandControl cc = {});
+
+    /// Forward a pre-parsed IPROTO CALL body as vshard.storage.call.
+    /// No msgpack re-encoding: TUPLE bytes are copied once from info.
+    storages::tarantool::ExecutionResult ForwardStorageCall(
+        CallMode mode,
+        const storages::tarantool::impl::CallRouteInfo& info,
         storages::tarantool::OptionalCommandControl cc = {});
 
     bool IsAvailable() const;

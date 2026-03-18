@@ -67,6 +67,30 @@ storages::tarantool::ExecutionResult ReplicasetPool::Execute(
     return master_->Execute(cc, query);
 }
 
+storages::tarantool::ExecutionResult ReplicasetPool::ForwardStorageCall(
+    CallMode mode,
+    const storages::tarantool::impl::CallRouteInfo& info,
+    storages::tarantool::OptionalCommandControl cc) {
+    switch (mode) {
+        case CallMode::kReadWrite:
+            return master_->ForwardStorageCall(info, cc);
+
+        case CallMode::kReadOnly:
+        case CallMode::kBestReadOnly:
+            if (replicas_.empty()) {
+                return master_->ForwardStorageCall(info, cc);
+            }
+            return SelectReplica().ForwardStorageCall(info, cc);
+
+        case CallMode::kBestReadOnlyError:
+            if (replicas_.empty() || !replicas_.front()->IsAvailable()) {
+                throw ReplicaUnavailableError{uuid_};
+            }
+            return SelectReplica().ForwardStorageCall(info, cc);
+    }
+    return master_->ForwardStorageCall(info, cc);
+}
+
 bool ReplicasetPool::IsAvailable() const {
     if (master_ && master_->IsAvailable()) return true;
     for (const auto& r : replicas_) {

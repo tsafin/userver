@@ -521,7 +521,22 @@ engine::Future<ExecutionResult> Connection::SendAndRegister(
     return future;
 }
 
-// ---- Space ID resolver ----
+// ---- Zero-copy storage call forwarding ----
+
+engine::Future<ExecutionResult> Connection::ForwardStorageCallAsync(
+    const CallRouteInfo& info, engine::Deadline deadline) {
+    const std::size_t tuple_size =
+        static_cast<std::size_t>(info.tuple_end - info.tuple_begin);
+    // Build body: kStorageCallBodyPrefix (23 bytes) + raw TUPLE bytes.
+    // One memcpy of the TUPLE; no msgpack re-encoding of the vshard envelope.
+    std::vector<uint8_t> body;
+    body.reserve(sizeof(kStorageCallBodyPrefix) + tuple_size);
+    body.insert(body.end(),
+                kStorageCallBodyPrefix,
+                kStorageCallBodyPrefix + sizeof(kStorageCallBodyPrefix));
+    body.insert(body.end(), info.tuple_begin, info.tuple_end);
+    return SendAndRegister(deadline, kIprotoCall, std::move(body));
+}
 
 uint32_t Connection::ResolveSpaceId(const std::string& space_name,
                                     engine::Deadline deadline) {

@@ -18,6 +18,7 @@
 #include <userver/storages/tarantool/query.hpp>
 #include <userver/storages/tarantool/result.hpp>
 
+#include <storages/tarantool/impl/iproto_frames.hpp>
 #include <storages/tarantool/impl/settings.hpp>
 
 USERVER_NAMESPACE_BEGIN
@@ -54,6 +55,12 @@ class Connection final {
   engine::Future<ExecutionResult> PingAsync(engine::Deadline deadline);
 
   void Ping(engine::Deadline deadline);
+
+  /// Asynchronous zero-copy storage call: builds the vshard.storage.call body
+  /// from kStorageCallBodyPrefix + raw TUPLE bytes (one memcpy, no msgpack
+  /// re-encoding), registers the request and returns a Future.
+  engine::Future<ExecutionResult> ForwardStorageCallAsync(
+      const CallRouteInfo& info, engine::Deadline deadline);
 
   bool IsBroken() const noexcept {
     return broken_.load(std::memory_order_acquire);

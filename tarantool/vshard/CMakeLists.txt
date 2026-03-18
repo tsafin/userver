@@ -13,6 +13,7 @@ add_executable(${PROJECT_NAME} ${SOURCES})
 target_link_libraries(${PROJECT_NAME}
     userver-tarantool
     userver-core
+    tntcxx
 )
 
 target_include_directories(${PROJECT_NAME} PRIVATE
@@ -40,6 +41,7 @@ if (USERVER_IS_THE_ROOT_PROJECT AND UNIT_TEST_SOURCES)
     target_link_libraries(${PROJECT_NAME}_unittest
         userver-utest
         userver-tarantool
+        tntcxx
     )
     target_compile_definitions(${PROJECT_NAME}_unittest PRIVATE
         DEFAULT_DYNAMIC_CONFIG_FILENAME="${CMAKE_SOURCE_DIR}/tarantool/tests/dynamic_config_fallback.json")
