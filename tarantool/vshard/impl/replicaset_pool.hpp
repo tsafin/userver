@@ -16,6 +16,8 @@
 #include <storages/tarantool/impl/iproto_frames.hpp>
 #include <storages/tarantool/impl/pool.hpp>
 
+#include <vshard/impl/iproto_vshard_frames.hpp>
+
 USERVER_NAMESPACE_BEGIN
 
 namespace storages::tarantool::vshard::impl {
@@ -55,6 +57,13 @@ class ReplicasetPool final {
     storages::tarantool::ExecutionResult ForwardStorageCall(
         CallMode mode,
         const storages::tarantool::impl::CallRouteInfo& info,
+        storages::tarantool::OptionalCommandControl cc = {});
+
+    /// Forward an IPROTO_VSHARD_CALL to the appropriate pool.
+    /// Routes master/replica by info.mode (0=ro→replica, 1=rw→master).
+    storages::tarantool::ExecutionResult ForwardVshardCall(
+        const VshardCallInfo& info,
+        const uint8_t* body, std::size_t body_len,
         storages::tarantool::OptionalCommandControl cc = {});
 
     bool IsAvailable() const;

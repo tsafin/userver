@@ -233,4 +233,111 @@ TEST(VshardExceptions, NoReplicasetErrorMessage) {
     EXPECT_EQ(e.GetBucketId(), 999u);
 }
 
+// ---------------------------------------------------------------------------
+// ParseVshardCallHeader — IPROTO_VSHARD_CALL header parser
+// ---------------------------------------------------------------------------
+
+#include <vshard/impl/iproto_vshard_frames.hpp>
+
+using namespace storages::tarantool::vshard;
+
+namespace {
+
+// Build a minimal IPROTO_VSHARD_CALL header: fixmap(4) + 4 kv pairs.
+// Keys: REQUEST_TYPE=0x50, SYNC=sync, VSHARD_BUCKET_ID=bucket_id,
+//       VSHARD_MODE=mode.
+std::vector<uint8_t> BuildVshardHeader(uint64_t sync, uint32_t bucket_id,
+                                        uint8_t mode) {
+    std::vector<uint8_t> buf;
+    auto encode_uint = [&](uint64_t v) {
+        if (v <= 0x7f) {
+            buf.push_back(static_cast<uint8_t>(v));
+        } else if (v <= 0xff) {
+            buf.push_back(0xcc);
+            buf.push_back(static_cast<uint8_t>(v));
+        } else if (v <= 0xffff) {
+            buf.push_back(0xcd);
+            buf.push_back(static_cast<uint8_t>(v >> 8));
+            buf.push_back(static_cast<uint8_t>(v));
+        } else if (v <= 0xffffffff) {
+            buf.push_back(0xce);
+            buf.push_back(static_cast<uint8_t>(v >> 24));
+            buf.push_back(static_cast<uint8_t>(v >> 16));
+            buf.push_back(static_cast<uint8_t>(v >>  8));
+            buf.push_back(static_cast<uint8_t>(v));
+        } else {
+            buf.push_back(0xcf);
+            for (int i = 7; i >= 0; --i)
+                buf.push_back(static_cast<uint8_t>(v >> (8 * i)));
+        }
+    };
+
+    buf.push_back(0x80u | 4u);  // fixmap(4)
+    encode_uint(0x00u);  encode_uint(impl::kIprotoVshardCallType);  // REQUEST_TYPE
+    encode_uint(0x01u);  encode_uint(sync);                          // SYNC
+    encode_uint(impl::kIprotoVshardBucketIdKey); encode_uint(bucket_id); // VSHARD_BUCKET_ID
+    encode_uint(impl::kIprotoVshardModeKey);     encode_uint(mode);       // VSHARD_MODE
+    return buf;
+}
+
+}  // namespace
+
+TEST(ParseVshardCallHeader, ValidRoundTrip) {
+    const auto hdr = BuildVshardHeader(/*sync=*/42, /*bucket_id=*/100, /*mode=*/1);
+    const auto info = impl::ParseVshardCallHeader(hdr.data(), hdr.size());
+    ASSERT_TRUE(info.has_value());
+    EXPECT_EQ(info->sync,      42u);
+    EXPECT_EQ(info->bucket_id, 100u);
+    EXPECT_EQ(info->mode,      1u);
+}
+
+TEST(ParseVshardCallHeader, ReadOnlyMode) {
+    const auto hdr = BuildVshardHeader(/*sync=*/1, /*bucket_id=*/65535, /*mode=*/0);
+    const auto info = impl::ParseVshardCallHeader(hdr.data(), hdr.size());
+    ASSERT_TRUE(info.has_value());
+    EXPECT_EQ(info->bucket_id, 65535u);
+    EXPECT_EQ(info->mode, 0u);
+}
+
+TEST(ParseVshardCallHeader, LargeSync) {
+    const auto hdr = BuildVshardHeader(/*sync=*/0xDEADBEEFCAFEBABEull,
+                                        /*bucket_id=*/1, /*mode=*/1);
+    const auto info = impl::ParseVshardCallHeader(hdr.data(), hdr.size());
+    ASSERT_TRUE(info.has_value());
+    EXPECT_EQ(info->sync, 0xDEADBEEFCAFEBABEull);
+}
+
+TEST(ParseVshardCallHeader, WrongRequestType) {
+    auto hdr = BuildVshardHeader(1, 1, 0);
+    // Patch REQUEST_TYPE value (byte 2 in fixmap with fixint keys) to 0x01 (CALL)
+    // fixmap(4) = 1 byte, key=0x00 = 1 byte, value is at offset 2
+    hdr[2] = 0x01;  // IPROTO_CALL, not IPROTO_VSHARD_CALL
+    const auto info = impl::ParseVshardCallHeader(hdr.data(), hdr.size());
+    EXPECT_FALSE(info.has_value());
+}
+
+TEST(ParseVshardCallHeader, EmptyBuffer) {
+    const auto info = impl::ParseVshardCallHeader(nullptr, 0);
+    EXPECT_FALSE(info.has_value());
+}
+
+TEST(ParseVshardCallHeader, TruncatedBuffer) {
+    const auto hdr = BuildVshardHeader(1, 1, 0);
+    // Feed only half the bytes to simulate truncation
+    const auto info = impl::ParseVshardCallHeader(hdr.data(), hdr.size() / 2);
+    EXPECT_FALSE(info.has_value());
+}
+
+TEST(ParseVshardCallHeader, BucketIdZeroInvalid) {
+    const auto hdr = BuildVshardHeader(1, /*bucket_id=*/0, 0);
+    const auto info = impl::ParseVshardCallHeader(hdr.data(), hdr.size());
+    EXPECT_FALSE(info.has_value());
+}
+
+TEST(ParseVshardCallHeader, BucketIdOutOfRange) {
+    const auto hdr = BuildVshardHeader(1, /*bucket_id=*/70000, 1);
+    const auto info = impl::ParseVshardCallHeader(hdr.data(), hdr.size());
+    EXPECT_FALSE(info.has_value());
+}
+
 USERVER_NAMESPACE_END

@@ -62,6 +62,14 @@ class Connection final {
   engine::Future<ExecutionResult> ForwardStorageCallAsync(
       const CallRouteInfo& info, engine::Deadline deadline);
 
+  /// Asynchronous IPROTO_VSHARD_CALL forward: builds a 4-entry header map
+  /// (REQUEST_TYPE=0x50, SYNC, VSHARD_BUCKET_ID, VSHARD_MODE) + body bytes
+  /// (one memcpy).  Used by VshardProxy::ForwardVshardCall().
+  engine::Future<ExecutionResult> ForwardVshardCallAsync(
+      uint32_t bucket_id, uint8_t mode,
+      const uint8_t* body, std::size_t body_len,
+      engine::Deadline deadline);
+
   bool IsBroken() const noexcept {
     return broken_.load(std::memory_order_acquire);
   }

@@ -91,6 +91,37 @@ storages::tarantool::ExecutionResult ReplicasetPool::ForwardStorageCall(
     return master_->ForwardStorageCall(info, cc);
 }
 
+storages::tarantool::ExecutionResult ReplicasetPool::ForwardVshardCall(
+    const VshardCallInfo& info,
+    const uint8_t* body, std::size_t body_len,
+    storages::tarantool::OptionalCommandControl cc) {
+
+    // Derive CallMode from the vshard mode byte (0=ro, 1=rw).
+    const CallMode mode = (info.mode == 0) ? CallMode::kReadOnly
+                                           : CallMode::kReadWrite;
+    switch (mode) {
+        case CallMode::kReadWrite:
+            return master_->ForwardVshardCall(info.bucket_id, info.mode,
+                                              body, body_len, cc);
+        case CallMode::kReadOnly:
+        case CallMode::kBestReadOnly:
+            if (replicas_.empty()) {
+                return master_->ForwardVshardCall(info.bucket_id, info.mode,
+                                                  body, body_len, cc);
+            }
+            return SelectReplica().ForwardVshardCall(info.bucket_id, info.mode,
+                                                     body, body_len, cc);
+        case CallMode::kBestReadOnlyError:
+            if (replicas_.empty() || !replicas_.front()->IsAvailable()) {
+                throw ReplicaUnavailableError{uuid_};
+            }
+            return SelectReplica().ForwardVshardCall(info.bucket_id, info.mode,
+                                                     body, body_len, cc);
+    }
+    return master_->ForwardVshardCall(info.bucket_id, info.mode,
+                                      body, body_len, cc);
+}
+
 bool ReplicasetPool::IsAvailable() const {
     if (master_ && master_->IsAvailable()) return true;
     for (const auto& r : replicas_) {

@@ -107,6 +107,24 @@ class VshardProxy final {
         impl::CallMode mode = impl::CallMode::kReadWrite,
         storages::tarantool::OptionalCommandControl = {});
 
+    /// Forward an IPROTO_VSHARD_CALL to the appropriate storage node.
+    ///
+    /// Parses only the IPROTO header (~26 bytes) to extract bucket_id + mode;
+    /// the body is forwarded entirely unchanged (zero body scan).
+    /// Requires storage-side IPROTO_VSHARD_CALL handler.
+    ///
+    /// @param iproto_header  First byte of the IPROTO header map (after preheader).
+    /// @param header_len     Bytes available in the header.
+    /// @param body           IPROTO body bytes (FUNCTION_NAME + TUPLE).
+    /// @param body_len       Size of body.
+    /// @throws VshardException  on bad header, routing failure, or retry limit.
+    formats::msgpack::Value ForwardVshardCall(
+        const uint8_t* iproto_header,
+        std::size_t header_len,
+        const uint8_t* body,
+        std::size_t body_len,
+        storages::tarantool::OptionalCommandControl = {});
+
     // ---- Scatter / Map-Reduce -----------------------------------------------
 
     /// Fan out to all replicasets in parallel; collect all results.

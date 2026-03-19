@@ -47,6 +47,10 @@ constexpr uint32_t kIprotoCall    = 10;
 constexpr uint32_t kIprotoAuth    = 7;
 constexpr uint32_t kIprotoPing    = 64;
 constexpr uint32_t kIprotoUpsert  = 9;
+// IPROTO_VSHARD_CALL extension (userver/vshard, not upstream Tarantool)
+constexpr uint32_t kIprotoVshardCall    = 0x50;  ///< new request type
+constexpr uint32_t kKeyVshardBucketId   = 0x5e;  ///< header key: bucket_id (uint32)
+constexpr uint32_t kKeyVshardMode       = 0x5f;  ///< header key: mode (0=ro, 1=rw)
 
 // IPROTO header/body keys
 constexpr uint32_t kKeyCode         = 0x00;
@@ -536,6 +540,59 @@ engine::Future<ExecutionResult> Connection::ForwardStorageCallAsync(
                 kStorageCallBodyPrefix + sizeof(kStorageCallBodyPrefix));
     body.insert(body.end(), info.tuple_begin, info.tuple_end);
     return SendAndRegister(deadline, kIprotoCall, std::move(body));
+}
+
+engine::Future<ExecutionResult> Connection::ForwardVshardCallAsync(
+    uint32_t bucket_id, uint8_t mode,
+    const uint8_t* body, std::size_t body_len,
+    engine::Deadline deadline) {
+
+    engine::Promise<ExecutionResult> promise;
+    auto future = promise.get_future();
+
+    if (broken_.load(std::memory_order_acquire)) {
+        promise.set_exception(std::make_exception_ptr(
+            TarantoolException{"connection is broken"}));
+        return future;
+    }
+    if (deadline.IsReached()) {
+        promise.set_exception(std::make_exception_ptr(
+            TarantoolException{"Request deadline exceeded before send"}));
+        return future;
+    }
+
+    const uint64_t sync_id = ++sync_counter_;
+    {
+        std::lock_guard lock(pending_mutex_);
+        pending_.emplace(sync_id, std::move(promise));
+    }
+
+    // IPROTO_VSHARD_CALL frame: preheader(5) + header(fixmap(4) ~21 bytes) + body.
+    // Header keys: REQUEST_TYPE=0x50, SYNC=<uint64>, VSHARD_BUCKET_ID=<uint32>,
+    //              VSHARD_MODE=<uint8>.  Body bytes are copied once.
+    {
+        std::lock_guard lock(staging_mutex_);
+        const auto prehdr_pos = staging_buf_.size();
+        staging_buf_.resize(prehdr_pos + 5);  // preheader slot (filled last)
+
+        EncodeFixMap(staging_buf_, 4);
+        EncodeUint(staging_buf_, kKeyCode);          EncodeUint(staging_buf_, kIprotoVshardCall);
+        EncodeUint(staging_buf_, kKeySync);          EncodeUint(staging_buf_, sync_id);
+        EncodeUint(staging_buf_, kKeyVshardBucketId);EncodeUint(staging_buf_, uint64_t{bucket_id});
+        EncodeUint(staging_buf_, kKeyVshardMode);    EncodeUint(staging_buf_, uint64_t{mode});
+
+        staging_buf_.insert(staging_buf_.end(), body, body + body_len);
+
+        const uint32_t len =
+            static_cast<uint32_t>(staging_buf_.size() - prehdr_pos - 5);
+        staging_buf_[prehdr_pos]     = 0xce;
+        staging_buf_[prehdr_pos + 1] = static_cast<uint8_t>(len >> 24);
+        staging_buf_[prehdr_pos + 2] = static_cast<uint8_t>(len >> 16);
+        staging_buf_[prehdr_pos + 3] = static_cast<uint8_t>(len >>  8);
+        staging_buf_[prehdr_pos + 4] = static_cast<uint8_t>(len);
+    }
+    flush_event_.Send();
+    return future;
 }
 
 uint32_t Connection::ResolveSpaceId(const std::string& space_name,

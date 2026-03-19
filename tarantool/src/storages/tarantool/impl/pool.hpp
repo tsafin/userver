@@ -34,6 +34,13 @@ class Pool final {
     ExecutionResult ForwardStorageCall(const CallRouteInfo& info,
                                        OptionalCommandControl cc);
 
+    /// Forward an IPROTO_VSHARD_CALL to storage.
+    /// Builds a fixmap(4) header with VSHARD_BUCKET_ID + VSHARD_MODE plus
+    /// the pre-formatted body (one memcpy).  No body scanning required.
+    ExecutionResult ForwardVshardCall(uint32_t bucket_id, uint8_t mode,
+                                      const uint8_t* body, std::size_t body_len,
+                                      OptionalCommandControl cc);
+
     /// Send an IPROTO PING and wait for the empty response.
     /// Useful for latency/throughput benchmarking without any server-side work.
     void Ping(OptionalCommandControl cc = std::nullopt);
