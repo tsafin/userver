@@ -161,9 +161,9 @@ class VshardProxy final {
     void StartRefreshTask();
 
     impl::BucketCalculator calculator_;
+    VshardProxySettings settings_;              // must be before fetcher_ (ctor init order)
     impl::RoutingTableHolder routing_table_;
     std::unique_ptr<impl::TopologyFetcher> fetcher_;
-    VshardProxySettings settings_;
 
     utils::PeriodicTask refresh_task_;
     std::chrono::steady_clock::time_point last_moved_refresh_{};

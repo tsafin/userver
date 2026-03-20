@@ -47,3 +47,34 @@ if (USERVER_IS_THE_ROOT_PROJECT AND UNIT_TEST_SOURCES)
         DEFAULT_DYNAMIC_CONFIG_FILENAME="${CMAKE_SOURCE_DIR}/tarantool/tests/dynamic_config_fallback.json")
     add_google_tests(${PROJECT_NAME}_unittest)
 endif()
+
+# ---------------------------------------------------------------------------
+# Vshard throughput benchmark (requires live vshard cluster)
+# ---------------------------------------------------------------------------
+
+if (USERVER_IS_THE_ROOT_PROJECT)
+    file(GLOB BENCH_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/bench/*.cpp)
+    if (BENCH_SOURCES)
+        add_executable(userver-tarantool-vshard-bench ${BENCH_SOURCES}
+            ${CMAKE_CURRENT_SOURCE_DIR}/impl/bucket_calculator.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/impl/vshard_error.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/impl/vshard_envelope.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/impl/routing_table.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/impl/replicaset_pool.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/impl/topology_fetcher.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/impl/vshard_proxy.cpp
+        )
+        target_include_directories(userver-tarantool-vshard-bench PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/..
+            ${CMAKE_SOURCE_DIR}/tarantool/src
+            $<TARGET_PROPERTY:userver-tarantool,INCLUDE_DIRECTORIES>
+        )
+        target_link_libraries(userver-tarantool-vshard-bench
+            userver-utest
+            userver-tarantool
+            tntcxx
+        )
+        target_compile_definitions(userver-tarantool-vshard-bench PRIVATE
+            DEFAULT_DYNAMIC_CONFIG_FILENAME="${CMAKE_SOURCE_DIR}/tarantool/tests/dynamic_config_fallback.json")
+    endif()
+endif()

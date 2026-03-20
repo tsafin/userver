@@ -96,10 +96,12 @@ storages::tarantool::Query VshardProxy::BuildStorageCallQuery(
     BucketId bucket_id, impl::CallMode mode, std::string_view func,
     formats::msgpack::ValueBuilder args) const {
     // vshard.storage.call signature: (bucket_id, mode, func_name, args)
+    // vshard wire protocol mode: "write" for rw, "read" for everything else.
+    const std::string_view vshard_mode =
+        (mode == impl::CallMode::kReadWrite) ? "write" : "read";
     formats::msgpack::ValueBuilder tuple_args;
     tuple_args.PushBack(formats::msgpack::ValueBuilder{bucket_id});
-    tuple_args.PushBack(formats::msgpack::ValueBuilder{
-        std::string{impl::ToString(mode)}});
+    tuple_args.PushBack(formats::msgpack::ValueBuilder{std::string{vshard_mode}});
     tuple_args.PushBack(formats::msgpack::ValueBuilder{std::string{func}});
     tuple_args.PushBack(std::move(args));
 
@@ -148,7 +150,7 @@ formats::msgpack::Value VshardProxy::DoCall(
             return env.app_result;
         }
 
-        // MOVED: bucket migrated to another replicaset
+        // MOVED: bucket migrated to another replicaset, or routing table wrong
         if (env.vshard_error.IsWrongBucket()) {
             if (attempt >= settings_.max_moved_retries) {
                 throw MovedError{
@@ -166,8 +168,10 @@ formats::msgpack::Value VshardProxy::DoCall(
                 rs = snapshot->FindReplicaset(bucket_id);
             }
 
-            if (!rs) {
-                // Unknown destination: trigger full refresh
+            // No destination UUID means our routing table is simply wrong
+            // (e.g. static config assigned wrong RS to this bucket range).
+            // Always trigger a live-probe refresh in this case.
+            if (!env.vshard_error.destination_uuid.has_value() || !rs) {
                 const auto now = std::chrono::steady_clock::now();
                 if (now - last_moved_refresh_ >
                     settings_.moved_refresh_min_interval) {
@@ -177,9 +181,11 @@ formats::msgpack::Value VshardProxy::DoCall(
                     } catch (const std::exception& ex) {
                         LOG_WARNING() << "vshard MOVED refresh failed: " << ex.what();
                     }
-                    snapshot = routing_table_.Read();
-                    rs = snapshot->FindReplicaset(bucket_id);
                 }
+                // Always re-read: once one fiber triggers RefreshFull all
+                // rate-limited fibers also pick up the updated routing table.
+                snapshot = routing_table_.Read();
+                rs = snapshot->FindReplicaset(bucket_id);
                 if (!rs) throw NoReplicasetError{bucket_id};
             }
             continue;  // retry
@@ -286,7 +292,7 @@ formats::msgpack::Value VshardProxy::ForwardCall(
                 rs = snapshot->FindReplicaset(bucket_id);
             }
 
-            if (!rs) {
+            if (!env.vshard_error.destination_uuid.has_value() || !rs) {
                 const auto now = std::chrono::steady_clock::now();
                 if (now - last_moved_refresh_ >
                     settings_.moved_refresh_min_interval) {
@@ -297,9 +303,11 @@ formats::msgpack::Value VshardProxy::ForwardCall(
                         LOG_WARNING() << "vshard MOVED refresh failed: "
                                       << ex.what();
                     }
-                    snapshot = routing_table_.Read();
-                    rs = snapshot->FindReplicaset(bucket_id);
                 }
+                // Always re-read: once one fiber triggers RefreshFull all
+                // rate-limited fibers also get the updated routing table.
+                snapshot = routing_table_.Read();
+                rs = snapshot->FindReplicaset(bucket_id);
                 if (!rs) throw NoReplicasetError{bucket_id};
             }
             continue;
@@ -405,7 +413,7 @@ formats::msgpack::Value VshardProxy::ForwardVshardCall(
                 rs = snapshot->FindReplicaset(bucket_id);
             }
 
-            if (!rs) {
+            if (!env.vshard_error.destination_uuid.has_value() || !rs) {
                 const auto now = std::chrono::steady_clock::now();
                 if (now - last_moved_refresh_ >
                     settings_.moved_refresh_min_interval) {
@@ -416,9 +424,11 @@ formats::msgpack::Value VshardProxy::ForwardVshardCall(
                         LOG_WARNING() << "vshard MOVED refresh failed: "
                                       << ex.what();
                     }
-                    snapshot = routing_table_.Read();
-                    rs = snapshot->FindReplicaset(bucket_id);
                 }
+                // Always re-read: once one fiber triggers RefreshFull all
+                // rate-limited fibers also get the updated routing table.
+                snapshot = routing_table_.Read();
+                rs = snapshot->FindReplicaset(bucket_id);
                 if (!rs) throw NoReplicasetError{bucket_id};
             }
             continue;
