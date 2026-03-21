@@ -302,6 +302,7 @@ struct VshardRouterArgs {
     CallMode         mode{CallMode::kReadWrite};  ///< resolved call mode
     bool             prefer_replica{false};
     bool             balance{false};
+    double           timeout{0.0};   ///< per-call timeout in seconds (0 = use default)
 };
 
 /// Read the msgpack array header, return element count and advance pos.
@@ -363,6 +364,57 @@ static bool IsMsgpackMap(const uint8_t* p, std::size_t len,
     return (b & 0xf0u) == mp::kFixMapMin || b == mp::kMap16 || b == mp::kMap32;
 }
 
+/// Read a msgpack float64 (0xcb) or float32 (0xca) or positive integer as double.
+static double ReadNumericAsDouble(const uint8_t* p, std::size_t len,
+                                   std::size_t& pos) noexcept {
+    using namespace storages::tarantool::impl::msgpack_scan;
+    if (pos >= len) return 0.0;
+    const uint8_t b = p[pos];
+    if (b == mp::kFloat64 && pos + 9 <= len) {
+        ++pos;
+        uint64_t bits = 0;
+        for (int i = 0; i < 8; ++i) bits = (bits << 8) | p[pos++];
+        double v;
+        std::memcpy(&v, &bits, 8);
+        return v;
+    }
+    if (b == mp::kFloat32 && pos + 5 <= len) {
+        ++pos;
+        uint32_t bits = 0;
+        for (int i = 0; i < 4; ++i) bits = (bits << 8) | p[pos++];
+        float v;
+        std::memcpy(&v, &bits, 4);
+        return static_cast<double>(v);
+    }
+    // Try reading as uint and convert
+    auto [val, np] = ReadUint(p, len, pos);
+    pos = np;
+    return static_cast<double>(val);
+}
+
+/// Parse timeout from an opts map at the current position.
+/// Expects pos to point at a msgpack map. Extracts "timeout" key's double value.
+/// Returns 0.0 if no timeout found or not a map.
+static double ParseTimeoutFromOpts(const uint8_t* p, std::size_t len,
+                                    std::size_t& pos) noexcept {
+    using namespace storages::tarantool::impl::msgpack_scan;
+    if (!IsMsgpackMap(p, len, pos)) {
+        pos = SkipValue(p, len, pos);
+        return 0.0;
+    }
+    const auto map_len = ReadMapHeader(p, len, pos);
+    double timeout = 0.0;
+    for (std::size_t i = 0; i < map_len; ++i) {
+        auto [key, kp] = ReadStr(p, len, pos); pos = kp;
+        if (key == "timeout") {
+            timeout = ReadNumericAsDouble(p, len, pos);
+        } else {
+            pos = SkipValue(p, len, pos);
+        }
+    }
+    return timeout;
+}
+
 /// Resolve CallMode from a mode string ("read" or "write").
 static CallMode ModeFromString(std::string_view s) noexcept {
     if (s == "write") return CallMode::kReadWrite;
@@ -407,6 +459,12 @@ ParseVshardRouterArgs(const uint8_t* p, std::size_t len) noexcept {
     out.args_begin = p + pos;
     pos = SkipValue(p, len, pos);
     out.args_len = static_cast<std::size_t>((p + pos) - out.args_begin);
+
+    // opts (optional 4th element): parse timeout
+    if (alen >= 4 && pos < len) {
+        out.timeout = ParseTimeoutFromOpts(p, len, pos);
+    }
+
     return out;
 }
 
@@ -466,7 +524,10 @@ ParseVshardRouterCallArgs(const uint8_t* p, std::size_t len) noexcept {
     pos = SkipValue(p, len, pos);
     out.args_len = static_cast<std::size_t>((p + pos) - out.args_begin);
 
-    // 5. opts (optional) — ignored for now, would carry timeout etc.
+    // 5. opts (optional) — parse timeout
+    if (alen >= 5 && pos < len) {
+        out.timeout = ParseTimeoutFromOpts(p, len, pos);
+    }
 
     // Resolve final CallMode from base mode + prefer_replica + balance flags
     out.mode = ResolveCallMode(out.mode, out.prefer_replica, out.balance);
@@ -672,10 +733,16 @@ static void HandleConnection(engine::io::Socket sock,
 
                 // Fully zero-copy: raw args in, raw result bytes out —
                 // no Value tree at any stage.
+                storages::tarantool::OptionalCommandControl cc;
+                if (vargs->timeout > 0.0) {
+                    cc = storages::tarantool::CommandControl{
+                        std::chrono::milliseconds{
+                            static_cast<int64_t>(vargs->timeout * 1000.0)}};
+                }
                 const auto result_bytes = proxy.CallRawBytes(
                     vargs->bucket_id, mode,
                     vargs->func_name,
-                    vargs->args_begin, vargs->args_len);
+                    vargs->args_begin, vargs->args_len, cc);
 
                 const auto resp = BuildResultFrameRaw(
                     req.sync, result_bytes.data(), result_bytes.size());

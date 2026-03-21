@@ -179,7 +179,13 @@ VshardProxy::RetryAction VshardProxy::HandleVshardError(
     BucketId bucket_id,
     uint32_t& attempt,
     rcu::ReadablePtr<impl::RoutingTable>& snapshot,
-    impl::ReplicasetPool*& rs) {
+    impl::ReplicasetPool*& rs,
+    engine::Deadline deadline) {
+
+    // Check deadline before retrying (matches Lua: fiber_clock() >= tend)
+    if (deadline.IsReachable() && deadline.IsReached()) {
+        throw VshardException{"vshard.router.call timeout exceeded"};
+    }
 
     // WRONG_BUCKET / BUCKET_IS_LOCKED: bucket migrated or locked during rebalance
     if (err.IsWrongBucket() || err.IsBucketIsLocked()) {
@@ -307,8 +313,22 @@ formats::msgpack::Value VshardProxy::DoCallWithQuery(
     impl::ReplicasetPool* rs = ResolveReplicaset(bucket_id, snapshot);
     if (!rs) throw NoReplicasetError{bucket_id};
 
+    // Build deadline from cc (Lua default: CALL_TIMEOUT_MIN = 0.5s)
+    const auto deadline = cc
+        ? engine::Deadline::FromDuration(cc->execute)
+        : engine::Deadline::FromDuration(std::chrono::milliseconds{500});
+
     uint32_t attempt = 0;
     while (true) {
+        // Update cc with remaining time for each attempt
+        if (deadline.IsReachable()) {
+            const auto left = deadline.TimeLeft();
+            if (left <= engine::Deadline::Duration::zero()) {
+                throw VshardException{"vshard.router.call timeout exceeded"};
+            }
+            cc = storages::tarantool::CommandControl{
+                std::chrono::duration_cast<std::chrono::milliseconds>(left)};
+        }
         storages::tarantool::ExecutionResult raw;
         try {
             raw = rs->Execute(mode, query, cc);
@@ -331,7 +351,7 @@ formats::msgpack::Value VshardProxy::DoCallWithQuery(
             return env.app_result;
         }
 
-        HandleVshardError(env.vshard_error, bucket_id, attempt, snapshot, rs);
+        HandleVshardError(env.vshard_error, bucket_id, attempt, snapshot, rs, deadline);
         // All retryable cases return here; throws handle the rest.
     }
 }
@@ -349,8 +369,22 @@ std::vector<uint8_t> VshardProxy::DoCallRawBytes(
     impl::ReplicasetPool* rs = ResolveReplicaset(bucket_id, snapshot);
     if (!rs) throw NoReplicasetError{bucket_id};
 
+    // Build deadline from cc (Lua default: CALL_TIMEOUT_MIN = 0.5s)
+    const auto deadline = cc
+        ? engine::Deadline::FromDuration(cc->execute)
+        : engine::Deadline::FromDuration(std::chrono::milliseconds{500});
+
     uint32_t attempt = 0;
     while (true) {
+        // Update cc with remaining time for each attempt
+        if (deadline.IsReachable()) {
+            const auto left = deadline.TimeLeft();
+            if (left <= engine::Deadline::Duration::zero()) {
+                throw VshardException{"vshard.router.call timeout exceeded"};
+            }
+            cc = storages::tarantool::CommandControl{
+                std::chrono::duration_cast<std::chrono::milliseconds>(left)};
+        }
         storages::tarantool::ExecutionResult raw;
         try {
             raw = rs->Execute(mode, query, cc);
@@ -373,7 +407,7 @@ std::vector<uint8_t> VshardProxy::DoCallRawBytes(
             return std::move(env.app_result_bytes);
         }
 
-        HandleVshardError(env.vshard_error, bucket_id, attempt, snapshot, rs);
+        HandleVshardError(env.vshard_error, bucket_id, attempt, snapshot, rs, deadline);
     }
 }
 
@@ -398,8 +432,21 @@ formats::msgpack::Value VshardProxy::ForwardCall(
     impl::ReplicasetPool* rs = ResolveReplicaset(bucket_id, snapshot);
     if (!rs) throw NoReplicasetError{bucket_id};
 
+    // Build deadline from cc (Lua default: CALL_TIMEOUT_MIN = 0.5s)
+    const auto deadline = cc
+        ? engine::Deadline::FromDuration(cc->execute)
+        : engine::Deadline::FromDuration(std::chrono::milliseconds{500});
+
     uint32_t attempt = 0;
     while (true) {
+        if (deadline.IsReachable()) {
+            const auto left = deadline.TimeLeft();
+            if (left <= engine::Deadline::Duration::zero()) {
+                throw VshardException{"vshard.router.call timeout exceeded"};
+            }
+            cc = storages::tarantool::CommandControl{
+                std::chrono::duration_cast<std::chrono::milliseconds>(left)};
+        }
         storages::tarantool::ExecutionResult raw;
         try {
             raw = rs->ForwardStorageCall(mode, *route, cc);
@@ -421,7 +468,7 @@ formats::msgpack::Value VshardProxy::ForwardCall(
             return env.app_result;
         }
 
-        HandleVshardError(env.vshard_error, bucket_id, attempt, snapshot, rs);
+        HandleVshardError(env.vshard_error, bucket_id, attempt, snapshot, rs, deadline);
     }
 }
 
@@ -451,8 +498,21 @@ formats::msgpack::Value VshardProxy::ForwardVshardCall(
     impl::ReplicasetPool* rs = ResolveReplicaset(bucket_id, snapshot);
     if (!rs) throw NoReplicasetError{bucket_id};
 
+    // Build deadline from cc (Lua default: CALL_TIMEOUT_MIN = 0.5s)
+    const auto deadline = cc
+        ? engine::Deadline::FromDuration(cc->execute)
+        : engine::Deadline::FromDuration(std::chrono::milliseconds{500});
+
     uint32_t attempt = 0;
     while (true) {
+        if (deadline.IsReachable()) {
+            const auto left = deadline.TimeLeft();
+            if (left <= engine::Deadline::Duration::zero()) {
+                throw VshardException{"vshard.router.call timeout exceeded"};
+            }
+            cc = storages::tarantool::CommandControl{
+                std::chrono::duration_cast<std::chrono::milliseconds>(left)};
+        }
         storages::tarantool::ExecutionResult raw;
         try {
             raw = rs->ForwardVshardCall(*info, body, body_len, cc);
@@ -474,7 +534,7 @@ formats::msgpack::Value VshardProxy::ForwardVshardCall(
             return env.app_result;
         }
 
-        HandleVshardError(env.vshard_error, bucket_id, attempt, snapshot, rs);
+        HandleVshardError(env.vshard_error, bucket_id, attempt, snapshot, rs, deadline);
     }
 }
 

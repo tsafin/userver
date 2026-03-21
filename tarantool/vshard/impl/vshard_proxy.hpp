@@ -11,6 +11,7 @@
 
 #include <userver/clients/dns/resolver_fwd.hpp>
 #include <userver/components/component_config.hpp>
+#include <userver/engine/deadline.hpp>
 #include <userver/formats/msgpack/value.hpp>
 #include <userver/formats/msgpack/value_builder.hpp>
 #include <userver/storages/tarantool/options.hpp>
@@ -212,7 +213,8 @@ class VshardProxy final {
         BucketId bucket_id,
         uint32_t& attempt,
         rcu::ReadablePtr<impl::RoutingTable>& snapshot,
-        impl::ReplicasetPool*& rs);
+        impl::ReplicasetPool*& rs,
+        engine::Deadline deadline = {});
 
     /// Find the replicaset for a bucket. If the routing table has no mapping
     /// (bucket_to_rs == 0), probe all RS masters with bucket_stat to discover
