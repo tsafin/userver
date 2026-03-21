@@ -299,30 +299,83 @@ struct VshardRouterArgs {
     std::string_view func_name;      ///< inner function, e.g. "box.space.customer:replace"
     const uint8_t*   args_begin{nullptr};  ///< raw msgpack value for the args array
     std::size_t      args_len{0};
+    CallMode         mode{CallMode::kReadWrite};  ///< resolved call mode
+    bool             prefer_replica{false};
+    bool             balance{false};
 };
 
-/// Parse the TUPLE array from a vshard.router.call* request.
-/// [bucket_id, func_name, args_array]
-/// Uses msgpack_scan::* — no local parser code.
+/// Read the msgpack array header, return element count and advance pos.
+/// Returns 0 on failure.
+static std::size_t ReadArrayHeader(const uint8_t* p, std::size_t len,
+                                    std::size_t& pos) noexcept {
+    using namespace storages::tarantool::impl::msgpack_scan;
+    if (pos >= len) return 0;
+    const uint8_t ab = p[pos++];
+    if ((ab & 0xf0u) == mp::kFixArrayMin) return ab & 0x0fu;
+    if (ab == mp::kArray16 && pos + 2 <= len) {
+        auto n = (std::size_t)p[pos] << 8 | p[pos + 1]; pos += 2; return n;
+    }
+    if (ab == mp::kArray32 && pos + 4 <= len) {
+        auto n = (std::size_t)p[pos] << 24 | (std::size_t)p[pos + 1] << 16 |
+                 (std::size_t)p[pos + 2] << 8 | p[pos + 3]; pos += 4;
+        return n;
+    }
+    return 0;
+}
+
+/// Read the msgpack map header, return element count and advance pos.
+/// Returns 0 on failure (also valid for empty map, but that's fine).
+static std::size_t ReadMapHeader(const uint8_t* p, std::size_t len,
+                                  std::size_t& pos) noexcept {
+    using namespace storages::tarantool::impl::msgpack_scan;
+    if (pos >= len) return 0;
+    const uint8_t mb = p[pos];
+    if ((mb & 0xf0u) == mp::kFixMapMin) { ++pos; return mb & 0x0fu; }
+    if (mb == mp::kMap16 && pos + 3 <= len) {
+        ++pos;
+        auto n = (std::size_t)p[pos] << 8 | p[pos + 1]; pos += 2; return n;
+    }
+    if (mb == mp::kMap32 && pos + 5 <= len) {
+        ++pos;
+        auto n = (std::size_t)p[pos] << 24 | (std::size_t)p[pos + 1] << 16 |
+                 (std::size_t)p[pos + 2] << 8 | p[pos + 3]; pos += 4;
+        return n;
+    }
+    return 0;
+}
+
+/// Check if byte at pos is a msgpack string type.
+static bool IsMsgpackStr(const uint8_t* p, std::size_t len,
+                          std::size_t pos) noexcept {
+    using namespace storages::tarantool::impl::msgpack_scan;
+    if (pos >= len) return false;
+    const uint8_t b = p[pos];
+    return (b & 0xe0u) == mp::kFixStrMin || b == mp::kStr8 ||
+           b == mp::kStr16 || b == mp::kStr32;
+}
+
+/// Check if byte at pos is a msgpack map type.
+static bool IsMsgpackMap(const uint8_t* p, std::size_t len,
+                          std::size_t pos) noexcept {
+    using namespace storages::tarantool::impl::msgpack_scan;
+    if (pos >= len) return false;
+    const uint8_t b = p[pos];
+    return (b & 0xf0u) == mp::kFixMapMin || b == mp::kMap16 || b == mp::kMap32;
+}
+
+/// Resolve CallMode from a mode string ("read" or "write").
+static CallMode ModeFromString(std::string_view s) noexcept {
+    if (s == "write") return CallMode::kReadWrite;
+    return CallMode::kReadOnly;  // "read" or any other value
+}
+
+/// Parse the TUPLE array from a vshard.router.callrw/callro/etc request.
+/// Format: [bucket_id, func_name, args_array]
 static std::optional<VshardRouterArgs>
 ParseVshardRouterArgs(const uint8_t* p, std::size_t len) noexcept {
     using namespace storages::tarantool::impl::msgpack_scan;
     std::size_t pos = 0;
-    if (pos >= len) return std::nullopt;
-
-    // outer array header
-    const uint8_t ab = p[pos++];
-    std::size_t alen = 0;
-    if ((ab & 0xf0u) == mp::kFixArrayMin) {
-        alen = ab & 0x0fu;
-    } else if (ab == mp::kArray16 && pos + 2 <= len) {
-        alen = (std::size_t)p[pos] << 8 | p[pos + 1]; pos += 2;
-    } else if (ab == mp::kArray32 && pos + 4 <= len) {
-        alen = (std::size_t)p[pos] << 24 | (std::size_t)p[pos + 1] << 16 |
-               (std::size_t)p[pos + 2] << 8 | p[pos + 3]; pos += 4;
-    } else {
-        return std::nullopt;
-    }
+    const auto alen = ReadArrayHeader(p, len, pos);
     if (alen < 3) return std::nullopt;
 
     VshardRouterArgs out;
@@ -338,6 +391,66 @@ ParseVshardRouterArgs(const uint8_t* p, std::size_t len) noexcept {
     out.args_begin = p + pos;
     pos = SkipValue(p, len, pos);
     out.args_len = static_cast<std::size_t>((p + pos) - out.args_begin);
+    return out;
+}
+
+/// Parse the TUPLE array from a generic vshard.router.call request.
+/// Format: [bucket_id, mode_string_or_opts_table, func_name, args_array[, opts]]
+/// The 2nd element is either a string ("read"/"write") or a table with
+/// {mode="read"/"write", prefer_replica=bool, balance=bool}.
+static std::optional<VshardRouterArgs>
+ParseVshardRouterCallArgs(const uint8_t* p, std::size_t len) noexcept {
+    using namespace storages::tarantool::impl::msgpack_scan;
+    std::size_t pos = 0;
+    const auto alen = ReadArrayHeader(p, len, pos);
+    if (alen < 4) return std::nullopt;  // need at least [bucket_id, mode, func, args]
+
+    VshardRouterArgs out;
+
+    // 1. bucket_id
+    auto [bid, bp] = ReadUint(p, len, pos); pos = bp;
+    out.bucket_id = static_cast<uint32_t>(bid);
+
+    // 2. mode: string or map
+    if (IsMsgpackStr(p, len, pos)) {
+        auto [mode_str, mp2] = ReadStr(p, len, pos); pos = mp2;
+        out.mode = ModeFromString(mode_str);
+    } else if (IsMsgpackMap(p, len, pos)) {
+        // Parse opts table: {mode=str, prefer_replica=bool, balance=bool}
+        const auto save_pos = pos;
+        const auto map_len = ReadMapHeader(p, len, pos);
+        for (std::size_t i = 0; i < map_len; ++i) {
+            auto [key, kp] = ReadStr(p, len, pos); pos = kp;
+            if (key == "mode") {
+                auto [val, vp] = ReadStr(p, len, pos); pos = vp;
+                out.mode = ModeFromString(val);
+            } else if (key == "prefer_replica") {
+                // Read bool: true (0xc3) or false (0xc2)
+                if (pos < len && p[pos] == 0xc3) out.prefer_replica = true;
+                pos = SkipValue(p, len, pos);
+            } else if (key == "balance") {
+                if (pos < len && p[pos] == 0xc3) out.balance = true;
+                pos = SkipValue(p, len, pos);
+            } else {
+                pos = SkipValue(p, len, pos);  // skip unknown key's value
+            }
+        }
+        (void)save_pos;
+    } else {
+        return std::nullopt;  // invalid 2nd argument type
+    }
+
+    // 3. func_name
+    auto [fn, fp] = ReadStr(p, len, pos); pos = fp;
+    if (fn.empty()) return std::nullopt;
+    out.func_name = fn;
+
+    // 4. args: record raw bytes without deserializing
+    out.args_begin = p + pos;
+    pos = SkipValue(p, len, pos);
+    out.args_len = static_cast<std::size_t>((p + pos) - out.args_begin);
+
+    // 5. opts (optional) — ignored for now, would carry timeout etc.
     return out;
 }
 
@@ -489,13 +602,20 @@ static void HandleConnection(engine::io::Socket sock,
 
                 // Map outer vshard function name to read/write mode.
                 CallMode mode = CallMode::kReadOnly;
-                if (body->func_name == "vshard.router.callrw" ||
-                    body->func_name == "vshard.router.call") {
+                bool is_generic_call = false;
+                if (body->func_name == "vshard.router.callrw") {
                     mode = CallMode::kReadWrite;
-                } else if (body->func_name != "vshard.router.callro" &&
-                           body->func_name != "vshard.router.callbro" &&
-                           body->func_name != "vshard.router.callre" &&
-                           body->func_name != "vshard.router.callbre") {
+                } else if (body->func_name == "vshard.router.callro") {
+                    mode = CallMode::kReadOnly;
+                } else if (body->func_name == "vshard.router.callbro") {
+                    mode = CallMode::kBestReadOnly;
+                } else if (body->func_name == "vshard.router.callre") {
+                    mode = CallMode::kReadOnly;  // TODO: kPreferReplica (Fix 3)
+                } else if (body->func_name == "vshard.router.callbre") {
+                    mode = CallMode::kBestReadOnlyError;
+                } else if (body->func_name == "vshard.router.call") {
+                    is_generic_call = true;
+                } else {
                     LOG_WARNING() << "iproto_server: unknown vshard function '"
                                   << body->func_name << "'";
                     const auto resp = BuildErrorFrame(
@@ -504,12 +624,28 @@ static void HandleConnection(engine::io::Socket sock,
                     continue;
                 }
 
-                // Parse vshard TUPLE: [bucket_id, inner_func, args_array]
-                const auto vargs = ParseVshardRouterArgs(
-                    body->tuple_begin, body->tuple_len);
+                // Parse vshard TUPLE.
+                // Generic call: [bucket_id, mode_or_opts, func, args[, opts]]
+                // Wrappers:     [bucket_id, func, args]
+                std::optional<VshardRouterArgs> vargs;
+                if (is_generic_call) {
+                    vargs = ParseVshardRouterCallArgs(
+                        body->tuple_begin, body->tuple_len);
+                    if (vargs) {
+                        mode = vargs->mode;
+                    }
+                } else {
+                    vargs = ParseVshardRouterArgs(
+                        body->tuple_begin, body->tuple_len);
+                    if (vargs) {
+                        vargs->mode = mode;
+                    }
+                }
                 if (!vargs) {
                     const auto resp = BuildErrorFrame(
-                        req.sync, "bad vshard.router args: expected [bucket_id, func, args]");
+                        req.sync, is_generic_call
+                            ? "bad vshard.router.call args: expected [bucket_id, mode, func, args]"
+                            : "bad vshard.router args: expected [bucket_id, func, args]");
                     (void)sock.SendAll(resp.data(), resp.size(), engine::Deadline{});
                     continue;
                 }
