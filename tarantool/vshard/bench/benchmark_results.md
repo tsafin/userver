@@ -55,6 +55,36 @@ Three additional optimisations stacked on top of Round 2:
 | 20 | 13,504 | 15,861 | **+17%** | **+8%** |
 | 50 | 22,868 | 26,651 | **+17%** | **+8%** |
 
+### Round 4 — `USERVER_FEATURE_ERASE_LOG_WITH_LEVEL=info` (compile-time log erasure, 100k ops)
+
+Same binary as Round 3, rebuilt with `-DUSERVER_FEATURE_ERASE_LOG_WITH_LEVEL=info` so that all
+`LOG_DEBUG` / `LOG_INFO` call sites are replaced by `true ? Noop{} : LogHelper(...)` at
+compile time (the compiler eliminates string formatting and `ShouldLog()` checks entirely).
+
+| Fibers | Lua router (ops/sec) | C++ proxy (ops/sec) | vs Round 3 |
+|-------:|---------------------:|--------------------:|-----------:|
+| 10 | 8,190 | 9,818 | −1.6% (noise) |
+| 20 | 13,504 | 15,745 | −0.7% (noise) |
+| 50 | 22,868 | 26,498 | −0.6% (noise) |
+
+No measurable improvement.  The hot path already contains **zero** `LOG_DEBUG`/`LOG_INFO` calls
+in `tarantool/src/` and `tarantool/vshard/`; the flag only affects userver core internals which
+are not on the critical path for this workload.
+
+### Bonus — C++ `VshardProxy` library used directly (no proxy process, 100k ops)
+
+Using the `userver-tarantool-vshard-bench` binary which embeds `VshardProxy` in-process
+(same thread pool, no extra network hop to a separate proxy process):
+
+| Fibers | Direct C++ library (ops/sec) | via C++ proxy process (ops/sec) | Proxy overhead |
+|-------:|-----------------------------:|--------------------------------:|---------------:|
+| 10 | 21,937 | 9,818 | 2.2× |
+| 20 | 39,013 | 15,745 | 2.5× |
+| 50 | 77,517 | 26,498 | 2.9× |
+
+The proxy process itself adds **~2–3× overhead** from two extra loopback round-trips
+(client → proxy, proxy → storage).  Embedding the library removes that overhead entirely.
+
 ## Analysis
 
 The C++ proxy is **17–22% faster** than the Lua vshard router across all concurrency levels.
