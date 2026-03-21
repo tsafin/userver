@@ -1,7 +1,7 @@
 #pragma once
 
 /// @file vshard/impl/vshard_envelope.hpp
-/// @brief Decode the vshard response envelope: [[app_result, vshard_error]].
+/// @brief Decode the vshard response envelope from vshard.storage.call.
 
 #include <optional>
 #include <span>
@@ -18,19 +18,24 @@ namespace storages::tarantool::vshard::impl {
 
 /// Decoded vshard storage response envelope.
 ///
-/// vshard storage functions return a 2-element tuple:
+/// `vshard.storage.call` returns two values via IPROTO_CALL (0x0A):
+///
 /// ```lua
-/// return {app_result, nil}        -- success
-/// return {nil,        vshard_err} -- vshard-level error (MOVED, TRANSFER …)
+/// return true,  user_result     -- success: status=true, data=user result
+/// return false, error_object    -- user function raised an error
+/// return nil,   vshard_error    -- routing error (WRONG_BUCKET, etc.)
 /// ```
 ///
-/// Both elements are wrapped in the IPROTO_DATA outer array:
+/// Tarantool packs these as a flat array in IPROTO_DATA:
 /// ```
-/// IPROTO_DATA = [[app_result, vshard_error]]
+/// IPROTO_DATA = [status, result_or_error]
+///   status = true  → success, result_or_error is the user function return
+///   status = false → user error, result_or_error is the error object
+///   status = nil   → vshard routing error, result_or_error is vshard_error
 /// ```
 struct VshardEnvelope {
-    formats::msgpack::Value app_result;  ///< First element (may be nil)
-    VshardError vshard_error;            ///< Second element (null if success)
+    formats::msgpack::Value app_result;  ///< User function result (may be nil)
+    VshardError vshard_error;            ///< Set only on routing errors (nil status)
 };
 
 /// Decode an @ref storages::tarantool::ExecutionResult into a VshardEnvelope.
