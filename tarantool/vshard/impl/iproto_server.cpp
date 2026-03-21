@@ -346,7 +346,7 @@ ParseVshardRouterArgs(const uint8_t* p, std::size_t len) noexcept {
 // ---------------------------------------------------------------------------
 
 /// Encode {DATA: [result_value]} and build the full OK frame.
-static std::vector<uint8_t> BuildResultFrame(
+[[maybe_unused]] static std::vector<uint8_t> BuildResultFrame(
     uint64_t sync, const formats::msgpack::Value& result) {
     const auto result_bytes =
         formats::msgpack::ToBytes(formats::msgpack::ValueBuilder{result});
@@ -359,6 +359,19 @@ static std::vector<uint8_t> BuildResultFrame(
     PushFixArray(body, 1);  // net.box unpacks the outer array as multi-return
     body.insert(body.end(), result_bytes.begin(), result_bytes.end());
 
+    return BuildOkFrame(sync, body.data(), body.size());
+}
+
+/// Zero-copy variant: result_data is already a msgpack-encoded value.
+static std::vector<uint8_t> BuildResultFrameRaw(
+    uint64_t sync, const uint8_t* result_data, std::size_t result_len) {
+    // body = fixmap(1) + {DATA: fixarray(1) + raw_result_bytes}
+    std::vector<uint8_t> body;
+    body.reserve(3 + result_len);
+    PushFixMap(body, 1);
+    body.push_back(static_cast<uint8_t>(Iproto::DATA));
+    PushFixArray(body, 1);
+    body.insert(body.end(), result_data, result_data + result_len);
     return BuildOkFrame(sync, body.data(), body.size());
 }
 
@@ -501,13 +514,15 @@ static void HandleConnection(engine::io::Socket sock,
                     continue;
                 }
 
-                // Zero-copy: pass raw args bytes directly — no FromBytes/ValueBuilder.
-                const auto result = proxy.CallRaw(
+                // Fully zero-copy: raw args in, raw result bytes out —
+                // no Value tree at any stage.
+                const auto result_bytes = proxy.CallRawBytes(
                     vargs->bucket_id, mode,
                     vargs->func_name,
                     vargs->args_begin, vargs->args_len);
 
-                const auto resp = BuildResultFrame(req.sync, result);
+                const auto resp = BuildResultFrameRaw(
+                    req.sync, result_bytes.data(), result_bytes.size());
                 (void)sock.SendAll(resp.data(), resp.size(), engine::Deadline{});
 
             } else {

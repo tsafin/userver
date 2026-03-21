@@ -49,7 +49,9 @@ class ExecutionResult final {
 
   /// Returns the decoded data array from the response as a MessagePack cursor.
   /// The cursor is valid for the lifetime of this ExecutionResult.
-  const formats::msgpack::Value& GetData() const noexcept { return data_; }
+  /// Lazily parsed on first call — callers that only use GetRawBytes() pay no
+  /// allocation cost for the Value tree.
+  const formats::msgpack::Value& GetData() const noexcept;  // lazy, see result.cpp
 
   /// Returns the raw MessagePack bytes of the IPROTO_DATA array.
   /// Useful for typed decode (e.g. via tntcxx mpp).
@@ -69,8 +71,9 @@ class ExecutionResult final {
   uint32_t error_code_{0};
   std::string error_message_;
   std::optional<TntErrorInfo> error_info_;
-  std::vector<uint8_t> data_buf_;  ///< owns the raw msgpack bytes
-  formats::msgpack::Value data_;   ///< zero-copy cursor into data_buf_
+  std::vector<uint8_t> data_buf_;      ///< owns the raw msgpack bytes
+  mutable formats::msgpack::Value data_;        ///< lazily-decoded cursor into data_buf_
+  mutable bool data_parsed_{false};    ///< true once Value::FromBytes has been called
 };
 
 }  // namespace storages::tarantool

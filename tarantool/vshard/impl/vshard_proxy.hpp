@@ -101,6 +101,13 @@ class VshardProxy final {
         const uint8_t* args_data, std::size_t args_len,
         storages::tarantool::OptionalCommandControl = {});
 
+    /// Fully zero-copy path: returns raw msgpack bytes of the user function
+    /// result with no Value tree constructed at any stage (args in, bytes out).
+    std::vector<uint8_t> CallRawBytes(
+        BucketId bucket_id, impl::CallMode mode, std::string_view func,
+        const uint8_t* args_data, std::size_t args_len,
+        storages::tarantool::OptionalCommandControl = {});
+
     // ---- Zero-copy forwarding -----------------------------------------------
 
     /// Forward a raw IPROTO CALL body directly to the appropriate storage node.
@@ -165,6 +172,12 @@ class VshardProxy final {
 
     /// Shared retry loop used by both DoCall and CallRaw.
     formats::msgpack::Value DoCallWithQuery(
+        BucketId bucket_id, impl::CallMode mode,
+        const storages::tarantool::Query& query,
+        storages::tarantool::OptionalCommandControl cc);
+
+    /// Shared retry loop returning raw bytes — no Value tree at any point.
+    std::vector<uint8_t> DoCallRawBytes(
         BucketId bucket_id, impl::CallMode mode,
         const storages::tarantool::Query& query,
         storages::tarantool::OptionalCommandControl cc);

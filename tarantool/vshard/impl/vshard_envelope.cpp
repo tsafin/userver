@@ -2,6 +2,9 @@
 
 #include <userver/logging/log.hpp>
 
+#include <storages/tarantool/impl/iproto_frames.hpp>
+#include <storages/tarantool/impl/msgpack_constants.hpp>
+
 USERVER_NAMESPACE_BEGIN
 
 namespace storages::tarantool::vshard::impl {
@@ -12,11 +15,6 @@ VshardEnvelope DecodeEnvelope(
 
     const auto& data = result.GetData();
 
-    // vshard.storage.call via IPROTO_CALL (0x0A) returns a flat array:
-    //   [status, result_or_error]
-    //   status = true  → success
-    //   status = false → user function error
-    //   status = nil   → vshard routing error (WRONG_BUCKET etc.)
     if (!data.IsArray() || data.GetSize() == 0) {
         LOG_WARNING() << "vshard envelope: unexpected IPROTO_DATA shape "
                       << "(size=" << (data.IsArray() ? data.GetSize() : -1) << ")";
@@ -27,7 +25,6 @@ VshardEnvelope DecodeEnvelope(
     VshardEnvelope env;
 
     if (status.IsNull()) {
-        // nil status → vshard routing error; data[1] is the vshard error object
         if (data.GetSize() >= 2) {
             env.vshard_error = ParseVshardError(data[1]);
         }
@@ -35,8 +32,6 @@ VshardEnvelope DecodeEnvelope(
     }
 
     if (!status.As<bool>(false)) {
-        // false status → user function raised an error; data[1] is the error.
-        // We re-surface it as a CommandException so callers see a real error.
         std::string err_msg = "vshard: user function error";
         if (data.GetSize() >= 2 && data[1].IsString()) {
             err_msg = data[1].As<std::string>("");
@@ -44,11 +39,90 @@ VshardEnvelope DecodeEnvelope(
         throw storages::tarantool::CommandException{1, std::move(err_msg)};
     }
 
-    // true status → success; data[1] is the user function result (may be nil)
     if (data.GetSize() >= 2) {
         env.app_result = data[1];
     }
     return env;
+}
+
+// ---------------------------------------------------------------------------
+// Zero-copy raw path
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/// Fall-back for error paths: parse via Value tree (cold path).
+RawEnvelopeResult DecodeEnvelopeRawFallback(
+    const storages::tarantool::ExecutionResult& result) {
+    auto env = DecodeEnvelope(result);
+    RawEnvelopeResult r;
+    if (!env.vshard_error.IsNull()) {
+        r.ok = false;
+        r.vshard_error = std::move(env.vshard_error);
+    }
+    // false status → CommandException thrown by DecodeEnvelope
+    return r;
+}
+
+}  // namespace
+
+RawEnvelopeResult DecodeEnvelopeRaw(
+    const storages::tarantool::ExecutionResult& result) {
+    result.AssertOk();
+
+    const auto raw = result.GetRawBytes();
+    const uint8_t* p = raw.data();
+    const std::size_t len = raw.size();
+
+    if (len == 0) return {};
+
+    std::size_t pos = 0;
+
+    // Read the outer array length.  Tarantool's IPROTO_CALL packs multi-return
+    // values as array32 (0xdd) regardless of element count, so we must handle
+    // all three array formats: fixarray (0x9N), array16 (0xdc), array32 (0xdd).
+    std::size_t count = 0;
+    const uint8_t fb = p[pos++];
+    if ((fb & 0xf0u) == mp::kFixArrayMin) {
+        count = fb & 0x0fu;
+    } else if (fb == mp::kArray16) {
+        if (pos + 2 > len) return {};
+        count = (std::size_t)p[pos] << 8 | p[pos + 1];
+        pos += 2;
+    } else if (fb == mp::kArray32) {
+        if (pos + 4 > len) return {};
+        count = (std::size_t)p[pos] << 24 | (std::size_t)p[pos + 1] << 16 |
+                (std::size_t)p[pos + 2] << 8 | p[pos + 3];
+        pos += 4;
+    } else {
+        // Not an array at all — fall back to Value path.
+        LOG_WARNING() << "vshard envelope: IPROTO_DATA is not an array fb=" << static_cast<int>(fb)
+                      << " len=" << len;
+        return DecodeEnvelopeRawFallback(result);
+    }
+
+    if (count == 0 || pos >= len) return {};
+
+    // Element [0]: status — true (0xc3) / false (0xc2) / nil (0xc0)
+    const uint8_t status_byte = p[pos];
+
+    if (status_byte == mp::kTrue) {
+        // Success path — extract element [1] raw bytes (zero Value tree)
+        ++pos;  // skip status byte
+        if (count < 2 || pos >= len) {
+            // No result value — return empty success (nil result)
+            return {};
+        }
+        const std::size_t result_start = pos;
+        const std::size_t result_end =
+            storages::tarantool::impl::msgpack_scan::SkipValue(p, len, pos);
+        RawEnvelopeResult r;
+        r.app_result_bytes.assign(p + result_start, p + result_end);
+        return r;
+    }
+
+    // Error paths — fall back to Value parse (cold path)
+    return DecodeEnvelopeRawFallback(result);
 }
 
 }  // namespace storages::tarantool::vshard::impl
