@@ -90,6 +90,17 @@ class VshardProxy final {
         formats::msgpack::ValueBuilder args,
         storages::tarantool::OptionalCommandControl = {});
 
+    /// Call with pre-encoded raw msgpack args — no deserialization on the hot path.
+    ///
+    /// @param args_data  Pointer to a msgpack-encoded value for the args array
+    ///                   (e.g. the raw bytes extracted from the client IPROTO_TUPLE
+    ///                   by ParseVshardRouterArgs).  The bytes are copied once into
+    ///                   the storage-call tuple; no Value tree is constructed.
+    formats::msgpack::Value CallRaw(
+        BucketId bucket_id, impl::CallMode mode, std::string_view func,
+        const uint8_t* args_data, std::size_t args_len,
+        storages::tarantool::OptionalCommandControl = {});
+
     // ---- Zero-copy forwarding -----------------------------------------------
 
     /// Forward a raw IPROTO CALL body directly to the appropriate storage node.
@@ -152,11 +163,23 @@ class VshardProxy final {
         formats::msgpack::ValueBuilder args,
         storages::tarantool::OptionalCommandControl cc);
 
+    /// Shared retry loop used by both DoCall and CallRaw.
+    formats::msgpack::Value DoCallWithQuery(
+        BucketId bucket_id, impl::CallMode mode,
+        const storages::tarantool::Query& query,
+        storages::tarantool::OptionalCommandControl cc);
+
     /// Build the vshard.storage.call argument array:
     /// [bucket_id, mode_str, func_name, args]
     storages::tarantool::Query BuildStorageCallQuery(
         BucketId bucket_id, impl::CallMode mode, std::string_view func,
         formats::msgpack::ValueBuilder args) const;
+
+    /// Same as BuildStorageCallQuery but accepts pre-encoded raw args bytes,
+    /// avoiding a full msgpack deserialization round-trip.
+    storages::tarantool::Query BuildStorageCallQueryRaw(
+        BucketId bucket_id, impl::CallMode mode, std::string_view func,
+        const uint8_t* args_data, std::size_t args_len) const;
 
     void StartRefreshTask();
 

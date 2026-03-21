@@ -19,6 +19,7 @@
 
 #include <array>
 #include <cstring>
+#include <optional>
 #include <string_view>
 #include <vector>
 
@@ -30,10 +31,12 @@
 #include <userver/engine/io/socket.hpp>
 #include <userver/formats/msgpack/serialize.hpp>
 #include <userver/formats/msgpack/value.hpp>
-#include <userver/formats/msgpack/value_builder.hpp>
 #include <userver/logging/log.hpp>
 #include <userver/yaml_config/merge_schemas.hpp>
 #include <userver/yaml_config/schema.hpp>
+
+// Shared IPROTO frame utilities: ParseIprotoRequest, msgpack_scan::*, mp::k*
+#include <storages/tarantool/impl/iproto_frames.hpp>
 
 // For VshardProxyComponent lookup
 #include <vshard/vshard_proxy_component.hpp>
@@ -44,25 +47,10 @@ namespace storages::tarantool::vshard::impl {
 
 namespace {
 
-// ---------------------------------------------------------------------------
-// IPROTO header/body map keys (from tntcxx IprotoConstants.hpp Iproto enum)
-// ---------------------------------------------------------------------------
-constexpr uint8_t kKeyRequestType   = Iproto::REQUEST_TYPE;   // 0x00
-constexpr uint8_t kKeySync          = Iproto::SYNC;           // 0x01
-constexpr uint8_t kKeySchemaVersion = Iproto::SCHEMA_VERSION; // 0x05
-constexpr uint8_t kKeyFunctionName  = Iproto::FUNCTION_NAME;  // 0x22
-constexpr uint8_t kKeyTuple         = Iproto::TUPLE;          // 0x21
-constexpr uint8_t kKeyData          = Iproto::DATA;           // 0x30
-constexpr uint8_t kKeyError         = Iproto::ERROR_24;       // 0x31
-
-// IPROTO request type codes
-constexpr uint8_t kTypeSelect = Iproto::SELECT;   // 0x01 — schema fetch by net.box
-constexpr uint8_t kTypeCall16 = 0x06;             // IPROTO_CALL_16 (legacy, pre-2.0)
-constexpr uint8_t kTypeAuth   = Iproto::AUTH;     // 0x07
-constexpr uint8_t kTypeCall   = Iproto::CALL;     // 0x0A — primary vshard call type
-constexpr uint8_t kTypePing   = Iproto::PING;     // 0x40
-constexpr uint8_t kTypeId     = 0x49;             // IPROTO_ID — feature negotiation (2.10+)
-constexpr uint32_t kTypeError = 0x8000;           // OR'd with error code in response
+// IPROTO request type codes — values not (yet) in tntcxx Iproto enum
+constexpr uint8_t kTypeCall16 = 0x06;  // IPROTO_CALL_16 (legacy, pre-2.0)
+constexpr uint8_t kTypeId     = 0x49;  // IPROTO_ID — feature negotiation (2.10+)
+constexpr uint32_t kTypeError = 0x8000;  // OR'd with error code in response header
 
 // IPROTO_ID body keys (Tarantool 2.10+, not in tntcxx enum yet)
 constexpr uint8_t kKeyVersion  = 0x54;  // IPROTO_VERSION
@@ -98,59 +86,51 @@ std::array<uint8_t, 128> MakeGreeting() {
 }
 
 // ---------------------------------------------------------------------------
-// msgpack helpers — minimal zero-dependency encoding
+// msgpack helpers — minimal zero-dependency encoding using mp::k* constants
 // ---------------------------------------------------------------------------
 
-// Append a single byte.
 inline void PushU8(std::vector<uint8_t>& buf, uint8_t v) {
     buf.push_back(v);
 }
 
-// Append a msgpack uint32 (4-byte format 0xce + big-endian uint32).
 inline void PushU32(std::vector<uint8_t>& buf, uint32_t v) {
-    buf.push_back(0xce);
+    buf.push_back(mp::kUint32);
     buf.push_back(static_cast<uint8_t>(v >> 24));
     buf.push_back(static_cast<uint8_t>(v >> 16));
     buf.push_back(static_cast<uint8_t>(v >> 8));
     buf.push_back(static_cast<uint8_t>(v));
 }
 
-// Append a msgpack uint64 (8-byte format 0xcf + big-endian uint64).
 inline void PushU64(std::vector<uint8_t>& buf, uint64_t v) {
-    buf.push_back(0xcf);
+    buf.push_back(mp::kUint64);
     for (int s = 56; s >= 0; s -= 8)
         buf.push_back(static_cast<uint8_t>(v >> s));
 }
 
-// Append a msgpack fixmap header of n entries (n <= 15).
 inline void PushFixMap(std::vector<uint8_t>& buf, uint8_t n) {
-    buf.push_back(0x80u | (n & 0x0fu));
+    buf.push_back(static_cast<uint8_t>(mp::kFixMapMin | (n & 0x0fu)));
 }
 
-// Append a msgpack fixarray header of n entries (n <= 15).
 inline void PushFixArray(std::vector<uint8_t>& buf, uint8_t n) {
-    buf.push_back(0x90u | (n & 0x0fu));
+    buf.push_back(static_cast<uint8_t>(mp::kFixArrayMin | (n & 0x0fu)));
 }
 
-// Append a msgpack key (fixint < 128) + uint32 value.
 inline void PushKV_u32(std::vector<uint8_t>& buf, uint8_t key, uint32_t val) {
     buf.push_back(key);
     PushU32(buf, val);
 }
 
-// Append a msgpack key + uint64 value.
 inline void PushKV_u64(std::vector<uint8_t>& buf, uint8_t key, uint64_t val) {
     buf.push_back(key);
     PushU64(buf, val);
 }
 
-// Append a msgpack str (str8 or fixstr).
 inline void PushStr(std::vector<uint8_t>& buf, std::string_view s) {
     const auto len = s.size();
     if (len <= 31) {
-        buf.push_back(0xa0u | static_cast<uint8_t>(len));
+        buf.push_back(static_cast<uint8_t>(mp::kFixStrMin | len));
     } else {
-        buf.push_back(0xd9u);
+        buf.push_back(mp::kStr8);
         buf.push_back(static_cast<uint8_t>(len));
     }
     buf.insert(buf.end(),
@@ -158,14 +138,12 @@ inline void PushStr(std::vector<uint8_t>& buf, std::string_view s) {
                reinterpret_cast<const uint8_t*>(s.data()) + len);
 }
 
-// Append a msgpack nil.
 inline void PushNil(std::vector<uint8_t>& buf) {
-    buf.push_back(0xc0u);
+    buf.push_back(mp::kNil);
 }
 
-// Serialize the 5-byte IPROTO length header (0xCE + uint32 body_len).
 inline void PushPreheader(std::vector<uint8_t>& buf, uint32_t body_len) {
-    buf.push_back(0xce);
+    buf.push_back(mp::kUint32);
     buf.push_back(static_cast<uint8_t>(body_len >> 24));
     buf.push_back(static_cast<uint8_t>(body_len >> 16));
     buf.push_back(static_cast<uint8_t>(body_len >> 8));
@@ -181,13 +159,14 @@ inline void PushPreheader(std::vector<uint8_t>& buf, uint32_t body_len) {
 std::vector<uint8_t> BuildOkFrame(uint64_t sync,
                                    const uint8_t* body_data,
                                    std::size_t body_len) {
-    // Header: fixmap(3) + {0x00: 0, 0x01: sync, 0x05: schema_version}
+    // Header: fixmap(3) + {REQUEST_TYPE: 0, SYNC: sync, SCHEMA_VERSION: ver}
     std::vector<uint8_t> hdr;
     hdr.reserve(20);
     PushFixMap(hdr, 3);
-    hdr.push_back(kKeyRequestType); hdr.push_back(0x00u);  // OK type = 0
-    PushKV_u64(hdr, kKeySync, sync);
-    PushKV_u32(hdr, kKeySchemaVersion, kSchemaVersion);
+    hdr.push_back(static_cast<uint8_t>(Iproto::REQUEST_TYPE));
+    hdr.push_back(0x00u);  // OK code = 0 (positive fixint)
+    PushKV_u64(hdr, static_cast<uint8_t>(Iproto::SYNC), sync);
+    PushKV_u32(hdr, static_cast<uint8_t>(Iproto::SCHEMA_VERSION), kSchemaVersion);
 
     const uint32_t total_body = static_cast<uint32_t>(hdr.size() + body_len);
 
@@ -201,18 +180,18 @@ std::vector<uint8_t> BuildOkFrame(uint64_t sync,
 
 /// Build a wire-ready IPROTO error response.
 std::vector<uint8_t> BuildErrorFrame(uint64_t sync, std::string_view msg) {
-    // Header: fixmap(3) + {0x00: 0x8001, 0x01: sync, 0x05: schema_ver}
+    // Header: fixmap(3) + {REQUEST_TYPE: 0x8001, SYNC: sync, SCHEMA_VERSION: ver}
     std::vector<uint8_t> hdr;
     PushFixMap(hdr, 3);
-    hdr.push_back(kKeyRequestType);
+    hdr.push_back(static_cast<uint8_t>(Iproto::REQUEST_TYPE));
     PushU32(hdr, kTypeError | 1u);
-    PushKV_u64(hdr, kKeySync, sync);
-    PushKV_u32(hdr, kKeySchemaVersion, kSchemaVersion);
+    PushKV_u64(hdr, static_cast<uint8_t>(Iproto::SYNC), sync);
+    PushKV_u32(hdr, static_cast<uint8_t>(Iproto::SCHEMA_VERSION), kSchemaVersion);
 
-    // Body: fixmap(1) + {0x31: "error message"}
+    // Body: fixmap(1) + {ERROR_24: "error message"}
     std::vector<uint8_t> body;
     PushFixMap(body, 1);
-    body.push_back(kKeyError);
+    body.push_back(static_cast<uint8_t>(Iproto::ERROR_24));
     PushStr(body, msg);
 
     const uint32_t total = static_cast<uint32_t>(hdr.size() + body.size());
@@ -226,10 +205,9 @@ std::vector<uint8_t> BuildErrorFrame(uint64_t sync, std::string_view msg) {
 
 /// Build an IPROTO OK response for AUTH (empty body).
 std::vector<uint8_t> BuildAuthOkFrame(uint64_t sync) {
-    // Body: fixmap(1) + {0x30: []}
     std::vector<uint8_t> body;
     PushFixMap(body, 1);
-    body.push_back(kKeyData);
+    body.push_back(static_cast<uint8_t>(Iproto::DATA));
     PushFixArray(body, 0);
     return BuildOkFrame(sync, body.data(), body.size());
 }
@@ -238,248 +216,147 @@ std::vector<uint8_t> BuildAuthOkFrame(uint64_t sync) {
 std::vector<uint8_t> BuildPingOkFrame(uint64_t sync) {
     std::vector<uint8_t> body;
     PushFixMap(body, 1);
-    body.push_back(kKeyData);
+    body.push_back(static_cast<uint8_t>(Iproto::DATA));
     PushFixArray(body, 0);
     return BuildOkFrame(sync, body.data(), body.size());
 }
 
 /// Build an IPROTO OK response for IPROTO_ID: {version: 0, features: []}.
-/// This satisfies net.box feature negotiation without advertising any features.
+/// Satisfies net.box feature negotiation without advertising any features.
 std::vector<uint8_t> BuildIdOkFrame(uint64_t sync) {
-    // Body: fixmap(2) + {0x54: 0, 0x55: []}
     std::vector<uint8_t> body;
     PushFixMap(body, 2);
     body.push_back(kKeyVersion);
     body.push_back(0x00);  // version 0 (positive fixint)
     body.push_back(kKeyFeatures);
-    PushFixArray(body, 0);  // empty features array
+    PushFixArray(body, 0);
     return BuildOkFrame(sync, body.data(), body.size());
 }
 
-/// Build an IPROTO OK response for IPROTO_SELECT: empty tuple set {0x30: []}.
-/// net.box sends SELECT to system spaces (_vspace=281, _vindex=289, _func=287)
-/// during schema fetch.  Returning empty data tells it there are no spaces
-/// defined, which is correct — our proxy has no box schema.
+/// Build an IPROTO OK response for IPROTO_SELECT: empty tuple set {DATA: []}.
+/// net.box fetches schema via SELECT on system spaces during connect; returning
+/// empty data lets it proceed without a real box schema.
 std::vector<uint8_t> BuildSelectEmptyFrame(uint64_t sync) {
     std::vector<uint8_t> body;
     PushFixMap(body, 1);
-    body.push_back(kKeyData);
+    body.push_back(static_cast<uint8_t>(Iproto::DATA));
     PushFixArray(body, 0);
     return BuildOkFrame(sync, body.data(), body.size());
 }
 
 // ---------------------------------------------------------------------------
-
-struct Span {
-    const uint8_t* p;
-    const uint8_t* end;
-    bool ok() const { return p < end; }
-    uint8_t read1() { return *p++; }
-    uint8_t peek() const { return *p; }
-};
-
-// Read a uint from msgpack (positive fixint, uint8/16/32/64).
-// Returns false on failure.
-static bool ReadUint(Span& s, uint64_t& out) {
-    if (!s.ok()) return false;
-    const uint8_t b = s.read1();
-    if (b < 0x80) { out = b; return true; }
-    if (b == 0xcc) { if (s.end - s.p < 1) return false; out = *s.p++; return true; }
-    if (b == 0xcd) { if (s.end - s.p < 2) return false;
-        out = (uint64_t(s.p[0]) << 8) | s.p[1]; s.p += 2; return true; }
-    if (b == 0xce) { if (s.end - s.p < 4) return false;
-        out = (uint64_t(s.p[0])<<24)|(uint64_t(s.p[1])<<16)|(uint64_t(s.p[2])<<8)|s.p[3];
-        s.p += 4; return true; }
-    if (b == 0xcf) { if (s.end - s.p < 8) return false;
-        out = 0;
-        for (int i = 0; i < 8; ++i) out = (out << 8) | *s.p++;
-        return true; }
-    return false;
-}
-
-// Read a string from msgpack (fixstr, str8, str16, str32).
-static bool ReadStr(Span& s, std::string_view& out) {
-    if (!s.ok()) return false;
-    const uint8_t b = s.read1();
-    uint32_t len = 0;
-    if ((b & 0xe0) == 0xa0) { len = b & 0x1fu; }
-    else if (b == 0xd9) { if (!s.ok()) return false; len = *s.p++; }
-    else if (b == 0xda) { if (s.end-s.p<2) return false;
-        len = (uint32_t(*s.p)<<8)|s.p[1]; s.p+=2; }
-    else if (b == 0xdb) { if (s.end-s.p<4) return false;
-        len = (uint32_t(s.p[0])<<24)|(uint32_t(s.p[1])<<16)|(uint32_t(s.p[2])<<8)|s.p[3];
-        s.p+=4; }
-    else return false;
-    if (static_cast<ptrdiff_t>(len) > s.end - s.p) return false;
-    out = {reinterpret_cast<const char*>(s.p), len};
-    s.p += len;
-    return true;
-}
-
-// Skip one msgpack value (including nested containers).
-static bool SkipValue(Span& s);
-
-static bool SkipN(Span& s, uint32_t n) {
-    for (uint32_t i = 0; i < n; ++i)
-        if (!SkipValue(s)) return false;
-    return true;
-}
-
-static bool SkipValue(Span& s) {
-    if (!s.ok()) return false;
-    const uint8_t b = s.read1();
-    // positive fixint / negative fixint
-    if (b < 0x80 || b >= 0xe0) return true;
-    // fixstr
-    if ((b & 0xe0) == 0xa0) { uint32_t n = b & 0x1f; s.p += n; return s.p <= s.end; }
-    // fixarray
-    if ((b & 0xf0) == 0x90) return SkipN(s, b & 0x0f);
-    // fixmap
-    if ((b & 0xf0) == 0x80) return SkipN(s, 2 * (b & 0x0f));
-    switch (b) {
-        case 0xc0: case 0xc2: case 0xc3: return true;  // nil, false, true
-        case 0xcc: case 0xd0: s.p += 1; return s.p <= s.end;
-        case 0xcd: case 0xd1: s.p += 2; return s.p <= s.end;
-        case 0xce: case 0xd2: case 0xca: s.p += 4; return s.p <= s.end;
-        case 0xcf: case 0xd3: case 0xcb: s.p += 8; return s.p <= s.end;
-        case 0xd4: s.p += 2; return s.p <= s.end;
-        case 0xd5: s.p += 3; return s.p <= s.end;
-        case 0xd6: s.p += 5; return s.p <= s.end;
-        case 0xd7: s.p += 9; return s.p <= s.end;
-        case 0xd8: s.p += 17; return s.p <= s.end;
-        case 0xc7: { if (!s.ok()) return false; uint32_t n = *s.p++; s.p += 1 + n; return s.p <= s.end; }
-        case 0xc8: { if (s.end-s.p<2) return false; uint32_t n = (uint32_t(s.p[0])<<8)|s.p[1]; s.p += 2+1+n; return s.p <= s.end; }
-        case 0xc9: { if (s.end-s.p<4) return false; uint32_t n = (uint32_t(s.p[0])<<24)|(uint32_t(s.p[1])<<16)|(uint32_t(s.p[2])<<8)|s.p[3]; s.p+=4+1+n; return s.p<=s.end; }
-        case 0xd9: { if (!s.ok()) return false; uint32_t n = *s.p++; s.p += n; return s.p <= s.end; }
-        case 0xda: { if (s.end-s.p<2) return false; uint32_t n=(uint32_t(s.p[0])<<8)|s.p[1]; s.p+=2+n; return s.p<=s.end; }
-        case 0xdb: { if (s.end-s.p<4) return false; uint32_t n=(uint32_t(s.p[0])<<24)|(uint32_t(s.p[1])<<16)|(uint32_t(s.p[2])<<8)|s.p[3]; s.p+=4+n; return s.p<=s.end; }
-        case 0xdc: { if (s.end-s.p<2) return false; uint32_t n=(uint32_t(s.p[0])<<8)|s.p[1]; s.p+=2; return SkipN(s,n); }
-        case 0xdd: { if (s.end-s.p<4) return false; uint32_t n=(uint32_t(s.p[0])<<24)|(uint32_t(s.p[1])<<16)|(uint32_t(s.p[2])<<8)|s.p[3]; s.p+=4; return SkipN(s,n); }
-        case 0xde: { if (s.end-s.p<2) return false; uint32_t n=(uint32_t(s.p[0])<<8)|s.p[1]; s.p+=2; return SkipN(s,2*n); }
-        case 0xdf: { if (s.end-s.p<4) return false; uint32_t n=(uint32_t(s.p[0])<<24)|(uint32_t(s.p[1])<<16)|(uint32_t(s.p[2])<<8)|s.p[3]; s.p+=4; return SkipN(s,2*n); }
-        default: return false;
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Parse a CALL request body: extract sync, func_name, and args span.
+// Request parsing — using shared msgpack_scan::* from iproto_frames.hpp
+// No local duplicates; depth-limited SkipValue is inherited from the shared impl.
 // ---------------------------------------------------------------------------
 
-struct ParsedRequest {
-    uint64_t sync{0};
-    uint8_t  type{0};
-    std::string_view func_name;   // only set for CALL
-    const uint8_t* args_begin{nullptr};  // start of args array value
-    std::size_t args_len{0};
-};
-
-/// Parse the header+body of an IPROTO request (after the 5-byte preheader).
-/// Returns false if the frame is malformed.
-static bool ParseRequest(const uint8_t* data, std::size_t len,
-                          ParsedRequest& out) {
-    Span s{data, data + len};
-
-    // --- header map ---
-    if (!s.ok()) return false;
-    const uint8_t hdr_byte = s.read1();
-    if ((hdr_byte & 0xf0) != 0x80) return false;  // must be fixmap
-    const uint32_t hdr_n = hdr_byte & 0x0f;
-
-    for (uint32_t i = 0; i < hdr_n; ++i) {
-        uint64_t key;
-        if (!ReadUint(s, key)) return false;
-        if (key == kKeyRequestType) {
-            uint64_t t;
-            if (!ReadUint(s, t)) return false;
-            out.type = static_cast<uint8_t>(t);
-        } else if (key == kKeySync) {
-            if (!ReadUint(s, out.sync)) return false;
-        } else {
-            if (!SkipValue(s)) return false;
-        }
-    }
-
-    // --- body map ---
-    if (!s.ok()) return true;  // no body is fine (PING)
-    const uint8_t body_byte = s.read1();
-    if ((body_byte & 0xf0) != 0x80) return false;  // must be fixmap
-    const uint32_t body_n = body_byte & 0x0f;
-
-    for (uint32_t i = 0; i < body_n; ++i) {
-        uint64_t key;
-        if (!ReadUint(s, key)) return false;
-        if (key == kKeyFunctionName) {
-            if (!ReadStr(s, out.func_name)) return false;
-        } else if (key == kKeyTuple) {
-            // Record the start/length of the args array msgpack value
-            out.args_begin = s.p;
-            if (!SkipValue(s)) return false;
-            out.args_len = static_cast<std::size_t>(s.p - out.args_begin);
-        } else {
-            if (!SkipValue(s)) return false;
-        }
-    }
-    return true;
-}
-
-// ---------------------------------------------------------------------------
-// Parse vshard.router.callrw/callro args: (bucket_id, func_name, args)
-// The IPROTO TUPLE value is an array [ bucket_id, func_name, args ].
-// ---------------------------------------------------------------------------
-
-struct VshardRouterArgs {
-    uint32_t bucket_id{0};
+/// Parsed CALL body: function name + raw TUPLE bytes (zero-copy).
+/// Pointers into the caller-owned frame buffer.
+struct CallBody {
     std::string_view func_name;
-    const uint8_t* args_begin{nullptr};
-    std::size_t    args_len{0};
+    const uint8_t*   tuple_begin{nullptr};
+    std::size_t      tuple_len{0};
 };
 
-static bool ParseVshardRouterArgs(const uint8_t* data, std::size_t len,
-                                   VshardRouterArgs& out) {
-    Span s{data, data + len};
-    // outer array
-    if (!s.ok()) return false;
-    const uint8_t ab = s.read1();
-    uint32_t alen = 0;
-    if ((ab & 0xf0) == 0x90) alen = ab & 0x0f;
-    else if (ab == 0xdc) { if (s.end-s.p<2) return false; alen=(uint32_t(s.p[0])<<8)|s.p[1]; s.p+=2; }
-    else if (ab == 0xdd) { if (s.end-s.p<4) return false; alen=(uint32_t(s.p[0])<<24)|(uint32_t(s.p[1])<<16)|(uint32_t(s.p[2])<<8)|s.p[3]; s.p+=4; }
-    else return false;
-    if (alen < 3) return false;
+/// Scan the body map of an IPROTO CALL request for FUNCTION_NAME and TUPLE.
+/// Uses msgpack_scan::ReadStr/ReadUint/SkipValue — no local parser code.
+static std::optional<CallBody>
+ParseCallBody(const uint8_t* p, std::size_t len) noexcept {
+    using namespace storages::tarantool::impl::msgpack_scan;
+    std::size_t pos = 0;
+    if (pos >= len) return std::nullopt;
+    const uint8_t b = p[pos++];
+    std::size_t body_n = 0;
+    if ((b & 0xf0u) == mp::kFixMapMin) {
+        body_n = b & 0x0fu;
+    } else if (b == mp::kMap16 && pos + 2 <= len) {
+        body_n = (std::size_t)p[pos] << 8 | p[pos + 1]; pos += 2;
+    } else {
+        return std::nullopt;
+    }
 
-    // bucket_id
-    uint64_t bid;
-    if (!ReadUint(s, bid)) return false;
+    CallBody result;
+    for (std::size_t i = 0; i < body_n && pos < len; ++i) {
+        auto [k, kp] = ReadUint(p, len, pos); pos = kp;
+        if (k == Iproto::FUNCTION_NAME) {
+            auto [s, sp] = ReadStr(p, len, pos); pos = sp;
+            result.func_name = s;
+        } else if (k == Iproto::TUPLE) {
+            result.tuple_begin = p + pos;
+            pos = SkipValue(p, len, pos);
+            result.tuple_len = static_cast<std::size_t>((p + pos) - result.tuple_begin);
+        } else {
+            pos = SkipValue(p, len, pos);
+        }
+    }
+    if (!result.tuple_begin) return std::nullopt;
+    return result;
+}
+
+/// vshard.router.call* TUPLE: [bucket_id, inner_func_name, args].
+/// args_begin/args_len are raw msgpack bytes — no deserialization needed.
+struct VshardRouterArgs {
+    uint32_t         bucket_id{0};
+    std::string_view func_name;      ///< inner function, e.g. "box.space.customer:replace"
+    const uint8_t*   args_begin{nullptr};  ///< raw msgpack value for the args array
+    std::size_t      args_len{0};
+};
+
+/// Parse the TUPLE array from a vshard.router.call* request.
+/// [bucket_id, func_name, args_array]
+/// Uses msgpack_scan::* — no local parser code.
+static std::optional<VshardRouterArgs>
+ParseVshardRouterArgs(const uint8_t* p, std::size_t len) noexcept {
+    using namespace storages::tarantool::impl::msgpack_scan;
+    std::size_t pos = 0;
+    if (pos >= len) return std::nullopt;
+
+    // outer array header
+    const uint8_t ab = p[pos++];
+    std::size_t alen = 0;
+    if ((ab & 0xf0u) == mp::kFixArrayMin) {
+        alen = ab & 0x0fu;
+    } else if (ab == mp::kArray16 && pos + 2 <= len) {
+        alen = (std::size_t)p[pos] << 8 | p[pos + 1]; pos += 2;
+    } else if (ab == mp::kArray32 && pos + 4 <= len) {
+        alen = (std::size_t)p[pos] << 24 | (std::size_t)p[pos + 1] << 16 |
+               (std::size_t)p[pos + 2] << 8 | p[pos + 3]; pos += 4;
+    } else {
+        return std::nullopt;
+    }
+    if (alen < 3) return std::nullopt;
+
+    VshardRouterArgs out;
+
+    auto [bid, bp] = ReadUint(p, len, pos); pos = bp;
     out.bucket_id = static_cast<uint32_t>(bid);
 
-    // func_name
-    if (!ReadStr(s, out.func_name)) return false;
+    auto [fn, fp] = ReadStr(p, len, pos); pos = fp;
+    if (fn.empty()) return std::nullopt;
+    out.func_name = fn;
 
-    // args (the rest, passed verbatim to vshard.storage.call)
-    out.args_begin = s.p;
-    if (!SkipValue(s)) return false;
-    out.args_len = static_cast<std::size_t>(s.p - out.args_begin);
-    return true;
+    // args: record raw bytes without deserializing
+    out.args_begin = p + pos;
+    pos = SkipValue(p, len, pos);
+    out.args_len = static_cast<std::size_t>((p + pos) - out.args_begin);
+    return out;
 }
 
 // ---------------------------------------------------------------------------
 // Build the IPROTO OK response carrying the VshardProxy result value.
 // ---------------------------------------------------------------------------
 
-/// Encode {0x30: [result_value]} and build the full OK frame.
+/// Encode {DATA: [result_value]} and build the full OK frame.
 static std::vector<uint8_t> BuildResultFrame(
     uint64_t sync, const formats::msgpack::Value& result) {
-    const auto result_bytes = formats::msgpack::ToBytes(
-        formats::msgpack::ValueBuilder{result});
+    const auto result_bytes =
+        formats::msgpack::ToBytes(formats::msgpack::ValueBuilder{result});
 
-    // body = fixmap(1) + {0x30: [result_value]}
-    // The result is wrapped in a 1-element array as net.box unpacks it
+    // body = fixmap(1) + {DATA: [result_value]}
     std::vector<uint8_t> body;
     body.reserve(3 + result_bytes.size());
     PushFixMap(body, 1);
-    body.push_back(kKeyData);
-    // Wrap result in a 1-element array (net.box unpacks multi-return)
-    PushFixArray(body, 1);
+    body.push_back(static_cast<uint8_t>(Iproto::DATA));
+    PushFixArray(body, 1);  // net.box unpacks the outer array as multi-return
     body.insert(body.end(), result_bytes.begin(), result_bytes.end());
 
     return BuildOkFrame(sync, body.data(), body.size());
@@ -501,8 +378,9 @@ static bool RecvExact(engine::io::Socket& sock, std::vector<uint8_t>& buf,
 }
 
 /// Append `n` bytes from socket to `buf`.
-static bool RecvAppend(engine::io::Socket& sock, std::vector<uint8_t>& buf,
-                        std::size_t n) {
+[[maybe_unused]] static bool RecvAppend(engine::io::Socket& sock,
+                                         std::vector<uint8_t>& buf,
+                                         std::size_t n) {
     const auto off = buf.size();
     buf.resize(off + n);
     const auto got = sock.RecvAll(buf.data() + off, n, engine::Deadline{});
@@ -525,13 +403,13 @@ static void HandleConnection(engine::io::Socket sock,
 
     // 2. Request loop
     while (true) {
-        // Read 5-byte preheader: 0xCE + uint32 body_len
+        // Read 5-byte preheader: mp::kUint32 marker + big-endian uint32 body_len
         try {
             if (!RecvExact(sock, frame_buf, 5)) break;
         } catch (...) {
             break;
         }
-        if (frame_buf[0] != 0xce) {
+        if (frame_buf[0] != mp::kUint32) {
             LOG_WARNING() << "iproto_server: unexpected preheader byte "
                           << static_cast<int>(frame_buf[0]);
             break;
@@ -552,9 +430,10 @@ static void HandleConnection(engine::io::Socket sock,
             break;
         }
 
-        // Parse
-        ParsedRequest req;
-        if (!ParseRequest(frame_buf.data(), body_len, req)) {
+        // Parse header using shared ParseIprotoRequest from iproto_frames.hpp
+        const auto req = storages::tarantool::impl::ParseIprotoRequest(
+            frame_buf.data(), body_len);
+        if (req.type == 0 && req.sync == 0) {
             LOG_WARNING() << "iproto_server: malformed frame, closing";
             break;
         }
@@ -562,82 +441,76 @@ static void HandleConnection(engine::io::Socket sock,
         // Dispatch
         try {
             if (req.type == kTypeId) {
-                // Feature negotiation (Tarantool 2.10+) — respond with
-                // version=0, empty features.  This unblocks net.box 2.6+.
                 const auto resp = BuildIdOkFrame(req.sync);
                 (void)sock.SendAll(resp.data(), resp.size(), engine::Deadline{});
 
-            } else if (req.type == kTypeAuth) {
+            } else if (req.type == Iproto::AUTH) {
                 // Accept any credentials without verification.
-                // vshard connects anonymously by default; clients may send
-                // AUTH regardless.
                 const auto resp = BuildAuthOkFrame(req.sync);
                 (void)sock.SendAll(resp.data(), resp.size(), engine::Deadline{});
 
-            } else if (req.type == kTypePing) {
+            } else if (req.type == Iproto::PING) {
                 const auto resp = BuildPingOkFrame(req.sync);
                 (void)sock.SendAll(resp.data(), resp.size(), engine::Deadline{});
 
-            } else if (req.type == kTypeSelect) {
-                // net.box fetches schema via SELECT on system spaces
-                // (_vspace=281, _vindex=289, _func=287, _vcollation=316).
-                // We have no schema; returning empty data satisfies net.box
-                // and lets it proceed to AUTH and CALL.
+            } else if (req.type == Iproto::SELECT) {
+                // net.box fetches schema on connect; return empty data.
                 const auto resp = BuildSelectEmptyFrame(req.sync);
                 (void)sock.SendAll(resp.data(), resp.size(), engine::Deadline{});
 
-            } else if (req.type == kTypeCall || req.type == kTypeCall16) {
-                // IPROTO_CALL (0x0A) — new-style, used by Tarantool 1.7+
-                // IPROTO_CALL_16 (0x06) — legacy, same wire format as CALL
-                // Both use key 0x22 (FUNCTION_NAME) and 0x21 (TUPLE/args).
-                if (req.args_begin == nullptr) {
+            } else if (req.type == Iproto::CALL || req.type == kTypeCall16) {
+                // Both CALL (0x0A) and legacy CALL_16 (0x06) carry
+                // FUNCTION_NAME (0x22) + TUPLE (0x21) in the body.
+                if (!req.body_begin) {
+                    const auto resp = BuildErrorFrame(req.sync, "missing body");
+                    (void)sock.SendAll(resp.data(), resp.size(), engine::Deadline{});
+                    continue;
+                }
+
+                const auto body = ParseCallBody(req.body_begin, req.body_len);
+                if (!body || !body->tuple_begin) {
                     const auto resp = BuildErrorFrame(req.sync, "missing args");
                     (void)sock.SendAll(resp.data(), resp.size(), engine::Deadline{});
                     continue;
                 }
 
-                // Map vshard router function name to read/write mode.
-                // Per vshard analysis: callrw and call (default mode=write)
-                // go to master; all callro/callbro/callre/callbre go to replica.
+                // Map outer vshard function name to read/write mode.
                 CallMode mode = CallMode::kReadOnly;
-                if (req.func_name == "vshard.router.callrw" ||
-                    req.func_name == "vshard.router.call") {
+                if (body->func_name == "vshard.router.callrw" ||
+                    body->func_name == "vshard.router.call") {
                     mode = CallMode::kReadWrite;
-                } else if (req.func_name != "vshard.router.callro" &&
-                           req.func_name != "vshard.router.callbro" &&
-                           req.func_name != "vshard.router.callre" &&
-                           req.func_name != "vshard.router.callbre") {
+                } else if (body->func_name != "vshard.router.callro" &&
+                           body->func_name != "vshard.router.callbro" &&
+                           body->func_name != "vshard.router.callre" &&
+                           body->func_name != "vshard.router.callbre") {
                     LOG_WARNING() << "iproto_server: unknown vshard function '"
-                                  << req.func_name << "'";
+                                  << body->func_name << "'";
                     const auto resp = BuildErrorFrame(
                         req.sync, "unsupported vshard function");
                     (void)sock.SendAll(resp.data(), resp.size(), engine::Deadline{});
                     continue;
                 }
 
-                VshardRouterArgs vargs;
-                if (!ParseVshardRouterArgs(req.args_begin, req.args_len, vargs)) {
+                // Parse vshard TUPLE: [bucket_id, inner_func, args_array]
+                const auto vargs = ParseVshardRouterArgs(
+                    body->tuple_begin, body->tuple_len);
+                if (!vargs) {
                     const auto resp = BuildErrorFrame(
                         req.sync, "bad vshard.router args: expected [bucket_id, func, args]");
                     (void)sock.SendAll(resp.data(), resp.size(), engine::Deadline{});
                     continue;
                 }
 
-                // Decode the args array into a ValueBuilder for DoCall
-                auto args_value = formats::msgpack::FromBytes(
-                    vargs.args_begin, vargs.args_len);
-                auto args_builder = formats::msgpack::ValueBuilder{args_value};
-
-                const auto result = proxy.Call(
-                    vargs.bucket_id, mode,
-                    std::string{vargs.func_name},
-                    std::move(args_builder));
+                // Zero-copy: pass raw args bytes directly — no FromBytes/ValueBuilder.
+                const auto result = proxy.CallRaw(
+                    vargs->bucket_id, mode,
+                    vargs->func_name,
+                    vargs->args_begin, vargs->args_len);
 
                 const auto resp = BuildResultFrame(req.sync, result);
                 (void)sock.SendAll(resp.data(), resp.size(), engine::Deadline{});
 
             } else {
-                // Unknown request type — log and return error.
                 LOG_WARNING() << "iproto_server: unsupported request type 0x"
                               << static_cast<unsigned>(req.type);
                 const auto resp = BuildErrorFrame(

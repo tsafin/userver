@@ -11,6 +11,7 @@
 #include <userver/utils/async.hpp>
 
 #include <storages/tarantool/impl/iproto_frames.hpp>
+#include <storages/tarantool/impl/msgpack_constants.hpp>
 #include <vshard/impl/iproto_vshard_frames.hpp>
 
 USERVER_NAMESPACE_BEGIN
@@ -88,6 +89,14 @@ formats::msgpack::Value VshardProxy::Call(
     return DoCall(bucket_id, mode, func, std::move(args), cc);
 }
 
+formats::msgpack::Value VshardProxy::CallRaw(
+    BucketId bucket_id, impl::CallMode mode, std::string_view func,
+    const uint8_t* args_data, std::size_t args_len,
+    storages::tarantool::OptionalCommandControl cc) {
+    auto query = BuildStorageCallQueryRaw(bucket_id, mode, func, args_data, args_len);
+    return DoCallWithQuery(bucket_id, mode, query, cc);
+}
+
 // ---------------------------------------------------------------------------
 // Core call implementation with MOVED/TRANSFER retry
 // ---------------------------------------------------------------------------
@@ -96,7 +105,6 @@ storages::tarantool::Query VshardProxy::BuildStorageCallQuery(
     BucketId bucket_id, impl::CallMode mode, std::string_view func,
     formats::msgpack::ValueBuilder args) const {
     // vshard.storage.call signature: (bucket_id, mode, func_name, args)
-    // vshard wire protocol mode: "write" for rw, "read" for everything else.
     const std::string_view vshard_mode =
         (mode == impl::CallMode::kReadWrite) ? "write" : "read";
     formats::msgpack::ValueBuilder tuple_args;
@@ -109,9 +117,67 @@ storages::tarantool::Query VshardProxy::BuildStorageCallQuery(
                                              std::move(tuple_args));
 }
 
+storages::tarantool::Query VshardProxy::BuildStorageCallQueryRaw(
+    BucketId bucket_id, impl::CallMode mode, std::string_view func,
+    const uint8_t* args_data, std::size_t args_len) const {
+    // Build the msgpack array [bucket_id, mode_str, func_name, args_array]
+    // manually, copying args_data verbatim — no Value tree constructed.
+    const std::string_view vshard_mode =
+        (mode == impl::CallMode::kReadWrite) ? "write" : "read";
+
+    std::vector<uint8_t> buf;
+    buf.reserve(1 + 5 + 1 + vshard_mode.size() + 1 + func.size() + args_len);
+
+    // fixarray(4)
+    buf.push_back(static_cast<uint8_t>(mp::kFixArrayMin | 4));
+
+    // [0] bucket_id as uint32
+    buf.push_back(mp::kUint32);
+    buf.push_back(static_cast<uint8_t>(bucket_id >> 24));
+    buf.push_back(static_cast<uint8_t>(bucket_id >> 16));
+    buf.push_back(static_cast<uint8_t>(bucket_id >>  8));
+    buf.push_back(static_cast<uint8_t>(bucket_id));
+
+    // [1] mode string (always ≤ 5 chars — fits in fixstr)
+    buf.push_back(static_cast<uint8_t>(mp::kFixStrMin | vshard_mode.size()));
+    buf.insert(buf.end(), vshard_mode.begin(), vshard_mode.end());
+
+    // [2] func name (fixstr or str8)
+    if (func.size() <= 31) {
+        buf.push_back(static_cast<uint8_t>(mp::kFixStrMin | func.size()));
+    } else {
+        buf.push_back(mp::kStr8);
+        buf.push_back(static_cast<uint8_t>(func.size()));
+    }
+    buf.insert(buf.end(),
+               reinterpret_cast<const uint8_t*>(func.data()),
+               reinterpret_cast<const uint8_t*>(func.data()) + func.size());
+
+    // [3] args: already msgpack-encoded value, copy verbatim
+    buf.insert(buf.end(), args_data, args_data + args_len);
+
+    return storages::tarantool::Query::WithRawArgs(
+        storages::tarantool::Query::Type::kCall,
+        "vshard.storage.call",
+        std::move(buf));
+}
+
 formats::msgpack::Value VshardProxy::DoCall(
     BucketId bucket_id, impl::CallMode mode, std::string_view func,
     formats::msgpack::ValueBuilder args,
+    storages::tarantool::OptionalCommandControl cc) {
+
+    if (bucket_id < 1 || bucket_id > calculator_.GetBucketCount()) {
+        throw NoReplicasetError{bucket_id};
+    }
+
+    auto query = BuildStorageCallQuery(bucket_id, mode, func, std::move(args));
+    return DoCallWithQuery(bucket_id, mode, query, cc);
+}
+
+formats::msgpack::Value VshardProxy::DoCallWithQuery(
+    BucketId bucket_id, impl::CallMode mode,
+    const storages::tarantool::Query& query,
     storages::tarantool::OptionalCommandControl cc) {
 
     if (bucket_id < 1 || bucket_id > calculator_.GetBucketCount()) {
@@ -122,9 +188,6 @@ formats::msgpack::Value VshardProxy::DoCall(
     auto snapshot = routing_table_.Read();
     impl::ReplicasetPool* rs = snapshot->FindReplicaset(bucket_id);
     if (!rs) throw NoReplicasetError{bucket_id};
-
-    // Build query once; the args ValueBuilder is consumed on first use.
-    auto query = BuildStorageCallQuery(bucket_id, mode, func, std::move(args));
 
     uint32_t attempt = 0;
     while (true) {

@@ -285,7 +285,88 @@ inline std::size_t SkipValue(const uint8_t* p, std::size_t len, std::size_t pos,
     }
 }
 
+/// Read a msgpack string (fixstr / str8 / str16 / str32) at p[pos].
+/// Returns {string_view into original buffer, pos_after}.
+/// On non-string type or out-of-bounds returns {"", pos+1} (does not abort).
+inline std::pair<std::string_view, std::size_t>
+ReadStr(const uint8_t* p, std::size_t len, std::size_t pos) noexcept {
+    if (pos >= len) return {{}, len};
+    const uint8_t b = p[pos++];
+    std::size_t slen = 0;
+    if ((b & 0xe0u) == mp::kFixStrMin) {
+        slen = b & 0x1fu;
+    } else if (b == mp::kStr8 && pos < len) {
+        slen = p[pos++];
+    } else if (b == mp::kStr16 && pos + 2 <= len) {
+        slen = (std::size_t)p[pos] << 8 | p[pos + 1];
+        pos += 2;
+    } else if (b == mp::kStr32 && pos + 4 <= len) {
+        slen = (std::size_t)p[pos] << 24 | (std::size_t)p[pos + 1] << 16 |
+               (std::size_t)p[pos + 2] << 8 | p[pos + 3];
+        pos += 4;
+    } else {
+        return {{}, pos};  // not a string — skip the type byte already consumed
+    }
+    if (pos + slen > len) return {{}, len};
+    return {std::string_view{reinterpret_cast<const char*>(p + pos), slen}, pos + slen};
+}
+
 }  // namespace msgpack_scan
+
+// ── IPROTO request scanner ────────────────────────────────────────────────────
+
+/// Parsed IPROTO request header.  All pointer fields are into the caller-owned
+/// buffer passed to `ParseIprotoRequest`; no heap allocation is performed.
+struct IprotoRequest {
+    uint64_t sync{0};
+    uint8_t  type{0};
+    const uint8_t* body_begin{nullptr};  ///< first byte of the body map; null for bodyless requests (PING)
+    std::size_t    body_len{0};
+};
+
+/// Scan an IPROTO request payload (after the 5-byte preheader) without
+/// allocating.  Extracts sync and request type from the header map and
+/// records a pointer to the body map for the caller to parse further.
+///
+/// Analogous to ParseIprotoResponse() but for the server-receive direction.
+///
+/// @param p    Pointer to the first byte of the frame (IPROTO header map).
+/// @param len  Number of bytes available from @p p.
+/// @returns    Populated IprotoRequest; on malformed input type == 0.
+[[nodiscard]] inline IprotoRequest
+ParseIprotoRequest(const uint8_t* p, std::size_t len) noexcept {
+    IprotoRequest r{};
+    if (!p || len == 0) return r;
+    std::size_t pos = 0;
+
+    // ── header map: {0x00: type, 0x01: sync, ...} ────────────────────────────
+    if (pos >= len) return r;
+    const uint8_t hb = p[pos++];
+    if ((hb & 0xf0u) != mp::kFixMapMin) return r;  // must be fixmap
+    const int hdr_n = hb & 0x0f;
+    for (int i = 0; i < hdr_n && pos < len; ++i) {
+        auto [k, kp] = msgpack_scan::ReadUint(p, len, pos);
+        pos = kp;
+        if (k == Iproto::REQUEST_TYPE) {
+            auto [v, vp] = msgpack_scan::ReadUint(p, len, pos);
+            pos = vp;
+            r.type = static_cast<uint8_t>(v);
+        } else if (k == Iproto::SYNC) {
+            auto [v, vp] = msgpack_scan::ReadUint(p, len, pos);
+            pos = vp;
+            r.sync = v;
+        } else {
+            pos = msgpack_scan::SkipValue(p, len, pos);
+        }
+    }
+
+    // ── body pointer (may be absent for PING etc.) ────────────────────────────
+    if (pos < len) {
+        r.body_begin = p + pos;
+        r.body_len   = len - pos;
+    }
+    return r;
+}
 
 /// Parse an IPROTO response payload (header map + body map) without allocation.
 ///
