@@ -14,6 +14,7 @@ VshardErrorType ErrorTypeFromCode(uint32_t code) noexcept {
         case 2:  return VshardErrorType::kNonMaster;
         case 7:  return VshardErrorType::kTransfer;
         case 9:  return VshardErrorType::kNoRouteset;  // NO_ROUTE_TO_BUCKET
+        case 22: return VshardErrorType::kBucketIsLocked;
         default: return VshardErrorType::kUnknown;
     }
 }
@@ -25,6 +26,7 @@ VshardErrorType ErrorTypeFromName(const std::string& name) noexcept {
     if (name == "NON_MASTER") return VshardErrorType::kNonMaster;
     if (name == "TRANSFER_IS_IN_PROGRESS") return VshardErrorType::kTransfer;
     if (name == "NO_ROUTE_TO_BUCKET") return VshardErrorType::kNoRouteset;
+    if (name == "BUCKET_IS_LOCKED") return VshardErrorType::kBucketIsLocked;
     return VshardErrorType::kUnknown;
 }
 }  // namespace

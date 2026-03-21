@@ -196,6 +196,24 @@ class VshardProxy final {
 
     void StartRefreshTask();
 
+    /// Return value from HandleVshardError — tells the retry loop what to do.
+    enum class RetryAction {
+        kRetryImmediate,   ///< Re-read routing snapshot and retry
+        kRetrySleep,       ///< Sleep (backoff already done) then retry
+        kThrow,            ///< Error was re-thrown; unreachable
+    };
+
+    /// Shared vshard error handler used by all retry loops.
+    /// Handles WRONG_BUCKET, TRANSFER, BUCKET_IS_LOCKED, NON_MASTER.
+    /// Throws on max retries or unknown error types.
+    /// On retryable errors, updates routing table / sleeps as needed.
+    RetryAction HandleVshardError(
+        const impl::VshardError& err,
+        BucketId bucket_id,
+        uint32_t& attempt,
+        rcu::ReadablePtr<impl::RoutingTable>& snapshot,
+        impl::ReplicasetPool*& rs);
+
     impl::BucketCalculator calculator_;
     VshardProxySettings settings_;              // must be before fetcher_ (ctor init order)
     impl::RoutingTableHolder routing_table_;

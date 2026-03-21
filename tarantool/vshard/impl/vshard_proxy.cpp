@@ -170,6 +170,90 @@ storages::tarantool::Query VshardProxy::BuildStorageCallQueryRaw(
         std::move(buf));
 }
 
+// ---------------------------------------------------------------------------
+// Shared vshard error handler — used by all retry loops
+// ---------------------------------------------------------------------------
+
+VshardProxy::RetryAction VshardProxy::HandleVshardError(
+    const impl::VshardError& err,
+    BucketId bucket_id,
+    uint32_t& attempt,
+    rcu::ReadablePtr<impl::RoutingTable>& snapshot,
+    impl::ReplicasetPool*& rs) {
+
+    // WRONG_BUCKET / BUCKET_IS_LOCKED: bucket migrated or locked during rebalance
+    if (err.IsWrongBucket() || err.IsBucketIsLocked()) {
+        if (attempt >= settings_.max_moved_retries) {
+            throw MovedError{
+                bucket_id,
+                err.destination_uuid.value_or(""),
+                err.message};
+        }
+        ++attempt;
+
+        if (err.destination_uuid.has_value()) {
+            routing_table_.PatchBucketOwner(bucket_id, *err.destination_uuid);
+            snapshot = routing_table_.Read();
+            rs = snapshot->FindReplicaset(bucket_id);
+        }
+
+        if (!err.destination_uuid.has_value() || !rs) {
+            const auto now = std::chrono::steady_clock::now();
+            if (now - last_moved_refresh_ >
+                settings_.moved_refresh_min_interval) {
+                last_moved_refresh_ = now;
+                try {
+                    routing_table_.Assign(fetcher_->RefreshFull());
+                } catch (const std::exception& ex) {
+                    LOG_WARNING() << "vshard MOVED refresh failed: " << ex.what();
+                }
+            }
+            snapshot = routing_table_.Read();
+            rs = snapshot->FindReplicaset(bucket_id);
+            if (!rs) throw NoReplicasetError{bucket_id};
+        }
+        return RetryAction::kRetryImmediate;
+    }
+
+    // TRANSFER: bucket is mid-migration, exponential backoff retry
+    if (err.IsTransfer()) {
+        if (attempt >= settings_.max_moved_retries) {
+            throw TransferError{err.message};
+        }
+        const auto backoff_ms = std::min(50u << attempt, 1000u);
+        ++attempt;
+        engine::SleepFor(std::chrono::milliseconds{backoff_ms});
+        return RetryAction::kRetrySleep;
+    }
+
+    // NON_MASTER: routing table stale — refresh and retry
+    if (err.IsNonMaster()) {
+        if (attempt >= settings_.max_moved_retries) {
+            throw VshardStorageError{err.code, "NON_MASTER", err.message};
+        }
+        ++attempt;
+        try {
+            routing_table_.Assign(fetcher_->RefreshFull());
+        } catch (const std::exception& ex) {
+            LOG_WARNING() << "vshard NON_MASTER refresh failed: " << ex.what();
+        }
+        snapshot = routing_table_.Read();
+        rs = snapshot->FindReplicaset(bucket_id);
+        if (!rs) throw NoReplicasetError{bucket_id};
+        return RetryAction::kRetryImmediate;
+    }
+
+    // Unknown vshard error — throw immediately
+    throw VshardStorageError{
+        err.code,
+        std::to_string(static_cast<uint32_t>(err.type)),
+        err.message};
+}
+
+// ---------------------------------------------------------------------------
+// Core call implementations
+// ---------------------------------------------------------------------------
+
 formats::msgpack::Value VshardProxy::DoCall(
     BucketId bucket_id, impl::CallMode mode, std::string_view func,
     formats::msgpack::ValueBuilder args,
@@ -221,81 +305,8 @@ formats::msgpack::Value VshardProxy::DoCallWithQuery(
             return env.app_result;
         }
 
-        // MOVED: bucket migrated to another replicaset, or routing table wrong
-        if (env.vshard_error.IsWrongBucket()) {
-            if (attempt >= settings_.max_moved_retries) {
-                throw MovedError{
-                    bucket_id,
-                    env.vshard_error.destination_uuid.value_or(""),
-                    env.vshard_error.message};
-            }
-            ++attempt;
-
-            // Apply fast local patch if destination is known
-            if (env.vshard_error.destination_uuid.has_value()) {
-                const auto& dest = *env.vshard_error.destination_uuid;
-                routing_table_.PatchBucketOwner(bucket_id, dest);
-                snapshot = routing_table_.Read();
-                rs = snapshot->FindReplicaset(bucket_id);
-            }
-
-            // No destination UUID means our routing table is simply wrong
-            // (e.g. static config assigned wrong RS to this bucket range).
-            // Always trigger a live-probe refresh in this case.
-            if (!env.vshard_error.destination_uuid.has_value() || !rs) {
-                const auto now = std::chrono::steady_clock::now();
-                if (now - last_moved_refresh_ >
-                    settings_.moved_refresh_min_interval) {
-                    last_moved_refresh_ = now;
-                    try {
-                        routing_table_.Assign(fetcher_->RefreshFull());
-                    } catch (const std::exception& ex) {
-                        LOG_WARNING() << "vshard MOVED refresh failed: " << ex.what();
-                    }
-                }
-                // Always re-read: once one fiber triggers RefreshFull all
-                // rate-limited fibers also pick up the updated routing table.
-                snapshot = routing_table_.Read();
-                rs = snapshot->FindReplicaset(bucket_id);
-                if (!rs) throw NoReplicasetError{bucket_id};
-            }
-            continue;  // retry
-        }
-
-        // TRANSFER: bucket is mid-migration, short backoff retry
-        if (env.vshard_error.IsTransfer()) {
-            if (attempt >= settings_.max_moved_retries) {
-                throw TransferError{env.vshard_error.message};
-            }
-            ++attempt;
-            engine::SleepFor(std::chrono::milliseconds{100});
-            continue;
-        }
-
-        // NON_MASTER: our routing table is stale — update and retry once
-        if (env.vshard_error.IsNonMaster()) {
-            if (attempt >= settings_.max_moved_retries) {
-                throw VshardStorageError{
-                    env.vshard_error.code, "NON_MASTER",
-                    env.vshard_error.message};
-            }
-            ++attempt;
-            try {
-                routing_table_.Assign(fetcher_->RefreshFull());
-            } catch (const std::exception& ex) {
-                LOG_WARNING() << "vshard NON_MASTER refresh failed: " << ex.what();
-            }
-            snapshot = routing_table_.Read();
-            rs = snapshot->FindReplicaset(bucket_id);
-            if (!rs) throw NoReplicasetError{bucket_id};
-            continue;
-        }
-
-        // Any other vshard error
-        throw VshardStorageError{
-            env.vshard_error.code,
-            std::to_string(static_cast<uint32_t>(env.vshard_error.type)),
-            env.vshard_error.message};
+        HandleVshardError(env.vshard_error, bucket_id, attempt, snapshot, rs);
+        // All retryable cases return here; throws handle the rest.
     }
 }
 
@@ -336,60 +347,7 @@ std::vector<uint8_t> VshardProxy::DoCallRawBytes(
             return std::move(env.app_result_bytes);
         }
 
-        // Routing error — same retry logic as DoCallWithQuery
-        if (env.vshard_error.IsWrongBucket()) {
-            if (attempt >= settings_.max_moved_retries) {
-                throw MovedError{
-                    bucket_id,
-                    env.vshard_error.destination_uuid.value_or(""),
-                    env.vshard_error.message};
-            }
-            ++attempt;
-            if (env.vshard_error.destination_uuid.has_value()) {
-                const auto& dest = *env.vshard_error.destination_uuid;
-                routing_table_.PatchBucketOwner(bucket_id, dest);
-                snapshot = routing_table_.Read();
-                rs = snapshot->FindReplicaset(bucket_id);
-            }
-            if (!env.vshard_error.destination_uuid.has_value() || !rs) {
-                const auto now = std::chrono::steady_clock::now();
-                if (now - last_moved_refresh_ > settings_.moved_refresh_min_interval) {
-                    last_moved_refresh_ = now;
-                    try { routing_table_.Assign(fetcher_->RefreshFull()); }
-                    catch (const std::exception& ex) {
-                        LOG_WARNING() << "vshard MOVED refresh failed: " << ex.what();
-                    }
-                }
-                snapshot = routing_table_.Read();
-                rs = snapshot->FindReplicaset(bucket_id);
-                if (!rs) throw NoReplicasetError{bucket_id};
-            }
-            continue;
-        }
-        if (env.vshard_error.IsTransfer()) {
-            if (attempt >= settings_.max_moved_retries) throw TransferError{env.vshard_error.message};
-            ++attempt;
-            engine::SleepFor(std::chrono::milliseconds{100});
-            continue;
-        }
-        if (env.vshard_error.IsNonMaster()) {
-            if (attempt >= settings_.max_moved_retries) {
-                throw VshardStorageError{env.vshard_error.code, "NON_MASTER", env.vshard_error.message};
-            }
-            ++attempt;
-            try { routing_table_.Assign(fetcher_->RefreshFull()); }
-            catch (const std::exception& ex) {
-                LOG_WARNING() << "vshard NON_MASTER refresh failed: " << ex.what();
-            }
-            snapshot = routing_table_.Read();
-            rs = snapshot->FindReplicaset(bucket_id);
-            if (!rs) throw NoReplicasetError{bucket_id};
-            continue;
-        }
-        throw VshardStorageError{
-            env.vshard_error.code,
-            std::to_string(static_cast<uint32_t>(env.vshard_error.type)),
-            env.vshard_error.message};
+        HandleVshardError(env.vshard_error, bucket_id, attempt, snapshot, rs);
     }
 }
 
@@ -437,75 +395,7 @@ formats::msgpack::Value VshardProxy::ForwardCall(
             return env.app_result;
         }
 
-        if (env.vshard_error.IsWrongBucket()) {
-            if (attempt >= settings_.max_moved_retries) {
-                throw MovedError{
-                    bucket_id,
-                    env.vshard_error.destination_uuid.value_or(""),
-                    env.vshard_error.message};
-            }
-            ++attempt;
-
-            if (env.vshard_error.destination_uuid.has_value()) {
-                routing_table_.PatchBucketOwner(
-                    bucket_id, *env.vshard_error.destination_uuid);
-                snapshot = routing_table_.Read();
-                rs = snapshot->FindReplicaset(bucket_id);
-            }
-
-            if (!env.vshard_error.destination_uuid.has_value() || !rs) {
-                const auto now = std::chrono::steady_clock::now();
-                if (now - last_moved_refresh_ >
-                    settings_.moved_refresh_min_interval) {
-                    last_moved_refresh_ = now;
-                    try {
-                        routing_table_.Assign(fetcher_->RefreshFull());
-                    } catch (const std::exception& ex) {
-                        LOG_WARNING() << "vshard MOVED refresh failed: "
-                                      << ex.what();
-                    }
-                }
-                // Always re-read: once one fiber triggers RefreshFull all
-                // rate-limited fibers also get the updated routing table.
-                snapshot = routing_table_.Read();
-                rs = snapshot->FindReplicaset(bucket_id);
-                if (!rs) throw NoReplicasetError{bucket_id};
-            }
-            continue;
-        }
-
-        if (env.vshard_error.IsTransfer()) {
-            if (attempt >= settings_.max_moved_retries) {
-                throw TransferError{env.vshard_error.message};
-            }
-            ++attempt;
-            engine::SleepFor(std::chrono::milliseconds{100});
-            continue;
-        }
-
-        if (env.vshard_error.IsNonMaster()) {
-            if (attempt >= settings_.max_moved_retries) {
-                throw VshardStorageError{
-                    env.vshard_error.code, "NON_MASTER",
-                    env.vshard_error.message};
-            }
-            ++attempt;
-            try {
-                routing_table_.Assign(fetcher_->RefreshFull());
-            } catch (const std::exception& ex) {
-                LOG_WARNING() << "vshard NON_MASTER refresh failed: "
-                              << ex.what();
-            }
-            snapshot = routing_table_.Read();
-            rs = snapshot->FindReplicaset(bucket_id);
-            if (!rs) throw NoReplicasetError{bucket_id};
-            continue;
-        }
-
-        throw VshardStorageError{
-            env.vshard_error.code,
-            std::to_string(static_cast<uint32_t>(env.vshard_error.type)),
-            env.vshard_error.message};
+        HandleVshardError(env.vshard_error, bucket_id, attempt, snapshot, rs);
     }
 }
 
@@ -558,75 +448,7 @@ formats::msgpack::Value VshardProxy::ForwardVshardCall(
             return env.app_result;
         }
 
-        if (env.vshard_error.IsWrongBucket()) {
-            if (attempt >= settings_.max_moved_retries) {
-                throw MovedError{
-                    bucket_id,
-                    env.vshard_error.destination_uuid.value_or(""),
-                    env.vshard_error.message};
-            }
-            ++attempt;
-
-            if (env.vshard_error.destination_uuid.has_value()) {
-                routing_table_.PatchBucketOwner(
-                    bucket_id, *env.vshard_error.destination_uuid);
-                snapshot = routing_table_.Read();
-                rs = snapshot->FindReplicaset(bucket_id);
-            }
-
-            if (!env.vshard_error.destination_uuid.has_value() || !rs) {
-                const auto now = std::chrono::steady_clock::now();
-                if (now - last_moved_refresh_ >
-                    settings_.moved_refresh_min_interval) {
-                    last_moved_refresh_ = now;
-                    try {
-                        routing_table_.Assign(fetcher_->RefreshFull());
-                    } catch (const std::exception& ex) {
-                        LOG_WARNING() << "vshard MOVED refresh failed: "
-                                      << ex.what();
-                    }
-                }
-                // Always re-read: once one fiber triggers RefreshFull all
-                // rate-limited fibers also get the updated routing table.
-                snapshot = routing_table_.Read();
-                rs = snapshot->FindReplicaset(bucket_id);
-                if (!rs) throw NoReplicasetError{bucket_id};
-            }
-            continue;
-        }
-
-        if (env.vshard_error.IsTransfer()) {
-            if (attempt >= settings_.max_moved_retries) {
-                throw TransferError{env.vshard_error.message};
-            }
-            ++attempt;
-            engine::SleepFor(std::chrono::milliseconds{100});
-            continue;
-        }
-
-        if (env.vshard_error.IsNonMaster()) {
-            if (attempt >= settings_.max_moved_retries) {
-                throw VshardStorageError{
-                    env.vshard_error.code, "NON_MASTER",
-                    env.vshard_error.message};
-            }
-            ++attempt;
-            try {
-                routing_table_.Assign(fetcher_->RefreshFull());
-            } catch (const std::exception& ex) {
-                LOG_WARNING() << "vshard NON_MASTER refresh failed: "
-                              << ex.what();
-            }
-            snapshot = routing_table_.Read();
-            rs = snapshot->FindReplicaset(bucket_id);
-            if (!rs) throw NoReplicasetError{bucket_id};
-            continue;
-        }
-
-        throw VshardStorageError{
-            env.vshard_error.code,
-            std::to_string(static_cast<uint32_t>(env.vshard_error.type)),
-            env.vshard_error.message};
+        HandleVshardError(env.vshard_error, bucket_id, attempt, snapshot, rs);
     }
 }
 

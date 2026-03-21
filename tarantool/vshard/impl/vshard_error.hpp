@@ -20,6 +20,7 @@ enum class VshardErrorType : uint32_t {
     kNonMaster  = 2,    ///< Request reached a replica, not the master
     kTransfer   = 7,    ///< Bucket is mid-transfer
     kNoRouteset = 9,    ///< No route to bucket (NO_ROUTE_TO_BUCKET)
+    kBucketIsLocked = 22, ///< Bucket is locked (e.g. during rebalancing)
 };
 
 /// Structured vshard error object from the response envelope second element.
@@ -42,6 +43,14 @@ struct VshardError {
     }
     bool IsTransfer() const noexcept {
         return type == VshardErrorType::kTransfer;
+    }
+    bool IsBucketIsLocked() const noexcept {
+        return type == VshardErrorType::kBucketIsLocked;
+    }
+    /// Returns true for any error that means "bucket not available here,
+    /// reset route and retry": WRONG_BUCKET, TRANSFER, BUCKET_IS_LOCKED.
+    bool IsBucketRetryable() const noexcept {
+        return IsWrongBucket() || IsTransfer() || IsBucketIsLocked();
     }
 };
 
