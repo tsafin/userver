@@ -72,10 +72,15 @@ class TopologyFetcher final {
     /// Build initial routing table from static config only (no RPCs).
     RoutingTable BuildFromConfig();
 
-    /// Refresh routing by querying vshard.storage.bucket_stat for every bucket
-    /// whose owner has sent MOVED to an unknown destination.
+    /// Refresh the full routing table by calling
+    /// `vshard.storage.buckets_discovery` on each RS master iteratively.
     /// On failure, logs a warning and returns the config-built table.
     RoutingTable RefreshFull();
+
+    /// Discover which RS owns a specific bucket by calling
+    /// `vshard.storage.bucket_stat` on each RS master.
+    /// Returns the 1-based RS index, or 0 if no RS claims the bucket.
+    uint16_t DiscoverBucket(uint32_t bucket_id);
 
  private:
     clients::dns::Resolver& resolver_;

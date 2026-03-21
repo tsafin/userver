@@ -9,7 +9,6 @@
 
 #include <storages/tarantool/impl/pool.hpp>
 #include <storages/tarantool/impl/settings.hpp>
-#include <vshard/impl/vshard_envelope.hpp>
 
 USERVER_NAMESPACE_BEGIN
 
@@ -148,91 +147,159 @@ RoutingTable TopologyFetcher::BuildFromConfig() {
 }
 
 /// Probe a single bucket on a ReplicasetPool master by calling
-/// vshard.storage.call(bucket_id, 'read', 'echo', {}).
+/// vshard.storage.bucket_stat({bucket_id}).
 /// Returns true if the RS owns the bucket (no WRONG_BUCKET response).
 static bool ProbesBucket(ReplicasetPool& rs_pool, uint32_t bucket_id) {
     try {
         auto args_b = formats::msgpack::ValueBuilder::Array();
         args_b.PushBack(formats::msgpack::ValueBuilder{
             static_cast<uint64_t>(bucket_id)});
-        args_b.PushBack(formats::msgpack::ValueBuilder{std::string{"read"}});
-        args_b.PushBack(formats::msgpack::ValueBuilder{std::string{"echo"}});
-        args_b.PushBack(formats::msgpack::ValueBuilder::Array());
 
         const auto raw = rs_pool.Execute(
             CallMode::kReadWrite,
-            storages::tarantool::Query::Call("vshard.storage.call",
+            storages::tarantool::Query::Call("vshard.storage.bucket_stat",
                                               std::move(args_b)));
 
-        const auto env = DecodeEnvelope(raw);
-        if (env.vshard_error.IsNull()) return true;
-        return !env.vshard_error.IsWrongBucket();
+        // bucket_stat returns [stat, err].  If stat is non-nil the bucket is
+        // on this RS.  If err has code WRONG_BUCKET, it's elsewhere.
+        const auto& data = raw.GetData();
+        if (data.IsArray() && data.GetSize() >= 1 && !data[0].IsMissing() &&
+            !data[0].IsNull()) {
+            return true;
+        }
+        return false;
     } catch (...) {
         return false;
     }
 }
 
+/// Call `vshard.storage.buckets_discovery({from=N})` on a single RS master.
+/// Returns the list of active/pinned bucket IDs owned by this RS.
+/// Uses pagination: repeats with next_from until all buckets are collected.
+static std::vector<uint32_t> DiscoverBucketsOnRS(ReplicasetPool& rs_pool) {
+    std::vector<uint32_t> result;
+    uint64_t from = 1;
+
+    for (int page = 0; page < 1000; ++page) {  // safety limit
+        try {
+            // Build args: [{from = N}]
+            auto opts_map = formats::msgpack::ValueBuilder::Object();
+            opts_map["from"] = formats::msgpack::ValueBuilder{from};
+            auto args_b = formats::msgpack::ValueBuilder::Array();
+            args_b.PushBack(std::move(opts_map));
+
+            const auto raw = rs_pool.Execute(
+                CallMode::kReadWrite,
+                storages::tarantool::Query::Call(
+                    "vshard.storage.buckets_discovery", std::move(args_b)));
+
+            const auto& data = raw.GetData();
+            // Response is a single-element array wrapping the return value:
+            // [[{buckets=[...], next_from=N|nil}]]
+            // data[0] is the map {buckets, next_from}
+            if (!data.IsArray() || data.GetSize() < 1) break;
+
+            const auto& resp = data[0];
+
+            // Extract buckets array
+            const auto& buckets_val = resp["buckets"];
+            if (!buckets_val.IsMissing() && buckets_val.IsArray()) {
+                const auto sz = buckets_val.GetSize();
+                result.reserve(result.size() + sz);
+                for (std::size_t i = 0; i < sz; ++i) {
+                    result.push_back(buckets_val[i].As<uint32_t>());
+                }
+            } else {
+                // Old-style response: plain array of bucket IDs (no .buckets key)
+                if (resp.IsArray()) {
+                    const auto sz = resp.GetSize();
+                    result.reserve(result.size() + sz);
+                    for (std::size_t i = 0; i < sz; ++i) {
+                        result.push_back(resp[i].As<uint32_t>());
+                    }
+                }
+                break;  // old-style has no pagination
+            }
+
+            // Check next_from for pagination
+            const auto& next_from_val = resp["next_from"];
+            if (next_from_val.IsMissing() || next_from_val.IsNull()) {
+                break;  // no more buckets
+            }
+            from = next_from_val.As<uint64_t>();
+        } catch (const std::exception& ex) {
+            LOG_WARNING() << "TopologyFetcher: buckets_discovery on RS failed: "
+                          << ex.what();
+            break;
+        }
+    }
+
+    return result;
+}
+
 RoutingTable TopologyFetcher::RefreshFull() {
-    // Probe bucket 1 on each RS master to discover the actual bucket allocation.
-    // vshard bootstrap assigns even ranges but the first RS in the config might
-    // not own buckets 1..N/2 — this probe resolves the actual assignment.
     const auto num_rs = static_cast<uint32_t>(pools_.size());
     if (num_rs == 0) {
         LOG_WARNING() << "TopologyFetcher::RefreshFull: no pools, using config";
         return BuildFromConfig();
     }
 
-    // Probe each RS master with the first and the mid-point bucket.
-    // This is sufficient to determine a simple contiguous-range split.
-    const uint32_t mid = config_.bucket_count / 2 + 1;
-    std::vector<uint32_t> rs_min_bucket(num_rs, 0);  // 0 = unknown
-
-    for (uint32_t i = 0; i < num_rs; ++i) {
-        auto& rs_pool = *pools_[i];
-        if (ProbesBucket(rs_pool, 1)) {
-            rs_min_bucket[i] = 1;
-        } else if (ProbesBucket(rs_pool, mid)) {
-            rs_min_bucket[i] = mid;
-        }
-    }
-
-    // Build routing table from probe results.
+    // Query each RS master with vshard.storage.buckets_discovery to get
+    // the full list of active/pinned buckets it owns.
     RoutingTable table;
     table.bucket_count = config_.bucket_count;
     table.bucket_to_rs.assign(config_.bucket_count, 0);
     table.replicasets = pools_;
 
-    bool any_probed = false;
+    uint32_t discovered = 0;
     for (uint32_t i = 0; i < num_rs; ++i) {
-        if (rs_min_bucket[i] == 0) continue;
-        any_probed = true;
-        // Assign the RS's half of the bucket space.
-        const uint32_t start = rs_min_bucket[i];
-        const uint32_t end   = start + config_.bucket_count / num_rs - 1;
+        const auto buckets = DiscoverBucketsOnRS(*pools_[i]);
         const uint16_t rs_idx = static_cast<uint16_t>(i + 1);
-        for (uint32_t b = start; b <= end && b <= config_.bucket_count; ++b) {
-            table.bucket_to_rs[b - 1] = rs_idx;
+        for (const auto bid : buckets) {
+            if (bid >= 1 && bid <= config_.bucket_count) {
+                table.bucket_to_rs[bid - 1] = rs_idx;
+                ++discovered;
+            }
         }
+        LOG_INFO() << "TopologyFetcher::RefreshFull: RS " << (i + 1)
+                   << " reports " << buckets.size() << " buckets";
     }
 
-    if (!any_probed) {
-        LOG_WARNING() << "TopologyFetcher::RefreshFull: probes all failed, "
-                         "falling back to static config";
+    if (discovered == 0) {
+        LOG_WARNING() << "TopologyFetcher::RefreshFull: no buckets discovered "
+                         "from any RS, falling back to static config";
         return BuildFromConfig();
     }
 
-    // Fill any gaps left by failed probes using BuildFromConfig distribution.
+    // Fill gaps for any undiscovered buckets using static config distribution.
+    // This handles buckets in SENDING/RECEIVING state that aren't reported by
+    // buckets_discovery.
+    uint32_t gaps = 0;
     for (uint32_t b = 0; b < config_.bucket_count; ++b) {
         if (table.bucket_to_rs[b] == 0) {
-            const uint32_t rs_idx = b / (config_.bucket_count / num_rs) + 1;
-            table.bucket_to_rs[b] =
-                static_cast<uint16_t>(std::min(rs_idx, num_rs));
+            ++gaps;
         }
     }
 
-    LOG_INFO() << "TopologyFetcher::RefreshFull: probed routing table for "
-               << config_.bucket_count << " buckets across " << num_rs << " RS";
+    if (gaps > 0) {
+        LOG_INFO() << "TopologyFetcher::RefreshFull: " << gaps
+                   << " buckets not discovered (in transit?), leaving unmapped";
+    }
+
+    LOG_INFO() << "TopologyFetcher::RefreshFull: discovered " << discovered
+               << "/" << config_.bucket_count << " buckets across " << num_rs
+               << " RS";
     return table;
+}
+
+uint16_t TopologyFetcher::DiscoverBucket(uint32_t bucket_id) {
+    const auto num_rs = static_cast<uint32_t>(pools_.size());
+    for (uint32_t i = 0; i < num_rs; ++i) {
+        if (ProbesBucket(*pools_[i], bucket_id)) {
+            return static_cast<uint16_t>(i + 1);
+        }
+    }
+    return 0;
 }
 
 }  // namespace storages::tarantool::vshard::impl
