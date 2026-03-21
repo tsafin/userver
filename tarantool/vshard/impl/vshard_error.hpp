@@ -15,11 +15,11 @@ namespace storages::tarantool::vshard::impl {
 
 /// vshard error types as defined in vshard/error.lua
 enum class VshardErrorType : uint32_t {
-    kUnknown = 0,
-    kWrongBucket = 32,   ///< Bucket has moved; destination may be in message
-    kNonMaster  = 40,   ///< Request reached a replica, not the master
-    kTransfer   = 33,   ///< Bucket is mid-transfer
-    kNoRouteset = 24,   ///< No replicaset owns this bucket
+    kUnknown    = 0,
+    kWrongBucket = 1,   ///< Bucket is on another replicaset; destination may be in message
+    kNonMaster  = 2,    ///< Request reached a replica, not the master
+    kTransfer   = 7,    ///< Bucket is mid-transfer
+    kNoRouteset = 9,    ///< No route to bucket (NO_ROUTE_TO_BUCKET)
 };
 
 /// Structured vshard error object from the response envelope second element.
