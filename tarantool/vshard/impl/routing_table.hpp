@@ -77,6 +77,10 @@ class RoutingTableHolder final {
     /// Applies the patch on the current table via StartWrite/Commit.
     void PatchBucketOwner(uint32_t bucket_id, const std::string& dest_uuid);
 
+    /// Atomic single-bucket update by RS index (1-based).
+    /// Used by on-demand bucket discovery when we already know the RS index.
+    void PatchBucketOwnerByIndex(uint32_t bucket_id, uint16_t rs_idx);
+
  private:
     rcu::Variable<RoutingTable> var_;
 };

@@ -251,6 +251,32 @@ VshardProxy::RetryAction VshardProxy::HandleVshardError(
 }
 
 // ---------------------------------------------------------------------------
+// ResolveReplicaset: FindReplicaset + on-demand DiscoverBucket fallback
+// ---------------------------------------------------------------------------
+
+impl::ReplicasetPool* VshardProxy::ResolveReplicaset(
+    BucketId bucket_id,
+    rcu::ReadablePtr<impl::RoutingTable>& snapshot) {
+
+    auto* rs = snapshot->FindReplicaset(bucket_id);
+    if (rs) return rs;
+
+    // Bucket has no known owner — probe all RS masters with bucket_stat
+    LOG_INFO() << "vshard bucket " << bucket_id
+               << " has no route, running on-demand discovery";
+
+    const auto rs_idx = fetcher_->DiscoverBucket(bucket_id);
+    if (rs_idx == 0) return nullptr;
+
+    // Update the routing table using RCU write
+    routing_table_.PatchBucketOwnerByIndex(bucket_id, rs_idx);
+
+    // Re-read the snapshot so the caller sees the updated table
+    snapshot = routing_table_.Read();
+    return snapshot->FindReplicaset(bucket_id);
+}
+
+// ---------------------------------------------------------------------------
 // Core call implementations
 // ---------------------------------------------------------------------------
 
@@ -276,9 +302,9 @@ formats::msgpack::Value VshardProxy::DoCallWithQuery(
         throw NoReplicasetError{bucket_id};
     }
 
-    // Snapshot routing table (lock-free read)
+    // Snapshot routing table (lock-free read), with on-demand discovery
     auto snapshot = routing_table_.Read();
-    impl::ReplicasetPool* rs = snapshot->FindReplicaset(bucket_id);
+    impl::ReplicasetPool* rs = ResolveReplicaset(bucket_id, snapshot);
     if (!rs) throw NoReplicasetError{bucket_id};
 
     uint32_t attempt = 0;
@@ -320,7 +346,7 @@ std::vector<uint8_t> VshardProxy::DoCallRawBytes(
     }
 
     auto snapshot = routing_table_.Read();
-    impl::ReplicasetPool* rs = snapshot->FindReplicaset(bucket_id);
+    impl::ReplicasetPool* rs = ResolveReplicaset(bucket_id, snapshot);
     if (!rs) throw NoReplicasetError{bucket_id};
 
     uint32_t attempt = 0;
@@ -369,7 +395,7 @@ formats::msgpack::Value VshardProxy::ForwardCall(
     }
 
     auto snapshot = routing_table_.Read();
-    impl::ReplicasetPool* rs = snapshot->FindReplicaset(bucket_id);
+    impl::ReplicasetPool* rs = ResolveReplicaset(bucket_id, snapshot);
     if (!rs) throw NoReplicasetError{bucket_id};
 
     uint32_t attempt = 0;
@@ -422,7 +448,7 @@ formats::msgpack::Value VshardProxy::ForwardVshardCall(
     }
 
     auto snapshot = routing_table_.Read();
-    impl::ReplicasetPool* rs = snapshot->FindReplicaset(bucket_id);
+    impl::ReplicasetPool* rs = ResolveReplicaset(bucket_id, snapshot);
     if (!rs) throw NoReplicasetError{bucket_id};
 
     uint32_t attempt = 0;

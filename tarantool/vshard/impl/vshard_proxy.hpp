@@ -214,6 +214,14 @@ class VshardProxy final {
         rcu::ReadablePtr<impl::RoutingTable>& snapshot,
         impl::ReplicasetPool*& rs);
 
+    /// Find the replicaset for a bucket. If the routing table has no mapping
+    /// (bucket_to_rs == 0), probe all RS masters with bucket_stat to discover
+    /// the owner on-demand, update the routing table, and return the pool.
+    /// Returns nullptr only if truly no RS owns the bucket.
+    impl::ReplicasetPool* ResolveReplicaset(
+        BucketId bucket_id,
+        rcu::ReadablePtr<impl::RoutingTable>& snapshot);
+
     impl::BucketCalculator calculator_;
     VshardProxySettings settings_;              // must be before fetcher_ (ctor init order)
     impl::RoutingTableHolder routing_table_;

@@ -15,6 +15,13 @@ void RoutingTableHolder::PatchBucketOwner(uint32_t bucket_id,
     writer.Commit();
 }
 
+void RoutingTableHolder::PatchBucketOwnerByIndex(uint32_t bucket_id,
+                                                  uint16_t rs_idx) {
+    auto writer = var_.StartWrite();
+    writer->UpdateBucketOwner(bucket_id, rs_idx);
+    writer.Commit();
+}
+
 }  // namespace storages::tarantool::vshard::impl
 
 USERVER_NAMESPACE_END
