@@ -369,6 +369,22 @@ static CallMode ModeFromString(std::string_view s) noexcept {
     return CallMode::kReadOnly;  // "read" or any other value
 }
 
+/// Resolve the final CallMode from base mode + prefer_replica + balance flags.
+/// This matches the Lua vshard wrapper dispatch:
+///   callro  = read, false, false → kReadOnly
+///   callbro = read, false, true  → kBestReadOnly
+///   callre  = read, true,  false → kReadOnly (prefer_replica, master fallback)
+///   callbre = read, true,  true  → kBestReadOnlyError
+static CallMode ResolveCallMode(CallMode base, bool prefer_replica,
+                                bool balance) noexcept {
+    if (base == CallMode::kReadWrite) return CallMode::kReadWrite;
+    // Read modes: resolve based on flags
+    if (prefer_replica && balance) return CallMode::kBestReadOnlyError;
+    if (balance) return CallMode::kBestReadOnly;
+    // prefer_replica alone or plain read → kReadOnly (replicas with master fallback)
+    return CallMode::kReadOnly;
+}
+
 /// Parse the TUPLE array from a vshard.router.callrw/callro/etc request.
 /// Format: [bucket_id, func_name, args_array]
 static std::optional<VshardRouterArgs>
@@ -451,6 +467,10 @@ ParseVshardRouterCallArgs(const uint8_t* p, std::size_t len) noexcept {
     out.args_len = static_cast<std::size_t>((p + pos) - out.args_begin);
 
     // 5. opts (optional) — ignored for now, would carry timeout etc.
+
+    // Resolve final CallMode from base mode + prefer_replica + balance flags
+    out.mode = ResolveCallMode(out.mode, out.prefer_replica, out.balance);
+
     return out;
 }
 
@@ -610,9 +630,9 @@ static void HandleConnection(engine::io::Socket sock,
                 } else if (body->func_name == "vshard.router.callbro") {
                     mode = CallMode::kBestReadOnly;
                 } else if (body->func_name == "vshard.router.callre") {
-                    mode = CallMode::kReadOnly;  // TODO: kPreferReplica (Fix 3)
+                    mode = CallMode::kReadOnly;  // prefer_replica=true, master fallback
                 } else if (body->func_name == "vshard.router.callbre") {
-                    mode = CallMode::kBestReadOnlyError;
+                    mode = CallMode::kBestReadOnlyError;  // prefer_replica + balance
                 } else if (body->func_name == "vshard.router.call") {
                     is_generic_call = true;
                 } else {
