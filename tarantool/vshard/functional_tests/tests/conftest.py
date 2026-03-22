@@ -191,6 +191,22 @@ def _stop_example_cluster(example_dir):
         _run_tarantoolctl(example_dir, 'stop', instance, check=False)
 
 
+def _cluster_nodes_up(example_dir):
+    """Detect a preexisting example cluster via tarantoolctl status."""
+    instances = [
+        'storage_1_a.lua',
+        'storage_2_a.lua',
+        'router_1.lua',
+    ]
+    for instance in instances:
+        result = _run_tarantoolctl(
+            example_dir, 'status', instance, check=False
+        )
+        if result.returncode != 0:
+            return False
+    return True
+
+
 @pytest.fixture(scope='session')
 def vshard_example_dir(request):
     """Path to the local vshard example directory used for test cluster startup."""
@@ -230,11 +246,14 @@ def cluster_tmpdir(tmp_path_factory):
 def vshard_cluster(vshard_example_dir, cluster_ports, cluster_tmpdir):
     """Start the local vshard example cluster via `make start`.
 
-    Yields connection info and always tears the cluster down with `make stop`.
+    Reuses a preexisting ready cluster when one is already running.
+    Otherwise starts the cluster and tears it down on fixture exit.
     """
     ports = cluster_ports
-    _stop_example_cluster(vshard_example_dir)
-    _start_example_cluster(vshard_example_dir)
+    reuse_existing = _cluster_nodes_up(vshard_example_dir)
+    if not reuse_existing:
+        _stop_example_cluster(vshard_example_dir)
+        _start_example_cluster(vshard_example_dir)
 
     for name, port in ports.items():
         if name == 'cpp_proxy':
@@ -251,9 +270,11 @@ def vshard_cluster(vshard_example_dir, cluster_ports, cluster_tmpdir):
         'tmpdir': cluster_tmpdir,
         'example_dir': vshard_example_dir,
         'bucket_count': BUCKET_COUNT,
+        'reused_existing': reuse_existing,
     }
 
-    _stop_example_cluster(vshard_example_dir)
+    if not reuse_existing:
+        _stop_example_cluster(vshard_example_dir)
 
 
 @pytest.fixture(scope='session')
