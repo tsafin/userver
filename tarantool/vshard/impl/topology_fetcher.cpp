@@ -331,15 +331,14 @@ TopologyFetcher::BucketDiscoveryResult TopologyFetcher::DiscoverBucket(
             case BucketProbeStatus::kBackoff:
                 break;
             case BucketProbeStatus::kUnreachableReplicaset:
+                result.unreachable = true;
                 result.unreachable_replicaset_id = pools_[i]->GetUuid();
-                if (result.error_message.empty()) {
-                    result.error_message = probe.error_message;
-                }
+                result.error_message = probe.error_message;
                 break;
             case BucketProbeStatus::kOtherError:
-                if (result.error_message.empty()) {
-                    result.error_message = probe.error_message;
-                }
+                result.unreachable = false;
+                result.unreachable_replicaset_id.clear();
+                result.error_message = probe.error_message;
                 break;
         }
     }

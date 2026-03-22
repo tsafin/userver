@@ -68,10 +68,11 @@ class TopologyFetcher final {
         uint16_t rs_idx{0};
         std::string unreachable_replicaset_id;
         std::string error_message;
+        bool unreachable{false};
 
         bool HasOwner() const noexcept { return rs_idx != 0; }
         bool HasUnreachableReplicaset() const noexcept {
-            return !unreachable_replicaset_id.empty();
+            return unreachable;
         }
         bool HasOtherError() const noexcept { return !error_message.empty(); }
     };
