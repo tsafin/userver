@@ -205,6 +205,8 @@ class VshardProxy final {
 
     SyncResult Sync(double timeout_seconds);
 
+    formats::msgpack::Value GetInfo(bool with_services);
+
     /// Resolve a bucket to its current replicaset UUID.
     std::string Route(BucketId bucket_id);
 

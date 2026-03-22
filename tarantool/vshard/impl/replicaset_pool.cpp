@@ -135,6 +135,19 @@ bool ReplicasetPool::IsAvailable() const {
     return false;
 }
 
+bool ReplicasetPool::IsMasterAvailable() const {
+    return master_ && master_->IsAvailable();
+}
+
+bool ReplicasetPool::HasReplica() const {
+    return !replicas_.empty();
+}
+
+bool ReplicasetPool::IsReplicaAvailable() const {
+    if (replicas_.empty()) return false;
+    return replicas_.front() && replicas_.front()->IsAvailable();
+}
+
 void ReplicasetPool::WriteStatistics(utils::statistics::Writer& writer) const {
     auto rs_writer = writer[uuid_];
     if (master_) {

@@ -350,6 +350,58 @@ class TestRoute:
             )
 
 
+class TestInfo:
+    """vshard.router.info."""
+
+    def test_info_matches_lua_on_stable_fields(self, lua_conn, cpp_conn):
+        lua_result = lua_conn.call('vshard.router.info', [])
+        cpp_result = cpp_conn.call('vshard.router.info', [])
+
+        lua_info = lua_result.data[0]
+        cpp_info = cpp_result.data[0]
+
+        assert cpp_info['bucket'] == lua_info['bucket']
+        assert cpp_info['identification_mode'] == lua_info['identification_mode']
+        assert cpp_info['is_enabled'] == lua_info['is_enabled']
+        assert set(cpp_info['replicasets'].keys()) == set(lua_info['replicasets'].keys())
+
+        for rs_uuid in lua_info['replicasets']:
+            assert cpp_info['replicasets'][rs_uuid]['bucket'] == \
+                lua_info['replicasets'][rs_uuid]['bucket']
+            assert cpp_info['replicasets'][rs_uuid]['master']['status'] == \
+                lua_info['replicasets'][rs_uuid]['master']['status']
+            assert cpp_info['replicasets'][rs_uuid]['replica']['status'] == \
+                lua_info['replicasets'][rs_uuid]['replica']['status']
+
+    def test_info_with_services_matches_lua_on_stable_fields(self, lua_conn, cpp_conn):
+        args = [{'with_services': True}]
+        lua_result = lua_conn.call('vshard.router.info', args)
+        cpp_result = cpp_conn.call('vshard.router.info', args)
+
+        lua_info = lua_result.data[0]
+        cpp_info = cpp_result.data[0]
+
+        assert cpp_info['bucket'] == lua_info['bucket']
+        assert 'services' in cpp_info
+        assert 'discovery' in cpp_info['services']
+        assert cpp_info['services']['discovery']['name'] == 'discovery'
+        assert cpp_info['services']['discovery']['status'] == 'ok'
+        assert cpp_info['services']['discovery']['activity'] == 'idling'
+
+        for rs_uuid in lua_info['replicasets']:
+            assert 'services' in cpp_info['replicasets'][rs_uuid]
+            assert 'failover' in cpp_info['replicasets'][rs_uuid]['services']
+            assert 'master_search' in cpp_info['replicasets'][rs_uuid]['services']
+            assert cpp_info['replicasets'][rs_uuid]['services']['failover']['status'] == 'ok'
+            assert cpp_info['replicasets'][rs_uuid]['services']['master_search'] == []
+
+    def test_info_rejects_non_map_non_bool_arg_like_lua(self, lua_conn, cpp_conn):
+        with pytest.raises(tarantool.error.DatabaseError):
+            lua_conn.call('vshard.router.info', [123])
+        with pytest.raises(tarantool.error.DatabaseError):
+            cpp_conn.call('vshard.router.info', [123])
+
+
 class TestSync:
     """vshard.router.sync."""
 

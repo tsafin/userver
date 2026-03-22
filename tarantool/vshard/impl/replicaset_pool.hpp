@@ -71,6 +71,9 @@ class ReplicasetPool final {
         storages::tarantool::OptionalCommandControl cc = {});
 
     bool IsAvailable() const;
+    bool IsMasterAvailable() const;
+    bool HasReplica() const;
+    bool IsReplicaAvailable() const;
     const std::string& GetUuid() const noexcept { return uuid_; }
 
     void WriteStatistics(utils::statistics::Writer& writer) const;

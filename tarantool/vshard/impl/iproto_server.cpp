@@ -207,6 +207,11 @@ struct ParsedMapCallRWArgs {
     std::optional<std::vector<BucketId>> bucket_ids;
 };
 
+struct ParsedInfoArgs {
+    bool valid{true};
+    bool with_services{false};
+};
+
 /// Parse call opts from a msgpack map at the current position.
 /// Expects pos to point at a msgpack map.
 /// Validates numeric timeout/request_timeout fields like Lua vshard does.
@@ -306,6 +311,48 @@ static ParsedMapCallRWArgs ParseMapCallRWArgs(
                 return out;
             }
             out.bucket_ids = std::move(bucket_ids);
+        } else {
+            pos = SkipValue(p, len, pos);
+        }
+    }
+
+    return out;
+}
+
+static ParsedInfoArgs ParseInfoArgs(
+    const uint8_t* p, std::size_t len) noexcept {
+    using namespace storages::tarantool::impl::msgpack_scan;
+    ParsedInfoArgs out;
+    std::size_t pos = 0;
+    const auto alen = ReadArrayHeader(p, len, pos);
+    if (alen == 0) return out;
+
+    if (pos >= len) return out;
+    const auto first = p[pos];
+    if (first == mp::kNil || first == mp::kFalse) {
+        return out;
+    }
+    if (first == mp::kTrue) {
+        out.with_services = true;
+        return out;
+    }
+    if (!IsMap(p, len, pos)) {
+        out.valid = false;
+        return out;
+    }
+
+    const auto map_len = ReadMapHeader(p, len, pos);
+    for (std::size_t i = 0; i < map_len; ++i) {
+        auto [key, kp] = ReadStr(p, len, pos);
+        pos = kp;
+        if (key == "with_services") {
+            if (pos >= len) {
+                out.with_services = false;
+                return out;
+            }
+            const auto val = p[pos];
+            out.with_services = (val != mp::kNil && val != mp::kFalse);
+            pos = SkipValue(p, len, pos);
         } else {
             pos = SkipValue(p, len, pos);
         }
@@ -980,6 +1027,21 @@ static void HandleConnection(engine::io::Socket sock,
                     // [] → {uuid: {uuid: uuid}, ...} for all known replicasets
                     const auto uuids = proxy.GetReplicasetUUIDs();
                     const auto resp = BuildRouteAllResultFrame(req.sync, uuids);
+                    (void)sock.SendAll(resp.data(), resp.size(), engine::Deadline{});
+                    continue;
+
+                } else if (body->func_name == "vshard.router.info") {
+                    const auto info_args = ParseInfoArgs(
+                        body->tuple_begin, body->tuple_len);
+                    if (!info_args.valid) {
+                        const auto resp = tnt::BuildIprotoErrorFrame(
+                            req.sync, kSchemaVersion,
+                            "bad info args: expected [] or [{with_services=...}]");
+                        (void)sock.SendAll(resp.data(), resp.size(), engine::Deadline{});
+                        continue;
+                    }
+                    const auto info = proxy.GetInfo(info_args.with_services);
+                    const auto resp = BuildResultFrame(req.sync, info);
                     (void)sock.SendAll(resp.data(), resp.size(), engine::Deadline{});
                     continue;
 

@@ -4,6 +4,7 @@
 #include <cctype>
 #include <cstdint>
 #include <algorithm>
+#include <unordered_map>
 #include <unordered_set>
 
 #include <userver/engine/deadline.hpp>
@@ -1009,6 +1010,166 @@ VshardProxy::SyncResult VshardProxy::Sync(double timeout_seconds) {
     }
 
     return SyncResult{true, false, std::nullopt};
+}
+
+formats::msgpack::Value VshardProxy::GetInfo(bool with_services) {
+    constexpr int kStatusGreen = 0;
+    constexpr int kStatusYellow = 1;
+    constexpr int kStatusOrange = 2;
+    constexpr int kStatusRed = 3;
+
+    auto snapshot = routing_table_.Read();
+
+    std::unordered_map<std::string, const impl::ReplicasetConfig*> config_by_uuid;
+    config_by_uuid.reserve(settings_.topology.replicasets.size());
+    for (const auto& rs_cfg : settings_.topology.replicasets) {
+        config_by_uuid.emplace(rs_cfg.uuid, &rs_cfg);
+    }
+
+    formats::msgpack::ValueBuilder state = formats::msgpack::ValueBuilder::Object();
+    auto replicasets = formats::msgpack::ValueBuilder::Object();
+    auto bucket = formats::msgpack::ValueBuilder::Object();
+    auto alerts = formats::msgpack::ValueBuilder::Array();
+
+    uint32_t available_ro = 0;
+    uint32_t available_rw = 0;
+    uint32_t unreachable = 0;
+    uint32_t known_bucket_count = 0;
+    int status = kStatusGreen;
+
+    for (const auto& rs : snapshot->replicasets) {
+        if (!rs) continue;
+
+        const auto cfg_it = config_by_uuid.find(rs->GetUuid());
+        const impl::ReplicasetConfig* rs_cfg =
+            (cfg_it == config_by_uuid.end()) ? nullptr : cfg_it->second;
+
+        const auto bucket_count = [&] {
+            uint32_t count = 0;
+            const auto rs_idx = snapshot->FindReplicasetIndex(rs->GetUuid());
+            if (rs_idx == 0) return count;
+            for (const auto owner : snapshot->bucket_to_rs) {
+                if (owner == rs_idx) ++count;
+            }
+            return count;
+        }();
+        known_bucket_count += bucket_count;
+
+        auto rs_info = formats::msgpack::ValueBuilder::Object();
+        rs_info["uuid"] = formats::msgpack::ValueBuilder{rs->GetUuid()};
+        rs_info["bucket"] = formats::msgpack::ValueBuilder::Object();
+
+        const impl::ReplicasetConfig::NodeConfig* master_cfg = nullptr;
+        const impl::ReplicasetConfig::NodeConfig* replica_cfg = nullptr;
+        if (rs_cfg) {
+            for (const auto& node : rs_cfg->nodes) {
+                if (node.is_master && !master_cfg) {
+                    master_cfg = &node;
+                } else if (!node.is_master && !replica_cfg) {
+                    replica_cfg = &node;
+                }
+            }
+            if (!master_cfg && !rs_cfg->nodes.empty()) {
+                master_cfg = &rs_cfg->nodes.front();
+            }
+        }
+
+        auto master = formats::msgpack::ValueBuilder::Object();
+        if (master_cfg) {
+            master["uri"] = formats::msgpack::ValueBuilder{
+                "storage@" + master_cfg->host + ":" +
+                std::to_string(master_cfg->port)};
+            master["network_timeout"] = formats::msgpack::ValueBuilder{0.5};
+        }
+        master["status"] = formats::msgpack::ValueBuilder{
+            rs->IsMasterAvailable() ? "available" : "unreachable"};
+        rs_info["master"] = std::move(master);
+
+        auto replica = formats::msgpack::ValueBuilder::Object();
+        if (replica_cfg) {
+            replica["uri"] = formats::msgpack::ValueBuilder{
+                "storage@" + replica_cfg->host + ":" +
+                std::to_string(replica_cfg->port)};
+            replica["network_timeout"] = formats::msgpack::ValueBuilder{0.5};
+            replica["status"] = formats::msgpack::ValueBuilder{
+                rs->IsReplicaAvailable() ? "available" : "unreachable"};
+        } else {
+            replica["status"] = formats::msgpack::ValueBuilder{
+                rs->IsMasterAvailable() ? "available" : "missing"};
+        }
+        rs_info["replica"] = std::move(replica);
+
+        auto rs_bucket = formats::msgpack::ValueBuilder::Object();
+        const auto master_available = rs->IsMasterAvailable();
+        const auto replica_available =
+            rs->HasReplica() ? rs->IsReplicaAvailable() : master_available;
+
+        if (!master_available) {
+            if (!replica_available) {
+                rs_bucket["unreachable"] = formats::msgpack::ValueBuilder{bucket_count};
+                unreachable += bucket_count;
+                status = kStatusRed;
+            } else {
+                rs_bucket["available_ro"] = formats::msgpack::ValueBuilder{bucket_count};
+                available_ro += bucket_count;
+                status = std::max(status, kStatusOrange);
+            }
+        } else {
+            rs_bucket["available_rw"] = formats::msgpack::ValueBuilder{bucket_count};
+            available_rw += bucket_count;
+        }
+        rs_info["bucket"] = std::move(rs_bucket);
+
+        if (with_services) {
+            auto services = formats::msgpack::ValueBuilder::Object();
+
+            auto failover = formats::msgpack::ValueBuilder::Object();
+            failover["name"] = formats::msgpack::ValueBuilder{"replicaset_failover"};
+            failover["status"] = formats::msgpack::ValueBuilder{"ok"};
+            failover["status_idx"] = formats::msgpack::ValueBuilder{0};
+            failover["activity"] = formats::msgpack::ValueBuilder{"idling"};
+            failover["error"] = formats::msgpack::ValueBuilder{""};
+            failover["replicas"] = formats::msgpack::ValueBuilder::Object();
+            services["failover"] = std::move(failover);
+
+            services["master_search"] = formats::msgpack::ValueBuilder::Array();
+            rs_info["services"] = std::move(services);
+        }
+
+        replicasets[rs->GetUuid()] = std::move(rs_info);
+    }
+
+    const auto unknown = settings_.topology.bucket_count - known_bucket_count;
+    bucket["available_ro"] = formats::msgpack::ValueBuilder{available_ro};
+    bucket["available_rw"] = formats::msgpack::ValueBuilder{available_rw};
+    bucket["unreachable"] = formats::msgpack::ValueBuilder{unreachable};
+    bucket["unknown"] = formats::msgpack::ValueBuilder{unknown};
+    if (unknown > 0) {
+        status = std::max(status, kStatusYellow);
+    }
+
+    state["replicasets"] = std::move(replicasets);
+    state["bucket"] = std::move(bucket);
+    state["alerts"] = std::move(alerts);
+    state["status"] = formats::msgpack::ValueBuilder{status};
+    state["identification_mode"] =
+        formats::msgpack::ValueBuilder{"uuid_as_key"};
+    state["is_enabled"] = formats::msgpack::ValueBuilder{true};
+
+    if (with_services) {
+        auto services = formats::msgpack::ValueBuilder::Object();
+        auto discovery = formats::msgpack::ValueBuilder::Object();
+        discovery["name"] = formats::msgpack::ValueBuilder{"discovery"};
+        discovery["status"] = formats::msgpack::ValueBuilder{"ok"};
+        discovery["status_idx"] = formats::msgpack::ValueBuilder{0};
+        discovery["activity"] = formats::msgpack::ValueBuilder{"idling"};
+        discovery["error"] = formats::msgpack::ValueBuilder{""};
+        services["discovery"] = std::move(discovery);
+        state["services"] = std::move(services);
+    }
+
+    const auto bytes = state.ToBytes();
+    return formats::msgpack::Value::FromBytes(bytes.data(), bytes.size());
 }
 
 std::string VshardProxy::Route(BucketId bucket_id) {
