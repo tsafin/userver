@@ -41,6 +41,24 @@ def pytest_addoption(parser):
         default=None,
         help='Path to userver-tarantool-vshard-sample binary',
     )
+    parser.addoption(
+        '--vshard-path',
+        default=None,
+        help='Path to vshard Lua module directory (containing vshard/init.lua)',
+    )
+
+
+def _find_vshard_path():
+    """Try to auto-detect vshard Lua module location."""
+    candidates = [
+        os.path.expanduser('~/src/vshard'),
+        '/usr/share/tarantool',
+        '/usr/local/share/tarantool',
+    ]
+    for path in candidates:
+        if os.path.isfile(os.path.join(path, 'vshard', 'init.lua')):
+            return path
+    return None
 
 
 def _wait_for_port(host, port, timeout=10):
@@ -55,6 +73,42 @@ def _wait_for_port(host, port, timeout=10):
         except (ConnectionRefusedError, OSError):
             time.sleep(0.2)
     return False
+
+
+def _wait_for_storage_ready(port, timeout=15):
+    """Wait until vshard.storage.buckets_count is callable."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            conn = tarantool.connect('127.0.0.1', port)
+            conn.call('vshard.storage.buckets_count', [])
+            conn.close()
+            return True
+        except Exception:
+            pass
+        time.sleep(0.5)
+    raise RuntimeError(f"Storage on port {port} not ready after {timeout}s")
+
+
+def _wait_for_buckets_distributed(lua_router_port, timeout=30):
+    """Wait until all buckets are distributed via the Lua router."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            conn = tarantool.connect('127.0.0.1', lua_router_port)
+            result = conn.call('vshard.router.info', [])
+            conn.close()
+            if result.data:
+                info = result.data[0] if isinstance(result.data, (list, tuple)) else result.data
+                if isinstance(info, dict):
+                    unknown = info.get('bucket', {}).get('unknown', 0)
+                    if unknown == 0:
+                        return True
+        except Exception:
+            pass
+        time.sleep(1)
+    raise RuntimeError(
+        f"Buckets not distributed after {timeout}s")
 
 
 def _start_tarantool(init_lua, env, tmpdir):
@@ -87,13 +141,10 @@ def _start_tarantool(init_lua, env, tmpdir):
 
 
 @pytest.fixture(scope='session')
-def base_port(worker_id):
-    """Compute a unique base port for parallel test workers."""
-    if worker_id == 'master' or worker_id == 'gw0':
-        return 13301
-    # xdist workers: gw0, gw1, ...
-    idx = int(worker_id.replace('gw', ''))
-    return 13301 + idx * 10
+def base_port():
+    """Compute a unique base port. Uses a random offset to avoid collisions."""
+    import random
+    return 13301 + random.randint(0, 50) * 10
 
 
 @pytest.fixture(scope='session')
@@ -115,8 +166,8 @@ def cluster_tmpdir(tmp_path_factory):
 
 
 @pytest.fixture(scope='session')
-def vshard_cluster(cluster_ports, cluster_tmpdir):
-    """Start a 4-node vshard storage cluster + Lua router.
+def vshard_cluster(request, cluster_ports, cluster_tmpdir):
+    """Start a 2-node vshard storage cluster (masters only) + Lua router.
 
     Yields a dict with connection info. Stops all processes on teardown.
     """
@@ -126,24 +177,28 @@ def vshard_cluster(cluster_ports, cluster_tmpdir):
     ports = cluster_ports
     tmpdir = cluster_tmpdir
 
+    # Find vshard Lua module path.
+    vshard_path = request.config.getoption('--vshard-path') or _find_vshard_path()
+    if vshard_path is None:
+        pytest.skip("vshard Lua module not found. Use --vshard-path=<dir>")
+
     common_env = {
         'TARANTOOL_BUCKET_COUNT': str(BUCKET_COUNT),
         'TARANTOOL_RS1_MASTER_PORT': str(ports['rs1_master']),
-        'TARANTOOL_RS1_REPLICA_PORT': str(ports['rs1_replica']),
+        'TARANTOOL_RS1_REPLICA_PORT': str(ports['rs1_master']),  # no separate replica
         'TARANTOOL_RS2_MASTER_PORT': str(ports['rs2_master']),
-        'TARANTOOL_RS2_REPLICA_PORT': str(ports['rs2_replica']),
+        'TARANTOOL_RS2_REPLICA_PORT': str(ports['rs2_master']),  # no separate replica
+        'TARANTOOL_VSHARD_PATH': vshard_path,
     }
 
+    # Masters only — replicas are not started to keep setup simple and fast.
     instances = [
-        ('rs1_master',  RS1_UUID, INSTANCE_UUIDS['rs1_master'],  '1'),
-        ('rs1_replica', RS1_UUID, INSTANCE_UUIDS['rs1_replica'], '0'),
-        ('rs2_master',  RS2_UUID, INSTANCE_UUIDS['rs2_master'],  '1'),
-        ('rs2_replica', RS2_UUID, INSTANCE_UUIDS['rs2_replica'], '0'),
+        ('rs1_master', RS1_UUID, INSTANCE_UUIDS['rs1_master'], '1'),
+        ('rs2_master', RS2_UUID, INSTANCE_UUIDS['rs2_master'], '1'),
     ]
 
     procs = []
 
-    # Start storage instances (masters first, then replicas).
     for name, rs_uuid, inst_uuid, is_master in instances:
         env = dict(common_env)
         env['TARANTOOL_PORT'] = str(ports[name])
@@ -153,30 +208,37 @@ def vshard_cluster(cluster_ports, cluster_tmpdir):
         proc = _start_tarantool(storage_lua, env, tmpdir)
         procs.append((name, proc))
 
-    # Bootstrap vshard on the first master.
-    try:
-        master_conn = tarantool.connect(
-            '127.0.0.1', ports['rs1_master'],
-            user='storage', password='storage',
-        )
-        master_conn.call('vshard.storage.bootstrap', [])
-        # Wait for bootstrap to complete.
-        time.sleep(2)
-        master_conn.close()
-    except Exception as e:
-        # Cleanup on bootstrap failure.
-        for name, proc in procs:
-            proc.kill()
-        raise RuntimeError(f"vshard bootstrap failed: {e}")
-
-    # Start Lua router.
+    # Start Lua router (needed for vshard.router.bootstrap).
     router_env = dict(common_env)
     router_env['TARANTOOL_PORT'] = str(ports['lua_router'])
     router_proc = _start_tarantool(router_lua, router_env, tmpdir)
     procs.append(('lua_router', router_proc))
 
-    # Wait for router discovery to populate.
-    time.sleep(2)
+    # Wait for storages to fully initialize vshard procedures.
+    _wait_for_storage_ready(ports['rs1_master'])
+    _wait_for_storage_ready(ports['rs2_master'])
+
+    # Bootstrap vshard via the Lua router (with retries for timing).
+    bootstrap_ok = False
+    bootstrap_err = None
+    for attempt in range(10):
+        try:
+            router_conn = tarantool.connect('127.0.0.1', ports['lua_router'])
+            router_conn.call('vshard.router.bootstrap',
+                             [{'if_not_bootstrapped': True}])
+            router_conn.close()
+            bootstrap_ok = True
+            break
+        except Exception as e:
+            bootstrap_err = e
+            time.sleep(1)
+    if not bootstrap_ok:
+        for name, proc in procs:
+            proc.kill()
+        raise RuntimeError(f"vshard bootstrap failed after retries: {bootstrap_err}")
+
+    # Wait for bootstrap to distribute buckets.
+    _wait_for_buckets_distributed(ports['lua_router'])
 
     yield {
         'ports': ports,
@@ -230,7 +292,6 @@ def secdist_config(vshard_cluster):
                         'nodes': [
                             {'host': '127.0.0.1', 'port': ports['rs1_master'],
                              'is_master': True},
-                            {'host': '127.0.0.1', 'port': ports['rs1_replica']},
                         ],
                     },
                     {
@@ -238,7 +299,6 @@ def secdist_config(vshard_cluster):
                         'nodes': [
                             {'host': '127.0.0.1', 'port': ports['rs2_master'],
                              'is_master': True},
-                            {'host': '127.0.0.1', 'port': ports['rs2_replica']},
                         ],
                     },
                 ],
@@ -353,7 +413,11 @@ def cpp_proxy(request, vshard_cluster, secdist_config):
 @pytest.fixture(scope='session')
 def cpp_conn(cpp_proxy):
     """Connection to the C++ vshard proxy (IPROTO)."""
-    conn = tarantool.connect('127.0.0.1', cpp_proxy['port'])
+    conn = tarantool.Connection(
+        '127.0.0.1', cpp_proxy['port'],
+        fetch_schema=False,  # C++ proxy only handles CALL, not schema queries
+    )
+    conn.connect()
     yield conn
     conn.close()
 

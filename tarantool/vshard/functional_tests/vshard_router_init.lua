@@ -7,6 +7,14 @@
 --   TARANTOOL_RS2_MASTER_PORT, TARANTOOL_RS2_REPLICA_PORT
 --   TARANTOOL_BUCKET_COUNT -- total bucket count (default 300)
 --   TARANTOOL_TMPDIR       -- working directory
+--   TARANTOOL_VSHARD_PATH  -- path to vshard Lua module (optional)
+
+-- Allow specifying vshard module location via env var.
+local vshard_path = os.getenv('TARANTOOL_VSHARD_PATH')
+if vshard_path then
+    package.path = vshard_path .. '/?.lua;' ..
+                   vshard_path .. '/?/init.lua;' .. package.path
+end
 
 local port = tonumber(os.getenv('TARANTOOL_PORT')) or 3305
 local tmpdir = os.getenv('TARANTOOL_TMPDIR') or '/tmp/vshard_test'
@@ -32,6 +40,8 @@ box.cfg{
     listen = port,
     log = tmpdir .. '/router_' .. port .. '.log',
     pid_file = tmpdir .. '/router_' .. port .. '.pid',
+    memtx_dir = tmpdir .. '/snap_' .. port,
+    wal_dir = tmpdir .. '/xlog_' .. port,
     background = (os.getenv('TARANTOOL_BACKGROUND') == '1'),
     memtx_memory = 32 * 1024 * 1024,
     wal_mode = 'none',
@@ -44,38 +54,46 @@ end)
 
 local vshard = require('vshard')
 
+local rs1_replicas = {
+    [INSTANCE_UUIDS['rs1_master']] = {
+        uri = 'storage:storage@127.0.0.1:' .. rs1_master_port,
+        name = 'rs1_master',
+        master = true,
+    },
+}
+if rs1_replica_port ~= rs1_master_port then
+    rs1_replicas[INSTANCE_UUIDS['rs1_replica']] = {
+        uri = 'storage:storage@127.0.0.1:' .. rs1_replica_port,
+        name = 'rs1_replica',
+        master = false,
+    }
+end
+
+local rs2_replicas = {
+    [INSTANCE_UUIDS['rs2_master']] = {
+        uri = 'storage:storage@127.0.0.1:' .. rs2_master_port,
+        name = 'rs2_master',
+        master = true,
+    },
+}
+if rs2_replica_port ~= rs2_master_port then
+    rs2_replicas[INSTANCE_UUIDS['rs2_replica']] = {
+        uri = 'storage:storage@127.0.0.1:' .. rs2_replica_port,
+        name = 'rs2_replica',
+        master = false,
+    }
+end
+
 local cfg = {
     sharding = {
-        [RS1_UUID] = {
-            replicas = {
-                [INSTANCE_UUIDS['rs1_master']] = {
-                    uri = 'storage:storage@127.0.0.1:' .. rs1_master_port,
-                    name = 'rs1_master',
-                    master = true,
-                },
-                [INSTANCE_UUIDS['rs1_replica']] = {
-                    uri = 'storage:storage@127.0.0.1:' .. rs1_replica_port,
-                    name = 'rs1_replica',
-                    master = false,
-                },
-            },
-        },
-        [RS2_UUID] = {
-            replicas = {
-                [INSTANCE_UUIDS['rs2_master']] = {
-                    uri = 'storage:storage@127.0.0.1:' .. rs2_master_port,
-                    name = 'rs2_master',
-                    master = true,
-                },
-                [INSTANCE_UUIDS['rs2_replica']] = {
-                    uri = 'storage:storage@127.0.0.1:' .. rs2_replica_port,
-                    name = 'rs2_replica',
-                    master = false,
-                },
-            },
-        },
+        [RS1_UUID] = { replicas = rs1_replicas },
+        [RS2_UUID] = { replicas = rs2_replicas },
     },
     bucket_count = bucket_count,
 }
 
 vshard.router.cfg(cfg)
+
+-- Expose vshard.router functions as global callable procedures so that
+-- net.box clients can call them via conn:call('vshard.router.callrw', ...).
+rawset(_G, 'vshard', {router = vshard.router})

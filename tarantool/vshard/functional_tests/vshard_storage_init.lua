@@ -9,6 +9,14 @@
 --   TARANTOOL_BUCKET_COUNT -- total bucket count (default 300)
 --   TARANTOOL_TMPDIR       -- working directory
 --   TARANTOOL_BACKGROUND   -- "1" to daemonize
+--   TARANTOOL_VSHARD_PATH  -- path to vshard Lua module (optional)
+
+-- Allow specifying vshard module location via env var.
+local vshard_path = os.getenv('TARANTOOL_VSHARD_PATH')
+if vshard_path then
+    package.path = vshard_path .. '/?.lua;' ..
+                   vshard_path .. '/?/init.lua;' .. package.path
+end
 
 local port = tonumber(os.getenv('TARANTOOL_PORT')) or 3301
 local tmpdir = os.getenv('TARANTOOL_TMPDIR') or '/tmp/vshard_test'
@@ -35,37 +43,42 @@ local INSTANCE_UUIDS = {
 }
 
 -- Build vshard config table used by both router and storage.
+-- If replica port equals master port, we use single-node replicasets.
 local function make_vshard_cfg()
+    local rs1_replicas = {
+        [INSTANCE_UUIDS['rs1_master']] = {
+            uri = 'storage:storage@127.0.0.1:' .. rs1_master_port,
+            name = 'rs1_master',
+            master = true,
+        },
+    }
+    if rs1_replica_port ~= rs1_master_port then
+        rs1_replicas[INSTANCE_UUIDS['rs1_replica']] = {
+            uri = 'storage:storage@127.0.0.1:' .. rs1_replica_port,
+            name = 'rs1_replica',
+            master = false,
+        }
+    end
+
+    local rs2_replicas = {
+        [INSTANCE_UUIDS['rs2_master']] = {
+            uri = 'storage:storage@127.0.0.1:' .. rs2_master_port,
+            name = 'rs2_master',
+            master = true,
+        },
+    }
+    if rs2_replica_port ~= rs2_master_port then
+        rs2_replicas[INSTANCE_UUIDS['rs2_replica']] = {
+            uri = 'storage:storage@127.0.0.1:' .. rs2_replica_port,
+            name = 'rs2_replica',
+            master = false,
+        }
+    end
+
     return {
         sharding = {
-            [RS1_UUID] = {
-                replicas = {
-                    [INSTANCE_UUIDS['rs1_master']] = {
-                        uri = 'storage:storage@127.0.0.1:' .. rs1_master_port,
-                        name = 'rs1_master',
-                        master = true,
-                    },
-                    [INSTANCE_UUIDS['rs1_replica']] = {
-                        uri = 'storage:storage@127.0.0.1:' .. rs1_replica_port,
-                        name = 'rs1_replica',
-                        master = false,
-                    },
-                },
-            },
-            [RS2_UUID] = {
-                replicas = {
-                    [INSTANCE_UUIDS['rs2_master']] = {
-                        uri = 'storage:storage@127.0.0.1:' .. rs2_master_port,
-                        name = 'rs2_master',
-                        master = true,
-                    },
-                    [INSTANCE_UUIDS['rs2_replica']] = {
-                        uri = 'storage:storage@127.0.0.1:' .. rs2_replica_port,
-                        name = 'rs2_replica',
-                        master = false,
-                    },
-                },
-            },
+            [RS1_UUID] = { replicas = rs1_replicas },
+            [RS2_UUID] = { replicas = rs2_replicas },
         },
         bucket_count = bucket_count,
     }
@@ -135,6 +148,9 @@ end)
 -- Configure vshard storage.
 local vshard = require('vshard')
 vshard.storage.cfg(make_vshard_cfg(), instance_uuid)
+
+-- Expose vshard globally so IPROTO CALL can resolve 'vshard.storage.*' functions.
+rawset(_G, 'vshard', vshard)
 
 -- Export config builder for router init.
 rawset(_G, 'make_vshard_cfg', make_vshard_cfg)

@@ -610,20 +610,38 @@ static void HandleConnection(engine::io::Socket sock,
 
     // 2. Request loop
     while (true) {
-        // Read 5-byte preheader: mp::kUint32 marker + big-endian uint32 body_len
+        // Read frame length: variable-length msgpack uint
+        // Tarantool IPROTO frames are prefixed with a msgpack-encoded uint32
+        // body length. Small frames may use fixint (1 byte), uint8 (2 bytes),
+        // uint16 (3 bytes) or uint32 (5 bytes) encoding.
+        uint32_t body_len = 0;
         try {
-            if (!RecvExact(sock, frame_buf, 5)) break;
+            if (!RecvExact(sock, frame_buf, 1)) break;
         } catch (...) {
             break;
         }
-        if (frame_buf[0] != mp::kUint32) {
-            LOG_WARNING() << "iproto_server: unexpected preheader byte "
-                          << static_cast<int>(frame_buf[0]);
+        const uint8_t lead = frame_buf[0];
+        if (lead <= 0x7f) {
+            // positive fixint: length is the byte itself
+            body_len = lead;
+        } else if (lead == 0xcc) {
+            // uint8
+            try { if (!RecvExact(sock, frame_buf, 1)) break; } catch (...) { break; }
+            body_len = frame_buf[0];
+        } else if (lead == 0xcd) {
+            // uint16
+            try { if (!RecvExact(sock, frame_buf, 2)) break; } catch (...) { break; }
+            body_len = (uint32_t(frame_buf[0]) << 8) | uint32_t(frame_buf[1]);
+        } else if (lead == mp::kUint32) {
+            // uint32
+            try { if (!RecvExact(sock, frame_buf, 4)) break; } catch (...) { break; }
+            body_len = (uint32_t(frame_buf[0]) << 24) | (uint32_t(frame_buf[1]) << 16) |
+                       (uint32_t(frame_buf[2]) << 8)  |  uint32_t(frame_buf[3]);
+        } else {
+            LOG_WARNING() << "iproto_server: unexpected length prefix byte "
+                          << static_cast<int>(lead);
             break;
         }
-        const uint32_t body_len =
-            (uint32_t(frame_buf[1]) << 24) | (uint32_t(frame_buf[2]) << 16) |
-            (uint32_t(frame_buf[3]) << 8)  |  uint32_t(frame_buf[4]);
 
         if (body_len > kMaxFrameSize) {
             LOG_WARNING() << "iproto_server: oversized frame " << body_len;
