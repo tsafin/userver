@@ -220,17 +220,93 @@ components_manager:
 
 ## Testing
 
+There are three levels of testing: unit tests (offline), functional tests
+(spin up a real vshard cluster), and manual smoke tests.
+
 ### Unit tests (no cluster required)
 
 ```bash
-cd build_debug
-ctest -V -R userver-tarantool-vshard-sample_unittest
+# Build unit tests:
+cmake --build build_debug --target userver-tarantool-vshard-sample_unittest -j6
+
+# Run via ctest:
+cd build_debug && ctest -V -R userver-tarantool-vshard-sample_unittest
+
+# Or run the binary directly (supports --gtest_filter):
+build_debug/userver/tarantool/vshard/userver-tarantool-vshard-sample_unittest
 ```
 
 Tests cover: `BucketCalculator` (mpcrc32), `RoutingTable` (MOVED / TRANSFER),
-`VshardError` parsing, `DecodeEnvelopeRaw` (fixarray / array16 / array32).
+`VshardError` parsing, `DecodeEnvelopeRaw` (fixarray / array16 / array32),
+`IprotoFrames` (ReadStr / ReadUint / ParseIprotoRequest / ParseIprotoResponse).
+
+### Functional tests (automated vshard cluster)
+
+Functional tests use **pytest** and automatically start a 2-replicaset vshard
+cluster (2 masters + Lua router) in temporary directories, then start the C++
+proxy as a subprocess.  Tests compare C++ proxy responses against the Lua router
+(**lock-step differential testing**).
+
+**Prerequisites:**
+
+* `tarantool` binary in `$PATH`
+* [vshard](https://github.com/tarantool/vshard) Lua module installed or available
+  locally (e.g. `~/src/vshard`)
+* Python packages: `pytest`, `tarantool` (`pip install pytest tarantool`)
+
+**Run via ctest (recommended):**
+
+```bash
+# Configure with vshard path auto-detection (looks in ~/src/vshard, /usr/share/tarantool):
+cmake --build build_debug --target userver-tarantool-vshard-sample -j6
+cd build_debug && ctest -V -R testsuite-userver-tarantool-vshard
+
+# Or specify vshard path explicitly during CMake configure:
+cmake -DVSHARD_LUA_PATH=/path/to/vshard ...
+```
+
+**Run manually with pytest:**
+
+```bash
+cd tarantool/vshard/functional_tests
+
+pytest tests/ \
+    --proxy-binary=../../../build_debug/userver/tarantool/vshard/userver-tarantool-vshard-sample \
+    --vshard-path=~/src/vshard \
+    -v
+```
+
+**Test structure:**
+
+| File | Description |
+|------|-------------|
+| `test_differential.py` | Lock-step: sends identical requests to both Lua and C++ routers, compares responses |
+| `test_routing.py` | C++ proxy routing: callrw, callro, callbro, callbre, callre, generic call |
+| `test_errors.py` | Error handling: invalid buckets, missing functions, timeouts, wrong-bucket retry |
+
+**What the test harness does automatically:**
+
+1. Starts 2 Tarantool storage masters with vshard configured
+2. Starts a Lua vshard router (for differential comparison)
+3. Bootstraps vshard and waits for bucket distribution
+4. Starts the C++ proxy pointing at the same cluster
+5. Runs all tests, then tears everything down
+
+### Run all tests at once
+
+```bash
+# Build everything and run both unit + functional tests:
+cmake --build build_debug --target userver-tarantool-vshard-sample \
+                          --target userver-tarantool-vshard-sample_unittest -j6
+cd build_debug && ctest -V -R 'userver-tarantool-vshard'
+```
+
+This runs both `userver-tarantool-vshard-sample_unittest` (unit) and
+`testsuite-userver-tarantool-vshard` (functional) in one command.
 
 ### Smoke test against a live cluster
+
+For quick manual verification with an already-running cluster:
 
 ```bash
 # With the proxy running on :3306 and a live cluster:

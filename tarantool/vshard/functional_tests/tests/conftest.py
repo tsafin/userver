@@ -340,6 +340,14 @@ components_manager:
 
         dynamic-config:
             fs-cache-path: ''
+            defaults:
+                USERVER_NO_LOG_SPANS:
+                    prefixes: ['tarantool_']
+                    names: []
+
+        logging-configurator:
+            limited-logging-enable: true
+            limited-logging-interval: 1s
 
         dns-client:
             fs-task-processor: fs-task-processor
