@@ -33,19 +33,27 @@ VshardEnvelope DecodeEnvelope(const storages::tarantool::ExecutionResult& result
 // Zero-copy path: scan raw bytes, no Value tree
 // ---------------------------------------------------------------------------
 
+enum class RawEnvelopeStatus {
+    kOk,
+    kStorageCallError,
+    kVshardError,
+};
+
 /// Result of a zero-copy raw envelope decode.
 ///
-/// On success (ok == true):
-///   app_result_bytes holds a copy of the raw msgpack encoding of the user
-///   function result extracted from the storage response envelope.  One
-///   allocation — no Value tree is constructed.
+/// For kOk:
+///   return_values_bytes contains the raw msgpack array of router return
+///   values: [app_result].
 ///
-/// On vshard routing error (ok == false, vshard_error set):
-///   The error was parsed via the Value path (cold path).
+/// For kStorageCallError:
+///   return_values_bytes contains the raw msgpack array [nil, err].
+///
+/// For kVshardError:
+///   vshard_error is set and the caller should enter the retry/error path.
 struct RawEnvelopeResult {
-    std::vector<uint8_t> app_result_bytes;  ///< raw msgpack of data[1] on success
-    VshardError vshard_error;               ///< set on WRONG_BUCKET / NON_MASTER etc.
-    bool ok{true};
+    std::vector<uint8_t> return_values_bytes;
+    VshardError vshard_error;
+    RawEnvelopeStatus status{RawEnvelopeStatus::kOk};
 };
 
 /// Decode the vshard envelope without constructing a formats::msgpack::Value
@@ -53,8 +61,10 @@ struct RawEnvelopeResult {
 /// within the raw IPROTO_DATA buffer and copies it out.
 ///
 /// Throws CommandException on IPROTO-level errors (via AssertOk).
-/// Returns RawEnvelopeResult::ok == false (with vshard_error set) on routing
-/// errors; throws CommandException on user-function errors.
+/// Returns:
+///   kOk                for successful storage calls,
+///   kStorageCallError  for Lua-level storage/user-function errors,
+///   kVshardError       for routing errors like WRONG_BUCKET / NON_MASTER.
 RawEnvelopeResult DecodeEnvelopeRaw(
     const storages::tarantool::ExecutionResult& result);
 

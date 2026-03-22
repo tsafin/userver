@@ -102,11 +102,18 @@ class VshardProxy final {
         const uint8_t* args_data, std::size_t args_len,
         storages::tarantool::OptionalCommandControl = {});
 
-    /// Fully zero-copy path: returns raw msgpack bytes of the user function
-    /// result with no Value tree constructed at any stage (args in, bytes out).
+    /// Fully zero-copy path: returns raw msgpack bytes of router multi-return
+    /// values with no Value tree constructed at any stage (args in, bytes out).
     std::vector<uint8_t> CallRawBytes(
         BucketId bucket_id, impl::CallMode mode, std::string_view func,
         const uint8_t* args_data, std::size_t args_len,
+        storages::tarantool::OptionalCommandControl = {});
+
+    /// Same as CallRawBytes(), but preserves the exact mode string forwarded
+    /// by generic vshard.router.call().
+    std::vector<uint8_t> CallRawBytesWithModeString(
+        BucketId bucket_id, impl::CallMode mode, std::string_view mode_string,
+        std::string_view func, const uint8_t* args_data, std::size_t args_len,
         storages::tarantool::OptionalCommandControl = {});
 
     // ---- Zero-copy forwarding -----------------------------------------------
@@ -181,7 +188,8 @@ class VshardProxy final {
         const storages::tarantool::Query& query,
         storages::tarantool::OptionalCommandControl cc);
 
-    /// Shared retry loop returning raw bytes — no Value tree at any point.
+    /// Shared retry loop returning raw router multi-return bytes — no Value
+    /// tree at any point.
     std::vector<uint8_t> DoCallRawBytes(
         BucketId bucket_id, impl::CallMode mode,
         const storages::tarantool::Query& query,
@@ -197,6 +205,12 @@ class VshardProxy final {
     /// avoiding a full msgpack deserialization round-trip.
     storages::tarantool::Query BuildStorageCallQueryRaw(
         BucketId bucket_id, impl::CallMode mode, std::string_view func,
+        const uint8_t* args_data, std::size_t args_len) const;
+
+    /// Same as BuildStorageCallQueryRaw, but preserves the exact mode string
+    /// received from a generic vshard.router.call() request.
+    storages::tarantool::Query BuildStorageCallQueryRawWithModeString(
+        BucketId bucket_id, std::string_view mode_string, std::string_view func,
         const uint8_t* args_data, std::size_t args_len) const;
 
     void StartRefreshTask();

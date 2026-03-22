@@ -9,6 +9,18 @@ USERVER_NAMESPACE_BEGIN
 
 namespace storages::tarantool::vshard::impl {
 
+namespace {
+
+void PushFixArray(std::vector<uint8_t>& buf, uint8_t n) {
+    buf.push_back(static_cast<uint8_t>(mp::kFixArrayMin | (n & 0x0fu)));
+}
+
+void PushNil(std::vector<uint8_t>& buf) {
+    buf.push_back(mp::kNil);
+}
+
+}  // namespace
+
 VshardEnvelope DecodeEnvelope(
     const storages::tarantool::ExecutionResult& result) {
     result.AssertOk();  // throws CommandException on IPROTO-level error
@@ -57,10 +69,9 @@ RawEnvelopeResult DecodeEnvelopeRawFallback(
     auto env = DecodeEnvelope(result);
     RawEnvelopeResult r;
     if (!env.vshard_error.IsNull()) {
-        r.ok = false;
+        r.status = RawEnvelopeStatus::kVshardError;
         r.vshard_error = std::move(env.vshard_error);
     }
-    // false status → CommandException thrown by DecodeEnvelope
     return r;
 }
 
@@ -107,17 +118,42 @@ RawEnvelopeResult DecodeEnvelopeRaw(
     const uint8_t status_byte = p[pos];
 
     if (status_byte == mp::kTrue) {
-        // Success path — extract element [1] raw bytes (zero Value tree)
+        // Success path — extract element [1] and wrap it as router multi-return
+        // values [result] without building a Value tree.
         ++pos;  // skip status byte
         if (count < 2 || pos >= len) {
-            // No result value — return empty success (nil result)
-            return {};
+            RawEnvelopeResult r;
+            PushFixArray(r.return_values_bytes, 1);
+            PushNil(r.return_values_bytes);
+            return r;
         }
         const std::size_t result_start = pos;
         const std::size_t result_end =
             storages::tarantool::impl::msgpack_scan::SkipValue(p, len, pos);
         RawEnvelopeResult r;
-        r.app_result_bytes.assign(p + result_start, p + result_end);
+        r.return_values_bytes.reserve(1 + (result_end - result_start));
+        PushFixArray(r.return_values_bytes, 1);
+        r.return_values_bytes.insert(
+            r.return_values_bytes.end(), p + result_start, p + result_end);
+        return r;
+    }
+
+    if (status_byte == mp::kFalse) {
+        // Lua router surfaces storage/user-function failures as [nil, err].
+        ++pos;  // skip status byte
+        RawEnvelopeResult r;
+        r.status = RawEnvelopeStatus::kStorageCallError;
+        PushFixArray(r.return_values_bytes, 2);
+        PushNil(r.return_values_bytes);
+        if (count < 2 || pos >= len) {
+            PushNil(r.return_values_bytes);
+            return r;
+        }
+        const std::size_t err_start = pos;
+        const std::size_t err_end =
+            storages::tarantool::impl::msgpack_scan::SkipValue(p, len, pos);
+        r.return_values_bytes.insert(
+            r.return_values_bytes.end(), p + err_start, p + err_end);
         return r;
     }
 

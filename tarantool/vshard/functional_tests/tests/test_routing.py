@@ -197,6 +197,17 @@ class TestGenericCall:
         )
         assert cpp_result.data is not None
 
+    def test_generic_call_invalid_mode_matches_lua(self, lua_conn, cpp_conn):
+        """Invalid mode strings should route as write and return Lua-style errors."""
+        bid = 75
+        args = [bid, 'junk', 'box.space.customer:select', [[bid]]]
+
+        lua_result = lua_conn.call('vshard.router.call', args)
+        cpp_result = cpp_conn.call('vshard.router.call', args)
+
+        assert cpp_result.data == lua_result.data
+
+
 
 class TestCallVariants:
     """callbro, callbre, callre — read variants with different semantics."""

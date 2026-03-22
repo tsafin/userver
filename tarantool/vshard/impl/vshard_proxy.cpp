@@ -18,6 +18,65 @@ USERVER_NAMESPACE_BEGIN
 
 namespace storages::tarantool::vshard {
 
+namespace {
+
+void PushString(std::vector<uint8_t>& buf, std::string_view value) {
+    if (value.size() <= 31) {
+        buf.push_back(static_cast<uint8_t>(mp::kFixStrMin | value.size()));
+    } else if (value.size() <= 0xff) {
+        buf.push_back(mp::kStr8);
+        buf.push_back(static_cast<uint8_t>(value.size()));
+    } else {
+        buf.push_back(mp::kStr16);
+        buf.push_back(static_cast<uint8_t>(value.size() >> 8));
+        buf.push_back(static_cast<uint8_t>(value.size()));
+    }
+    buf.insert(buf.end(), value.begin(), value.end());
+}
+
+void PushUint(std::vector<uint8_t>& buf, uint32_t value) {
+    if (value <= 0x7fu) {
+        buf.push_back(static_cast<uint8_t>(value));
+    } else if (value <= 0xffu) {
+        buf.push_back(mp::kUint8);
+        buf.push_back(static_cast<uint8_t>(value));
+    } else {
+        buf.push_back(mp::kUint16);
+        buf.push_back(static_cast<uint8_t>(value >> 8));
+        buf.push_back(static_cast<uint8_t>(value));
+    }
+}
+
+std::vector<uint8_t> BuildStorageCallErrorReturn(std::string_view message) {
+    static constexpr std::string_view kErrorType = "LuajitError";
+    static constexpr std::string_view kTraceFile = "./src/lua/utils.c";
+
+    std::vector<uint8_t> buf;
+    buf.reserve(96 + message.size());
+
+    buf.push_back(static_cast<uint8_t>(mp::kFixArrayMin | 2));
+    buf.push_back(mp::kNil);
+
+    buf.push_back(static_cast<uint8_t>(mp::kFixMapMin | 4));
+    PushString(buf, "base_type");
+    PushString(buf, kErrorType);
+    PushString(buf, "type");
+    PushString(buf, kErrorType);
+    PushString(buf, "message");
+    PushString(buf, message);
+    PushString(buf, "trace");
+    buf.push_back(static_cast<uint8_t>(mp::kFixArrayMin | 1));
+    buf.push_back(static_cast<uint8_t>(mp::kFixMapMin | 2));
+    PushString(buf, "file");
+    PushString(buf, kTraceFile);
+    PushString(buf, "line");
+    PushUint(buf, 1005);
+
+    return buf;
+}
+
+}  // namespace
+
 VshardProxy::VshardProxy(clients::dns::Resolver& resolver,
                          const components::ComponentConfig& pool_config,
                          VshardProxySettings settings)
@@ -105,6 +164,15 @@ std::vector<uint8_t> VshardProxy::CallRawBytes(
     return DoCallRawBytes(bucket_id, mode, query, cc);
 }
 
+std::vector<uint8_t> VshardProxy::CallRawBytesWithModeString(
+    BucketId bucket_id, impl::CallMode mode, std::string_view mode_string,
+    std::string_view func, const uint8_t* args_data, std::size_t args_len,
+    storages::tarantool::OptionalCommandControl cc) {
+    auto query = BuildStorageCallQueryRawWithModeString(
+        bucket_id, mode_string, func, args_data, args_len);
+    return DoCallRawBytes(bucket_id, mode, query, cc);
+}
+
 // ---------------------------------------------------------------------------
 // Core call implementation with MOVED/TRANSFER retry
 // ---------------------------------------------------------------------------
@@ -128,13 +196,20 @@ storages::tarantool::Query VshardProxy::BuildStorageCallQuery(
 storages::tarantool::Query VshardProxy::BuildStorageCallQueryRaw(
     BucketId bucket_id, impl::CallMode mode, std::string_view func,
     const uint8_t* args_data, std::size_t args_len) const {
-    // Build the msgpack array [bucket_id, mode_str, func_name, args_array]
-    // manually, copying args_data verbatim — no Value tree constructed.
     const std::string_view vshard_mode =
         (mode == impl::CallMode::kReadWrite) ? "write" : "read";
+    return BuildStorageCallQueryRawWithModeString(
+        bucket_id, vshard_mode, func, args_data, args_len);
+}
+
+storages::tarantool::Query VshardProxy::BuildStorageCallQueryRawWithModeString(
+    BucketId bucket_id, std::string_view mode_string, std::string_view func,
+    const uint8_t* args_data, std::size_t args_len) const {
+    // Build the msgpack array [bucket_id, mode_str, func_name, args_array]
+    // manually, copying args_data verbatim — no Value tree constructed.
 
     std::vector<uint8_t> buf;
-    buf.reserve(1 + 5 + 1 + vshard_mode.size() + 1 + func.size() + args_len);
+    buf.reserve(1 + 5 + 1 + mode_string.size() + 1 + func.size() + args_len);
 
     // fixarray(4)
     buf.push_back(static_cast<uint8_t>(mp::kFixArrayMin | 4));
@@ -146,9 +221,14 @@ storages::tarantool::Query VshardProxy::BuildStorageCallQueryRaw(
     buf.push_back(static_cast<uint8_t>(bucket_id >>  8));
     buf.push_back(static_cast<uint8_t>(bucket_id));
 
-    // [1] mode string (always ≤ 5 chars — fits in fixstr)
-    buf.push_back(static_cast<uint8_t>(mp::kFixStrMin | vshard_mode.size()));
-    buf.insert(buf.end(), vshard_mode.begin(), vshard_mode.end());
+    // [1] mode string
+    if (mode_string.size() <= 31) {
+        buf.push_back(static_cast<uint8_t>(mp::kFixStrMin | mode_string.size()));
+    } else {
+        buf.push_back(mp::kStr8);
+        buf.push_back(static_cast<uint8_t>(mode_string.size()));
+    }
+    buf.insert(buf.end(), mode_string.begin(), mode_string.end());
 
     // [2] func name (fixstr or str8)
     if (func.size() <= 31) {
@@ -388,6 +468,8 @@ std::vector<uint8_t> VshardProxy::DoCallRawBytes(
         storages::tarantool::ExecutionResult raw;
         try {
             raw = rs->Execute(mode, query, cc);
+        } catch (const storages::tarantool::CommandException& ex) {
+            return BuildStorageCallErrorReturn(ex.what());
         } catch (const storages::tarantool::TarantoolException& ex) {
             LOG_WARNING() << "vshard.storage.call network error (bucket="
                           << bucket_id << " attempt=" << attempt
@@ -399,12 +481,12 @@ std::vector<uint8_t> VshardProxy::DoCallRawBytes(
         impl::RawEnvelopeResult env;
         try {
             env = impl::DecodeEnvelopeRaw(raw);
-        } catch (const storages::tarantool::CommandException&) {
-            throw;
+        } catch (const storages::tarantool::CommandException& ex) {
+            return BuildStorageCallErrorReturn(ex.what());
         }
 
-        if (env.ok) {
-            return std::move(env.app_result_bytes);
+        if (env.status != impl::RawEnvelopeStatus::kVshardError) {
+            return std::move(env.return_values_bytes);
         }
 
         HandleVshardError(env.vshard_error, bucket_id, attempt, snapshot, rs, deadline);

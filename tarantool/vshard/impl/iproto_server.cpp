@@ -299,6 +299,7 @@ struct VshardRouterArgs {
     std::string_view func_name;      ///< inner function, e.g. "box.space.customer:replace"
     const uint8_t*   args_begin{nullptr};  ///< raw msgpack value for the args array
     std::size_t      args_len{0};
+    std::string_view storage_mode{"write"};  ///< exact mode forwarded to storage.call
     CallMode         mode{CallMode::kReadWrite};  ///< resolved call mode
     bool             prefer_replica{false};
     bool             balance{false};
@@ -417,8 +418,10 @@ static double ParseTimeoutFromOpts(const uint8_t* p, std::size_t len,
 
 /// Resolve CallMode from a mode string ("read" or "write").
 static CallMode ModeFromString(std::string_view s) noexcept {
-    if (s == "write") return CallMode::kReadWrite;
-    return CallMode::kReadOnly;  // "read" or any other value
+    // Lua vshard treats only exact "read" as read mode.
+    // Any other string falls back to write mode.
+    if (s == "read") return CallMode::kReadOnly;
+    return CallMode::kReadWrite;
 }
 
 /// Resolve the final CallMode from base mode + prefer_replica + balance flags.
@@ -488,6 +491,7 @@ ParseVshardRouterCallArgs(const uint8_t* p, std::size_t len) noexcept {
     // 2. mode: string or map
     if (IsMsgpackStr(p, len, pos)) {
         auto [mode_str, mp2] = ReadStr(p, len, pos); pos = mp2;
+        out.storage_mode = mode_str;
         out.mode = ModeFromString(mode_str);
     } else if (IsMsgpackMap(p, len, pos)) {
         // Parse opts table: {mode=str, prefer_replica=bool, balance=bool}
@@ -497,6 +501,7 @@ ParseVshardRouterCallArgs(const uint8_t* p, std::size_t len) noexcept {
             auto [key, kp] = ReadStr(p, len, pos); pos = kp;
             if (key == "mode") {
                 auto [val, vp] = ReadStr(p, len, pos); pos = vp;
+                out.storage_mode = val;
                 out.mode = ModeFromString(val);
             } else if (key == "prefer_replica") {
                 // Read bool: true (0xc3) or false (0xc2)
@@ -674,16 +679,17 @@ static std::vector<uint8_t> BuildRouteAllResultFrame(
     return BuildOkFrame(sync, body.data(), body.size());
 }
 
-/// Zero-copy variant: result_data is already a msgpack-encoded value.
+/// Zero-copy variant: return_values_data is already a msgpack-encoded array of
+/// router return values (for example [result] or [nil, err]).
 static std::vector<uint8_t> BuildResultFrameRaw(
-    uint64_t sync, const uint8_t* result_data, std::size_t result_len) {
-    // body = fixmap(1) + {DATA: fixarray(1) + raw_result_bytes}
+    uint64_t sync, const uint8_t* return_values_data, std::size_t return_values_len) {
+    // body = fixmap(1) + {DATA: raw_return_values_array}
     std::vector<uint8_t> body;
-    body.reserve(3 + result_len);
+    body.reserve(2 + return_values_len);
     PushFixMap(body, 1);
     body.push_back(static_cast<uint8_t>(Iproto::DATA));
-    PushFixArray(body, 1);
-    body.insert(body.end(), result_data, result_data + result_len);
+    body.insert(
+        body.end(), return_values_data, return_values_data + return_values_len);
     return BuildOkFrame(sync, body.data(), body.size());
 }
 
@@ -902,10 +908,13 @@ static void HandleConnection(engine::io::Socket sock,
                         std::chrono::milliseconds{
                             static_cast<int64_t>(vargs->timeout * 1000.0)}};
                 }
-                const auto result_bytes = proxy.CallRawBytes(
-                    vargs->bucket_id, mode,
-                    vargs->func_name,
-                    vargs->args_begin, vargs->args_len, cc);
+                const auto result_bytes = is_generic_call
+                    ? proxy.CallRawBytesWithModeString(
+                          vargs->bucket_id, mode, vargs->storage_mode,
+                          vargs->func_name, vargs->args_begin, vargs->args_len, cc)
+                    : proxy.CallRawBytes(
+                          vargs->bucket_id, mode, vargs->func_name,
+                          vargs->args_begin, vargs->args_len, cc);
 
                 const auto resp = BuildResultFrameRaw(
                     req.sync, result_bytes.data(), result_bytes.size());
