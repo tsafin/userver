@@ -25,6 +25,10 @@ Pool::Pool(clients::dns::Resolver& resolver, PoolSettings settings)
 
 Pool::~Pool() = default;
 
+ConnectionPtr Pool::Acquire(engine::Deadline deadline) {
+    return impl_->Acquire(deadline);
+}
+
 ExecutionResult Pool::Execute(OptionalCommandControl cc, const Query& query) {
     const engine::Deadline deadline =
         cc ? engine::Deadline::FromDuration(cc->execute)

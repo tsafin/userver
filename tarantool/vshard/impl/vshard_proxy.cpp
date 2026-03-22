@@ -3,6 +3,8 @@
 #include <chrono>
 #include <cctype>
 #include <cstdint>
+#include <algorithm>
+#include <unordered_set>
 
 #include <userver/engine/deadline.hpp>
 #include <userver/engine/io/exception.hpp>
@@ -12,6 +14,7 @@
 #include <userver/storages/tarantool/query.hpp>
 #include <userver/utils/async.hpp>
 
+#include <storages/tarantool/impl/connection.hpp>
 #include <storages/tarantool/impl/iproto_frames.hpp>
 #include <storages/tarantool/impl/msgpack.hpp>
 #include <vshard/impl/iproto_vshard_frames.hpp>
@@ -125,6 +128,48 @@ void HandleDirectCallException(
         RethrowDirectCallNetworkError(rs, bucket_id, ex);
     }
     throw;
+}
+
+struct DirectCallResult {
+    bool ok{true};
+    formats::msgpack::Value value;
+    std::string message;
+    std::optional<uint32_t> code;
+};
+
+DirectCallResult ParseDirectCallResult(
+    const storages::tarantool::ExecutionResult& raw) {
+    raw.AssertOk();
+    const auto& data = raw.GetData();
+    if (!data.IsArray() || data.GetSize() == 0) {
+        throw storages::tarantool::TarantoolException{
+            "Unexpected direct CALL reply shape"};
+    }
+
+    DirectCallResult result;
+    if (data[0].IsNull()) {
+        result.ok = false;
+        if (data.GetSize() >= 2) {
+            const auto& err = data[1];
+            if (err.IsObject()) {
+                result.message = err["message"].As<std::string>("");
+                if (!err["code"].IsMissing()) {
+                    result.code = err["code"].As<uint32_t>();
+                }
+            } else if (err.IsString()) {
+                result.message = err.As<std::string>("");
+            }
+        }
+        if (result.message.empty()) {
+            result.message = "vshard direct call failed";
+        }
+        return result;
+    }
+
+    if (data.GetSize() >= 2) {
+        result.value = data[1];
+    }
+    return result;
 }
 
 }  // namespace
@@ -689,13 +734,51 @@ formats::msgpack::Value VshardProxy::ForwardVshardCall(
     }
 }
 
-std::vector<formats::msgpack::Value> VshardProxy::MapCallRW(
+std::vector<VshardProxy::MapCallRWEntry> VshardProxy::MapCallRW(
     std::string_view func,
-    formats::msgpack::ValueBuilder args,
-    storages::tarantool::OptionalCommandControl cc) {
+    const uint8_t* args_data, std::size_t args_len,
+    storages::tarantool::OptionalCommandControl cc,
+    std::optional<std::vector<BucketId>> bucket_ids) {
 
     auto snapshot = routing_table_.Read();
-    const auto& replicasets = snapshot->replicasets;
+    std::vector<std::shared_ptr<impl::ReplicasetPool>> replicasets;
+    if (bucket_ids) {
+        std::unordered_set<std::string> seen;
+        for (const auto bid : *bucket_ids) {
+            const auto discovery = fetcher_->DiscoverBucket(bid);
+            if (discovery.HasOwner()) {
+                routing_table_.PatchBucketOwnerByIndex(bid, discovery.rs_idx);
+            } else if (discovery.HasUnreachableReplicaset()) {
+                throw UnreachableReplicasetError{
+                    discovery.unreachable_replicaset_id, bid};
+            } else if (discovery.HasOtherError()) {
+                throw VshardException{discovery.error_message};
+            } else {
+                throw NoRouteToBucketError{bid};
+            }
+
+            auto local_snapshot = routing_table_.Read();
+            auto* rs = local_snapshot->FindReplicaset(bid);
+            if (!rs) throw NoReplicasetError{bid};
+            const auto& uuid = rs->GetUuid();
+            if (!seen.insert(uuid).second) continue;
+            for (const auto& rs_ptr : local_snapshot->replicasets) {
+                if (rs_ptr->GetUuid() == uuid) {
+                    replicasets.push_back(rs_ptr);
+                    break;
+                }
+            }
+        }
+    } else {
+        replicasets = snapshot->replicasets;
+    }
+
+    std::sort(
+        replicasets.begin(), replicasets.end(),
+        [](const auto& lhs, const auto& rhs) {
+            return lhs->GetUuid() < rhs->GetUuid();
+        });
+
     const auto num_rs = replicasets.size();
     if (num_rs == 0) {
         throw VshardException{"MapCallRW: no replicasets available"};
@@ -708,22 +791,38 @@ std::vector<formats::msgpack::Value> VshardProxy::MapCallRW(
     // Allocate a unique ref ID for this map-reduce operation
     const uint64_t rid = ref_id_.fetch_add(1, std::memory_order_relaxed);
 
+    struct SessionContext {
+        std::shared_ptr<impl::ReplicasetPool> rs;
+        storages::tarantool::impl::ConnectionPtr conn;
+        bool ref_created{false};
+    };
+
+    std::vector<SessionContext> sessions;
+    sessions.reserve(num_rs);
+    for (auto& rs : replicasets) {
+        sessions.push_back(SessionContext{rs, rs->AcquireMaster(deadline), false});
+    }
+
     // Serialize user args once for sharing across tasks
-    auto user_args_bytes = std::move(args).ToBytes();
+    const std::vector<uint8_t> user_args_bytes{
+        args_data, args_data + args_len};
     const std::string func_str{func};
 
-    // Helper: build unref query and send to all RS (best-effort)
-    auto unref_all = [&replicasets, rid, &cc]() {
-        auto ua = formats::msgpack::ValueBuilder::Array();
-        ua.PushBack(formats::msgpack::ValueBuilder{"storage_unref"});
-        ua.PushBack(formats::msgpack::ValueBuilder{static_cast<int64_t>(rid)});
-        auto unref_q = storages::tarantool::Query::WithRawArgs(
+    // Helper: build unref query and send to all sessions where ref is still held.
+    auto unref_all = [&sessions, rid, deadline]() {
+        std::vector<uint8_t> args;
+        tnt::EncodeArray(args, 2);
+        tnt::EncodeStr(args, "storage_unref");
+        tnt::EncodeUint(args, rid);
+        const auto unref_q = storages::tarantool::Query::WithRawArgs(
             storages::tarantool::Query::Type::kCall,
             "vshard.storage._call",
-            std::move(ua).ToBytes());
-        for (const auto& rs_ptr : replicasets) {
+            std::move(args));
+        for (auto& session : sessions) {
+            if (!session.ref_created) continue;
             try {
-                rs_ptr->Execute(impl::CallMode::kReadWrite, unref_q, cc);
+                session.conn->Execute(
+                    engine::Deadline::FromDuration(deadline.TimeLeft()), unref_q);
             } catch (...) {}
         }
     };
@@ -735,23 +834,42 @@ std::vector<formats::msgpack::Value> VshardProxy::MapCallRW(
         const double timeout_secs =
             std::chrono::duration<double>(deadline.TimeLeft()).count();
 
-        auto ra = formats::msgpack::ValueBuilder::Array();
-        ra.PushBack(formats::msgpack::ValueBuilder{"storage_ref"});
-        ra.PushBack(formats::msgpack::ValueBuilder{static_cast<int64_t>(rid)});
-        ra.PushBack(formats::msgpack::ValueBuilder{timeout_secs});
-        auto ref_query = storages::tarantool::Query::WithRawArgs(
+        std::vector<uint8_t> ref_args;
+        tnt::EncodeArray(ref_args, 3);
+        tnt::EncodeStr(ref_args, "storage_ref");
+        tnt::EncodeUint(ref_args, rid);
+        formats::msgpack::ValueBuilder{timeout_secs}.AppendTo(ref_args);
+        const auto ref_query = storages::tarantool::Query::WithRawArgs(
             storages::tarantool::Query::Type::kCall,
             "vshard.storage._call",
-            std::move(ra).ToBytes());
+            std::move(ref_args));
 
         std::vector<engine::TaskWithResult<void>> ref_tasks;
         ref_tasks.reserve(num_rs);
-        for (const auto& rs_ptr : replicasets) {
-            auto* rs = rs_ptr.get();
+        for (auto& session : sessions) {
             ref_tasks.emplace_back(utils::Async(
                 "vshard_ref",
-                [rs, &ref_query, &cc]() {
-                    rs->Execute(impl::CallMode::kReadWrite, ref_query, cc);
+                [&session, &ref_query, deadline]() {
+                    try {
+                        const auto raw = session.conn->Execute(
+                            engine::Deadline::FromDuration(deadline.TimeLeft()),
+                            ref_query);
+                        const auto result = ParseDirectCallResult(raw);
+                        if (!result.ok) {
+                            throw MapCallRWException(
+                                std::string{result.message},
+                                std::string{session.rs->GetUuid()},
+                                result.code);
+                        }
+                        session.ref_created = true;
+                    } catch (const storages::tarantool::CommandException& ex) {
+                        throw MapCallRWException{
+                            ex.what(), session.rs->GetUuid(),
+                            ex.GetErrorCode()};
+                    } catch (const std::exception& ex) {
+                        throw MapCallRWException{
+                            ex.what(), session.rs->GetUuid()};
+                    }
                 }));
         }
 
@@ -765,67 +883,56 @@ std::vector<formats::msgpack::Value> VshardProxy::MapCallRW(
         }
     }
 
-    // --- Map stage: execute user function on all RS ---
-    // Calls vshard.storage._call('storage_map', rid, func, args) on each RS.
-    // Build raw msgpack: fixarray(4) + 'storage_map' + rid + func + user_args
-    std::vector<uint8_t> map_query_bytes;
-    {
-        using namespace storages::tarantool::impl::msgpack_scan;
-        // array header (4 elements)
-        map_query_bytes.push_back(mp::kFixArrayMin | 4);
-        // 'storage_map' (11 chars)
-        map_query_bytes.push_back(mp::kFixStrMin | 11);
-        const char* sm = "storage_map";
-        map_query_bytes.insert(map_query_bytes.end(), sm, sm + 11);
-        // rid as uint64
-        map_query_bytes.push_back(mp::kUint64);
-        for (int i = 7; i >= 0; --i)
-            map_query_bytes.push_back(static_cast<uint8_t>(rid >> (i * 8)));
-        // func name
-        const auto flen = func_str.size();
-        if (flen <= 31) {
-            map_query_bytes.push_back(
-                static_cast<uint8_t>(mp::kFixStrMin | flen));
-        } else {
-            map_query_bytes.push_back(mp::kStr16);
-            map_query_bytes.push_back(static_cast<uint8_t>(flen >> 8));
-            map_query_bytes.push_back(static_cast<uint8_t>(flen));
-        }
-        map_query_bytes.insert(map_query_bytes.end(),
-                               func_str.data(), func_str.data() + flen);
-        // user args: already a valid msgpack value, embed verbatim
-        map_query_bytes.insert(map_query_bytes.end(),
-                               user_args_bytes.begin(), user_args_bytes.end());
-    }
-
-    std::vector<engine::TaskWithResult<formats::msgpack::Value>> map_tasks;
+    std::vector<engine::TaskWithResult<MapCallRWEntry>> map_tasks;
     map_tasks.reserve(num_rs);
 
-    for (const auto& rs_ptr : replicasets) {
-        auto* rs = rs_ptr.get();
+    for (auto& session : sessions) {
         map_tasks.emplace_back(utils::Async(
             "vshard_map_call",
-            [rs, &map_query_bytes, &cc]()
-                -> formats::msgpack::Value {
-                auto q = storages::tarantool::Query::WithRawArgs(
-                    storages::tarantool::Query::Type::kCall,
-                    "vshard.storage._call",
-                    map_query_bytes);
-                const auto raw =
-                    rs->Execute(impl::CallMode::kReadWrite, q, cc);
-                const auto env = impl::DecodeEnvelope(raw);
-                if (!env.vshard_error.IsNull()) {
-                    throw VshardStorageError{
-                        env.vshard_error.code,
-                        "MAP_CALL_ERROR",
-                        env.vshard_error.message};
+            [&session, rid, &func_str, &user_args_bytes, deadline]()
+                -> MapCallRWEntry {
+                try {
+                    std::vector<uint8_t> map_query_bytes;
+                    map_query_bytes.reserve(
+                        32 + func_str.size() + user_args_bytes.size());
+                    tnt::EncodeArray(map_query_bytes, 4);
+                    tnt::EncodeStr(map_query_bytes, "storage_map");
+                    tnt::EncodeUint(map_query_bytes, rid);
+                    tnt::EncodeStr(map_query_bytes, func_str);
+                    map_query_bytes.insert(
+                        map_query_bytes.end(),
+                        user_args_bytes.begin(), user_args_bytes.end());
+                    auto q = storages::tarantool::Query::WithRawArgs(
+                        storages::tarantool::Query::Type::kCall,
+                        "vshard.storage._call",
+                        std::move(map_query_bytes));
+                    const auto raw = session.conn->Execute(
+                        engine::Deadline::FromDuration(deadline.TimeLeft()), q);
+                    session.ref_created = false;
+                    const auto result = ParseDirectCallResult(raw);
+                    if (!result.ok) {
+                        throw MapCallRWException(
+                            std::string{result.message},
+                            std::string{session.rs->GetUuid()},
+                            result.code);
+                    }
+                    return MapCallRWEntry{
+                        session.rs->GetUuid(), std::move(result.value)};
+                } catch (const storages::tarantool::CommandException& ex) {
+                    throw MapCallRWException{
+                        ex.what(), session.rs->GetUuid(),
+                        ex.GetErrorCode()};
+                } catch (const MapCallRWException&) {
+                    throw;
+                } catch (const std::exception& ex) {
+                    throw MapCallRWException{
+                        ex.what(), session.rs->GetUuid()};
                 }
-                return env.app_result;
             }));
     }
 
     // Collect map results
-    std::vector<formats::msgpack::Value> results;
+    std::vector<MapCallRWEntry> results;
     results.reserve(num_rs);
     std::exception_ptr map_error;
     for (auto& t : map_tasks) {

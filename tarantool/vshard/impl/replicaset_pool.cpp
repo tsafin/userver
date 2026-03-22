@@ -67,6 +67,11 @@ storages::tarantool::ExecutionResult ReplicasetPool::Execute(
     return master_->Execute(cc, query);
 }
 
+storages::tarantool::impl::ConnectionPtr ReplicasetPool::AcquireMaster(
+    engine::Deadline deadline) {
+    return master_->Acquire(deadline);
+}
+
 storages::tarantool::ExecutionResult ReplicasetPool::ForwardStorageCall(
     CallMode mode,
     const storages::tarantool::impl::CallRouteInfo& info,

@@ -8,6 +8,7 @@
 #include <string>
 #include <vector>
 
+#include <userver/engine/deadline.hpp>
 #include <userver/storages/tarantool/options.hpp>
 #include <userver/storages/tarantool/query.hpp>
 #include <userver/storages/tarantool/result.hpp>
@@ -51,6 +52,9 @@ class ReplicasetPool final {
         CallMode mode,
         const storages::tarantool::Query& query,
         storages::tarantool::OptionalCommandControl cc = {});
+
+    storages::tarantool::impl::ConnectionPtr AcquireMaster(
+        engine::Deadline deadline);
 
     /// Forward a pre-parsed IPROTO CALL body as vshard.storage.call.
     /// No msgpack re-encoding: TUPLE bytes are copied once from info.

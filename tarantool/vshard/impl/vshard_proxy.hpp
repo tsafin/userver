@@ -4,6 +4,7 @@
 /// @brief C++ reimplementation of the vshard router.
 
 #include <chrono>
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <string>
@@ -156,10 +157,38 @@ class VshardProxy final {
 
     /// Fan out to all replicasets in parallel; collect all results.
     /// @throws VshardException if any single replicaset call fails.
-    std::vector<formats::msgpack::Value> MapCallRW(
+    struct MapCallRWEntry {
+        std::string replicaset_id;
+        formats::msgpack::Value value;
+    };
+
+    class MapCallRWException : public std::runtime_error {
+     public:
+        MapCallRWException(
+            std::string message, std::string replicaset_id,
+            std::optional<uint32_t> error_code = std::nullopt)
+            : std::runtime_error(std::move(message)),
+              replicaset_id_(std::move(replicaset_id)),
+              error_code_(error_code) {}
+
+        const std::string& GetReplicasetId() const noexcept {
+            return replicaset_id_;
+        }
+
+        std::optional<uint32_t> GetErrorCode() const noexcept {
+            return error_code_;
+        }
+
+     private:
+        std::string replicaset_id_;
+        std::optional<uint32_t> error_code_;
+    };
+
+    std::vector<MapCallRWEntry> MapCallRW(
         std::string_view func,
-        formats::msgpack::ValueBuilder args,
-        storages::tarantool::OptionalCommandControl = {});
+        const uint8_t* args_data, std::size_t args_len,
+        storages::tarantool::OptionalCommandControl = {},
+        std::optional<std::vector<BucketId>> bucket_ids = std::nullopt);
 
     // ---- Utilities ----------------------------------------------------------
 

@@ -378,6 +378,42 @@ class TestSync:
             assert err['message'] == 'Timeout exceeded'
 
 
+class TestMapCallRW:
+    """vshard.router.map_callrw."""
+
+    def test_map_callrw_matches_lua(self, lua_conn, cpp_conn):
+        lua_result = lua_conn.call('vshard.router.map_callrw', ['echo', ['x']])
+        cpp_result = cpp_conn.call('vshard.router.map_callrw', ['echo', ['x']])
+        assert cpp_result.data == lua_result.data
+
+    def test_map_callrw_timeout_matches_lua(self, lua_conn, cpp_conn):
+        args = ['echo', ['x'], {'timeout': 0.5}]
+        lua_result = lua_conn.call('vshard.router.map_callrw', args)
+        cpp_result = cpp_conn.call('vshard.router.map_callrw', args)
+        assert cpp_result.data == lua_result.data
+
+    def test_map_callrw_bucket_ids_matches_lua(self, lua_conn, cpp_conn):
+        args = ['echo', ['x'], {'bucket_ids': [1]}]
+        lua_result = lua_conn.call('vshard.router.map_callrw', args)
+        cpp_result = cpp_conn.call('vshard.router.map_callrw', args)
+        assert cpp_result.data == lua_result.data
+
+    def test_map_callrw_missing_function_matches_lua(self, lua_conn, cpp_conn):
+        args = ['no_such_fn', []]
+        lua_result = lua_conn.call('vshard.router.map_callrw', args)
+        cpp_result = cpp_conn.call('vshard.router.map_callrw', args)
+
+        assert lua_result.data[0] is None
+        assert cpp_result.data[0] is None
+        assert cpp_result.data[2] == lua_result.data[2]
+
+        lua_err = lua_result.data[1]
+        cpp_err = cpp_result.data[1]
+        assert cpp_err['code'] == lua_err['code']
+        assert cpp_err['type'] == lua_err['type']
+        assert cpp_err['message'] == lua_err['message']
+
+
 class TestRouteAll:
     """vshard.router.routeall — list all replicasets."""
 

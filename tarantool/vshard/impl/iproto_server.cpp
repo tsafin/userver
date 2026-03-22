@@ -198,6 +198,15 @@ struct ParsedRouterOpts {
     bool valid{true};
 };
 
+struct ParsedMapCallRWArgs {
+    std::string_view func_name;
+    const uint8_t* args_begin{nullptr};
+    std::size_t args_len{0};
+    double timeout{0.0};
+    bool opts_valid{true};
+    std::optional<std::vector<BucketId>> bucket_ids;
+};
+
 /// Parse call opts from a msgpack map at the current position.
 /// Expects pos to point at a msgpack map.
 /// Validates numeric timeout/request_timeout fields like Lua vshard does.
@@ -232,6 +241,77 @@ static ParsedRouterOpts ParseCallOpts(const uint8_t* p, std::size_t len,
         }
     }
     return opts;
+}
+
+static std::optional<std::vector<BucketId>> ParseBucketIdArray(
+    const uint8_t* p, std::size_t len, std::size_t& pos) noexcept {
+    using namespace storages::tarantool::impl::msgpack_scan;
+    const auto count = ReadArrayHeader(p, len, pos);
+    std::vector<BucketId> bucket_ids;
+    bucket_ids.reserve(count);
+    for (std::size_t i = 0; i < count; ++i) {
+        if (!IsNumber(p, len, pos)) return std::nullopt;
+        auto [bid, np] = ReadUint(p, len, pos);
+        pos = np;
+        bucket_ids.push_back(static_cast<BucketId>(bid));
+    }
+    return bucket_ids;
+}
+
+static ParsedMapCallRWArgs ParseMapCallRWArgs(
+    const uint8_t* p, std::size_t len) noexcept {
+    using namespace storages::tarantool::impl::msgpack_scan;
+    ParsedMapCallRWArgs out;
+    std::size_t pos = 0;
+    const auto alen = ReadArrayHeader(p, len, pos);
+    if (alen < 2) {
+        out.opts_valid = false;
+        return out;
+    }
+
+    auto [fn, fp] = ReadStr(p, len, pos);
+    pos = fp;
+    if (fn.empty()) {
+        out.opts_valid = false;
+        return out;
+    }
+    out.func_name = fn;
+
+    out.args_begin = p + pos;
+    pos = SkipValue(p, len, pos);
+    out.args_len = static_cast<std::size_t>((p + pos) - out.args_begin);
+
+    if (alen < 3 || pos >= len) return out;
+    if (!IsMap(p, len, pos)) {
+        out.opts_valid = false;
+        pos = SkipValue(p, len, pos);
+        return out;
+    }
+
+    const auto map_len = ReadMapHeader(p, len, pos);
+    for (std::size_t i = 0; i < map_len; ++i) {
+        auto [key, kp] = ReadStr(p, len, pos);
+        pos = kp;
+        if (key == "timeout") {
+            if (!IsNumber(p, len, pos)) {
+                out.opts_valid = false;
+                pos = SkipValue(p, len, pos);
+                continue;
+            }
+            out.timeout = ReadNumberAsDouble(p, len, pos);
+        } else if (key == "bucket_ids") {
+            auto bucket_ids = ParseBucketIdArray(p, len, pos);
+            if (!bucket_ids) {
+                out.opts_valid = false;
+                return out;
+            }
+            out.bucket_ids = std::move(bucket_ids);
+        } else {
+            pos = SkipValue(p, len, pos);
+        }
+    }
+
+    return out;
 }
 
 static std::optional<std::chrono::milliseconds> MillisecondsFromSeconds(
@@ -600,6 +680,39 @@ static std::vector<uint8_t> BuildTimeoutClientErrorReturn(
     return payload;
 }
 
+static std::vector<uint8_t> BuildMapCallRWClientErrorReturn(
+    std::string_view message, uint32_t code,
+    std::optional<std::string_view> replicaset_id,
+    std::string_view trace_file = "./src/box/lua/call.c",
+    uint32_t trace_line = 116) {
+    std::vector<uint8_t> payload;
+    payload.reserve(192 + message.size() +
+                    (replicaset_id ? replicaset_id->size() : 0));
+
+    tnt::EncodeArray(payload, replicaset_id ? 3 : 2);
+    payload.push_back(mp::kNil);
+    PushMapHeader(payload, 5);
+    tnt::EncodeStr(payload, "code");
+    tnt::EncodeUint(payload, code);
+    tnt::EncodeStr(payload, "base_type");
+    tnt::EncodeStr(payload, "ClientError");
+    tnt::EncodeStr(payload, "type");
+    tnt::EncodeStr(payload, "ClientError");
+    tnt::EncodeStr(payload, "message");
+    tnt::EncodeStr(payload, message);
+    tnt::EncodeStr(payload, "trace");
+    tnt::EncodeArray(payload, 1);
+    PushMapHeader(payload, 2);
+    tnt::EncodeStr(payload, "file");
+    tnt::EncodeStr(payload, trace_file);
+    tnt::EncodeStr(payload, "line");
+    tnt::EncodeUint(payload, trace_line);
+    if (replicaset_id) {
+        tnt::EncodeStr(payload, *replicaset_id);
+    }
+    return payload;
+}
+
 static std::vector<uint8_t> BuildRouterShardingErrorReturn(
     uint32_t code, std::string_view name, std::string_view message,
     std::optional<std::string_view> replicaset_id,
@@ -910,6 +1023,62 @@ static void HandleConnection(engine::io::Socket sock,
                     const auto resp = BuildResultFrameRaw(
                         req.sync, result_bytes.data(), result_bytes.size());
                     (void)sock.SendAll(resp.data(), resp.size(), engine::Deadline{});
+                    continue;
+
+                } else if (body->func_name == "vshard.router.map_callrw") {
+                    const auto map_args = ParseMapCallRWArgs(
+                        body->tuple_begin, body->tuple_len);
+                    if (!map_args.opts_valid || map_args.func_name.empty() ||
+                        !map_args.args_begin) {
+                        const auto resp = tnt::BuildIprotoErrorFrame(
+                            req.sync, kSchemaVersion,
+                            "Usage: vshard.router.map_callrw(func, args[, opts])");
+                        (void)sock.SendAll(resp.data(), resp.size(), engine::Deadline{});
+                        continue;
+                    }
+
+                    storages::tarantool::OptionalCommandControl cc;
+                    if (const auto timeout_ms =
+                            MillisecondsFromSeconds(map_args.timeout)) {
+                        cc = storages::tarantool::CommandControl{*timeout_ms};
+                    }
+
+                    try {
+                        const auto results = proxy.MapCallRW(
+                            map_args.func_name, map_args.args_begin,
+                            map_args.args_len, cc, map_args.bucket_ids);
+
+                        auto map = formats::msgpack::ValueBuilder::Object();
+                        for (const auto& entry : results) {
+                            auto values = formats::msgpack::ValueBuilder::Array();
+                            if (!entry.value.IsNull()) {
+                                values.PushBack(
+                                    formats::msgpack::ValueBuilder{entry.value});
+                            }
+                            map[entry.replicaset_id] = std::move(values);
+                        }
+                        auto return_values = std::vector<uint8_t>{};
+                        tnt::EncodeArray(return_values, 1);
+                        const auto map_bytes = map.ToBytes();
+                        return_values.insert(
+                            return_values.end(), map_bytes.begin(), map_bytes.end());
+                        const auto resp = BuildResultFrameRaw(
+                            req.sync, return_values.data(), return_values.size());
+                        (void)sock.SendAll(resp.data(), resp.size(), engine::Deadline{});
+                    } catch (const VshardProxy::MapCallRWException& ex) {
+                        const auto result_bytes = IsConnectivityErrorMessage(ex.what())
+                            ? BuildMapCallRWClientErrorReturn(
+                                  NormalizeNetboxClientErrorMessage(ex.what()),
+                                  77, ex.GetReplicasetId(),
+                                  "builtin/box/net_box.lua", 540)
+                            : BuildMapCallRWClientErrorReturn(
+                                  ex.what(),
+                                  ex.GetErrorCode().value_or(32),
+                                  ex.GetReplicasetId());
+                        const auto resp = BuildResultFrameRaw(
+                            req.sync, result_bytes.data(), result_bytes.size());
+                        (void)sock.SendAll(resp.data(), resp.size(), engine::Deadline{});
+                    }
                     continue;
 
                 } else {

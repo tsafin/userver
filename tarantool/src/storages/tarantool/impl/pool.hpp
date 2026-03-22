@@ -4,12 +4,14 @@
 #include <string>
 
 #include <userver/clients/dns/resolver_fwd.hpp>
+#include <userver/engine/deadline.hpp>
 #include <userver/storages/tarantool/options.hpp>
 #include <userver/storages/tarantool/query.hpp>
 #include <userver/storages/tarantool/result.hpp>
 #include <userver/utils/statistics/writer.hpp>
 
 #include <storages/tarantool/impl/iproto_frames.hpp>
+#include <storages/tarantool/impl/connection_ptr.hpp>
 #include <storages/tarantool/impl/settings.hpp>
 
 USERVER_NAMESPACE_BEGIN
@@ -27,6 +29,8 @@ class Pool final {
     Pool(Pool&&) = default;
 
     ExecutionResult Execute(OptionalCommandControl cc, const Query& query);
+
+    ConnectionPtr Acquire(engine::Deadline deadline);
 
     /// Forward a pre-parsed IPROTO CALL body to storage as vshard.storage.call.
     /// Builds body from kStorageCallBodyPrefix + raw TUPLE bytes (one memcpy);
