@@ -1,10 +1,9 @@
 """Conftest for vshard C++ proxy functional tests.
 
-Cluster topology:
-  RS1: master (port A), replica (port A+1)
-  RS2: master (port A+2), replica (port A+3)
-  Lua router: port A+4
-  C++ proxy:  port A+5 (started as subprocess)
+The functional tests reuse a local vshard example cluster via `make start` /
+`make stop`, with the path supplied explicitly via `--vshard-path` or the
+`VSHARD_PATH` environment variable. This matches the benchmark workflow and
+avoids hardcoded host-local paths in the test harness.
 
 Lock-step mode: tests receive both lua_conn and cpp_conn fixtures to compare.
 
@@ -15,27 +14,32 @@ import json
 import os
 import pathlib
 import subprocess
-import tempfile
 import time
 
 import pytest
 import tarantool
 
-# Bucket count for the test cluster (small for fast bootstrap).
-BUCKET_COUNT = 300
+# Bucket count for the local vshard example cluster.
+BUCKET_COUNT = 3000
 
-# Fixed UUIDs matching the Lua init scripts.
+# Fixed UUIDs matching the canonical vshard example localcfg.lua.
 RS1_UUID = 'cbf06940-0790-498b-948d-042b62cf3d29'
-RS2_UUID = 'ac522f65-a15e-4b1b-af2b-3a0a67d36fef'
+RS2_UUID = 'ac522f65-aa94-4134-9f64-51ee384f1a54'
 INSTANCE_UUIDS = {
     'rs1_master':  '8a274925-a26d-47fc-9e1b-af88ce939412',
-    'rs1_replica': 'a3ef657e-eb4a-4f47-8a38-1a0e04517b15',
+    'rs1_replica': '3de2e3e1-9ebe-4d0d-abb1-26d301b84633',
     'rs2_master':  '1e02ae8a-afc0-4e91-ba34-843a356b8ed7',
-    'rs2_replica': 'd5b83e4c-93af-476e-bb2b-c0a56c5e19f8',
+    'rs2_replica': '001688c3-66f8-4a31-8e19-036c17d489c2',
 }
 
 
 def pytest_addoption(parser):
+    parser.addini(
+        'mockserver-tracing-enabled',
+        'Compatibility shim for repo-level pytest.ini when running this suite '
+        'without the plugin that normally registers the option.',
+        default='true',
+    )
     parser.addoption(
         '--proxy-binary',
         default=None,
@@ -44,21 +48,21 @@ def pytest_addoption(parser):
     parser.addoption(
         '--vshard-path',
         default=None,
-        help='Path to vshard Lua module directory (containing vshard/init.lua)',
+        help='Path to vshard repo root or example dir (for make start/stop)',
     )
 
-
-def _find_vshard_path():
-    """Try to auto-detect vshard Lua module location."""
-    candidates = [
-        os.path.expanduser('~/src/vshard'),
-        '/usr/share/tarantool',
-        '/usr/local/share/tarantool',
-    ]
-    for path in candidates:
-        if os.path.isfile(os.path.join(path, 'vshard', 'init.lua')):
-            return path
-    return None
+def _resolve_vshard_example_dir(vshard_path):
+    """Resolve repo root or example dir to the actual example directory."""
+    if os.path.isfile(os.path.join(vshard_path, 'Makefile')) and os.path.isfile(
+        os.path.join(vshard_path, '.tarantoolctl')
+    ):
+        return vshard_path
+    example_dir = os.path.join(vshard_path, 'example')
+    if os.path.isfile(os.path.join(example_dir, 'Makefile')):
+        return example_dir
+    raise RuntimeError(
+        f"Cannot resolve vshard example dir from {vshard_path!r}"
+    )
 
 
 def _wait_for_port(host, port, timeout=10):
@@ -75,12 +79,14 @@ def _wait_for_port(host, port, timeout=10):
     return False
 
 
-def _wait_for_storage_ready(port, timeout=15):
+def _wait_for_storage_ready(port, timeout=20):
     """Wait until vshard.storage.buckets_count is callable."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
-            conn = tarantool.connect('127.0.0.1', port)
+            conn = tarantool.connect(
+                '127.0.0.1', port, user='storage', password='storage',
+            )
             conn.call('vshard.storage.buckets_count', [])
             conn.close()
             return True
@@ -107,56 +113,111 @@ def _wait_for_buckets_distributed(lua_router_port, timeout=30):
         except Exception:
             pass
         time.sleep(1)
-    raise RuntimeError(
-        f"Buckets not distributed after {timeout}s")
+    raise RuntimeError(f"Buckets not distributed after {timeout}s")
 
 
-def _start_tarantool(init_lua, env, tmpdir):
-    """Start a Tarantool instance in background and return the process."""
-    snap_dir = os.path.join(tmpdir, f"snap_{env['TARANTOOL_PORT']}")
-    xlog_dir = os.path.join(tmpdir, f"xlog_{env['TARANTOOL_PORT']}")
-    os.makedirs(snap_dir, exist_ok=True)
-    os.makedirs(xlog_dir, exist_ok=True)
-
-    full_env = dict(os.environ)
-    full_env.update(env)
-    full_env['TARANTOOL_TMPDIR'] = tmpdir
-    full_env['TARANTOOL_BACKGROUND'] = '0'  # We manage the process ourselves
-
-    proc = subprocess.Popen(
-        ['tarantool', str(init_lua)],
-        env=full_env,
+def _run_make_target(example_dir, target, *, check=True):
+    return subprocess.run(
+        ['make', target],
+        cwd=example_dir,
+        check=check,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        text=True,
     )
-    port = int(env['TARANTOOL_PORT'])
-    if not _wait_for_port('127.0.0.1', port, timeout=15):
-        proc.kill()
-        stdout, stderr = proc.communicate(timeout=5)
-        raise RuntimeError(
-            f"Tarantool on port {port} did not start.\n"
-            f"stdout: {stdout.decode()}\nstderr: {stderr.decode()}"
+
+
+def _run_tarantoolctl(example_dir, *args, check=True, input_text=None):
+    cmd = 'cd "{}" && tarantoolctl {}'.format(
+        example_dir, ' '.join(args)
+    )
+    return subprocess.run(
+        ['bash', '-lc', cmd],
+        check=check,
+        input=input_text,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+
+def _start_example_cluster(example_dir):
+    start = _run_make_target(example_dir, 'start', check=False)
+    if start.returncode == 0:
+        return
+
+    # Some system tarantoolctl builds only accept explicit *.lua instance names
+    # from local directories, while the bundled Makefile uses bare names.
+    instances = [
+        'storage_1_a.lua',
+        'storage_1_b.lua',
+        'storage_2_a.lua',
+        'storage_2_b.lua',
+        'router_1.lua',
+    ]
+    for instance in instances:
+        _run_tarantoolctl(example_dir, 'start', instance)
+    bootstrap = subprocess.run(
+        [
+            'bash', '-lc',
+            'cd "{}" && printf "vshard.router.bootstrap()\\n" | tarantoolctl enter router_1.lua'.format(
+                example_dir
+            ),
+        ],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    output = (bootstrap.stdout or '') + (bootstrap.stderr or '')
+    if bootstrap.returncode != 0 and 'NON_EMPTY' not in output:
+        raise subprocess.CalledProcessError(
+            bootstrap.returncode, bootstrap.args, bootstrap.stdout, bootstrap.stderr
         )
-    return proc
+
+
+def _stop_example_cluster(example_dir):
+    stop = _run_make_target(example_dir, 'stop', check=False)
+    if stop.returncode == 0:
+        return
+
+    for instance in [
+        'storage_1_a.lua',
+        'storage_1_b.lua',
+        'storage_2_a.lua',
+        'storage_2_b.lua',
+        'router_1.lua',
+    ]:
+        _run_tarantoolctl(example_dir, 'stop', instance, check=False)
 
 
 @pytest.fixture(scope='session')
-def base_port():
-    """Compute a unique base port. Uses a random offset to avoid collisions."""
-    import random
-    return 13301 + random.randint(0, 50) * 10
+def vshard_example_dir(request):
+    """Path to the local vshard example directory used for test cluster startup."""
+    vshard_path = request.config.getoption('--vshard-path') or os.environ.get(
+        'VSHARD_PATH'
+    )
+    if vshard_path is None:
+        pytest.skip(
+            "VSHARD_PATH is not set. Use --vshard-path=<repo-or-example-dir> "
+            "or export VSHARD_PATH to run the vshard functional tests."
+        )
+    try:
+        return _resolve_vshard_example_dir(vshard_path)
+    except RuntimeError as exc:
+        pytest.skip(str(exc))
 
 
 @pytest.fixture(scope='session')
-def cluster_ports(base_port):
-    """Return a dict of named ports for the cluster."""
+def cluster_ports():
+    """Ports used by the canonical local vshard example cluster."""
     return {
-        'rs1_master':  base_port,
-        'rs1_replica': base_port + 1,
-        'rs2_master':  base_port + 2,
-        'rs2_replica': base_port + 3,
-        'lua_router':  base_port + 4,
-        'cpp_proxy':   base_port + 5,
+        'rs1_master':  3301,
+        'rs1_replica': 3302,
+        'rs2_master':  3303,
+        'rs2_replica': 3304,
+        'lua_router':  3305,
+        'cpp_proxy':   13306,
     }
 
 
@@ -166,93 +227,33 @@ def cluster_tmpdir(tmp_path_factory):
 
 
 @pytest.fixture(scope='session')
-def vshard_cluster(request, cluster_ports, cluster_tmpdir):
-    """Start a 2-node vshard storage cluster (masters only) + Lua router.
+def vshard_cluster(vshard_example_dir, cluster_ports, cluster_tmpdir):
+    """Start the local vshard example cluster via `make start`.
 
-    Yields a dict with connection info. Stops all processes on teardown.
+    Yields connection info and always tears the cluster down with `make stop`.
     """
-    test_dir = pathlib.Path(__file__).parent.parent
-    storage_lua = str(test_dir / 'vshard_storage_init.lua')
-    router_lua = str(test_dir / 'vshard_router_init.lua')
     ports = cluster_ports
-    tmpdir = cluster_tmpdir
+    _stop_example_cluster(vshard_example_dir)
+    _start_example_cluster(vshard_example_dir)
 
-    # Find vshard Lua module path.
-    vshard_path = request.config.getoption('--vshard-path') or _find_vshard_path()
-    if vshard_path is None:
-        pytest.skip("vshard Lua module not found. Use --vshard-path=<dir>")
+    for name, port in ports.items():
+        if name == 'cpp_proxy':
+            continue
+        if not _wait_for_port('127.0.0.1', port, timeout=20):
+            raise RuntimeError(f"{name} on port {port} did not start")
 
-    common_env = {
-        'TARANTOOL_BUCKET_COUNT': str(BUCKET_COUNT),
-        'TARANTOOL_RS1_MASTER_PORT': str(ports['rs1_master']),
-        'TARANTOOL_RS1_REPLICA_PORT': str(ports['rs1_master']),  # no separate replica
-        'TARANTOOL_RS2_MASTER_PORT': str(ports['rs2_master']),
-        'TARANTOOL_RS2_REPLICA_PORT': str(ports['rs2_master']),  # no separate replica
-        'TARANTOOL_VSHARD_PATH': vshard_path,
-    }
-
-    # Masters only — replicas are not started to keep setup simple and fast.
-    instances = [
-        ('rs1_master', RS1_UUID, INSTANCE_UUIDS['rs1_master'], '1'),
-        ('rs2_master', RS2_UUID, INSTANCE_UUIDS['rs2_master'], '1'),
-    ]
-
-    procs = []
-
-    for name, rs_uuid, inst_uuid, is_master in instances:
-        env = dict(common_env)
-        env['TARANTOOL_PORT'] = str(ports[name])
-        env['TARANTOOL_RS_UUID'] = rs_uuid
-        env['TARANTOOL_INSTANCE_UUID'] = inst_uuid
-        env['TARANTOOL_IS_MASTER'] = is_master
-        proc = _start_tarantool(storage_lua, env, tmpdir)
-        procs.append((name, proc))
-
-    # Start Lua router (needed for vshard.router.bootstrap).
-    router_env = dict(common_env)
-    router_env['TARANTOOL_PORT'] = str(ports['lua_router'])
-    router_proc = _start_tarantool(router_lua, router_env, tmpdir)
-    procs.append(('lua_router', router_proc))
-
-    # Wait for storages to fully initialize vshard procedures.
     _wait_for_storage_ready(ports['rs1_master'])
     _wait_for_storage_ready(ports['rs2_master'])
-
-    # Bootstrap vshard via the Lua router (with retries for timing).
-    bootstrap_ok = False
-    bootstrap_err = None
-    for attempt in range(10):
-        try:
-            router_conn = tarantool.connect('127.0.0.1', ports['lua_router'])
-            router_conn.call('vshard.router.bootstrap',
-                             [{'if_not_bootstrapped': True}])
-            router_conn.close()
-            bootstrap_ok = True
-            break
-        except Exception as e:
-            bootstrap_err = e
-            time.sleep(1)
-    if not bootstrap_ok:
-        for name, proc in procs:
-            proc.kill()
-        raise RuntimeError(f"vshard bootstrap failed after retries: {bootstrap_err}")
-
-    # Wait for bootstrap to distribute buckets.
     _wait_for_buckets_distributed(ports['lua_router'])
 
     yield {
         'ports': ports,
-        'tmpdir': tmpdir,
+        'tmpdir': cluster_tmpdir,
+        'example_dir': vshard_example_dir,
         'bucket_count': BUCKET_COUNT,
     }
 
-    # Teardown: kill all processes.
-    for name, proc in procs:
-        proc.kill()
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            proc.terminate()
+    _stop_example_cluster(vshard_example_dir)
 
 
 @pytest.fixture(scope='session')
@@ -292,6 +293,8 @@ def secdist_config(vshard_cluster):
                         'nodes': [
                             {'host': '127.0.0.1', 'port': ports['rs1_master'],
                              'is_master': True},
+                            {'host': '127.0.0.1', 'port': ports['rs1_replica'],
+                             'is_master': False},
                         ],
                     },
                     {
@@ -299,6 +302,8 @@ def secdist_config(vshard_cluster):
                         'nodes': [
                             {'host': '127.0.0.1', 'port': ports['rs2_master'],
                              'is_master': True},
+                            {'host': '127.0.0.1', 'port': ports['rs2_replica'],
+                             'is_master': False},
                         ],
                     },
                 ],
