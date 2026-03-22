@@ -131,4 +131,62 @@ if (USERVER_IS_THE_ROOT_PROJECT)
                            "(vshard Lua module not found, set -DVSHARD_LUA_PATH=...)")
         endif()
     endif()
+
+    # -----------------------------------------------------------------------
+    # Throughput benchmark target — runs bench_vshard.lua against both the
+    # Lua vshard router and the C++ proxy, and the in-process C++ benchmark.
+    # Appends a new results section to bench/benchmark_results.md.
+    #
+    # The cluster is started automatically via 'make start' in VSHARD_PATH if
+    # the nodes are not already listening, and stopped afterwards.
+    #
+    # Usage:
+    #   cmake --build build_release --target benchmark-vshard
+    #
+    # Override ports/paths at cmake configure time with:
+    #   -DVSHARD_PATH=/path/to/vshard          (vshard repo root or example dir)
+    #   -DVSHARD_LUA_ROUTER=localhost:3305
+    #   -DVSHARD_BENCH_FIBER_COUNTS=10,20,50
+    #   -DVSHARD_BENCH_OPS=100000
+    #   -DVSHARD_BENCH_CPP_PORT=13306
+    # -----------------------------------------------------------------------
+    if(NOT DEFINED VSHARD_LUA_ROUTER)
+        set(VSHARD_LUA_ROUTER "localhost:3305")
+    endif()
+    if(NOT DEFINED VSHARD_BENCH_FIBER_COUNTS)
+        set(VSHARD_BENCH_FIBER_COUNTS "10,20,50")
+    endif()
+    if(NOT DEFINED VSHARD_BENCH_OPS)
+        set(VSHARD_BENCH_OPS 100000)
+    endif()
+    if(NOT DEFINED VSHARD_BENCH_CPP_PORT)
+        set(VSHARD_BENCH_CPP_PORT 3306)
+    endif()
+    # VSHARD_PATH is optional; when set the script can auto-start the cluster
+    set(_vshard_path_arg "")
+    if(DEFINED VSHARD_PATH)
+        set(_vshard_path_arg "--vshard-path" "${VSHARD_PATH}")
+    endif()
+
+    if(TARGET userver-tarantool-vshard-sample)
+        set(_bench_script "${CMAKE_CURRENT_SOURCE_DIR}/bench/run_benchmarks.sh")
+        set(_bench_output "${CMAKE_CURRENT_SOURCE_DIR}/bench/benchmark_results.md")
+
+        add_custom_target(benchmark-vshard
+            COMMAND bash "${_bench_script}"
+                --proxy-binary $<TARGET_FILE:userver-tarantool-vshard-sample>
+                --lua-router   "${VSHARD_LUA_ROUTER}"
+                --fiber-counts "${VSHARD_BENCH_FIBER_COUNTS}"
+                --ops          "${VSHARD_BENCH_OPS}"
+                --cpp-proxy-port "${VSHARD_BENCH_CPP_PORT}"
+                --output       "${_bench_output}"
+                ${_vshard_path_arg}
+            DEPENDS userver-tarantool-vshard-sample
+            COMMENT "Running vshard throughput benchmarks (fibers=${VSHARD_BENCH_FIBER_COUNTS}, ops=${VSHARD_BENCH_OPS})"
+            VERBATIM
+        )
+        message(STATUS "vshard benchmark target: enabled (use 'cmake --build . --target benchmark-vshard')")
+    else()
+        message(STATUS "vshard benchmark target: DISABLED (userver-tarantool-vshard-sample not available)")
+    endif()
 endif()

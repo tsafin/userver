@@ -104,15 +104,29 @@ high concurrency, making both routers "equally free."
 
 ## How to Reproduce
 
-Start a 4-node vshard cluster (see `configs/` for static config and secdist) then:
+Start a 4-node vshard cluster (see `configs/` for static config and secdist) then run:
 
 ```bash
-# Baseline: Lua router on :3305
+# Using the CMake benchmark target (recommended):
+cmake --build build_release --target benchmark-vshard
+
+# Manually — Lua router baseline:
 tarantool bench/bench_vshard.lua localhost:3305 20 100000
 
-# C++ proxy on :3306
-cp tarantool/vshard/configs/secdist.json /tmp/vshard_secdist.json
-./build_release/userver/tarantool/vshard/userver-tarantool-vshard-sample \
-    --config tarantool/vshard/configs/static_config.yaml &
+# Manually — C++ proxy (start proxy first, then):
 tarantool bench/bench_vshard.lua localhost:3306 20 100000
 ```
+
+### Round 5 — 2026-03-22 (ops=100000, git=9d96e8c85)
+
+C++ proxy now fully operational end-to-end (rebuilt release binary). Results match
+expected format: 10–18% faster than Lua router at low-to-medium concurrency.
+
+| Fibers | Lua router (ops/sec) | C++ proxy (ops/sec) | vs Lua |
+|-------:|---------------------:|--------------------:|-------:|
+| 10 | 8,679 | 10,201 | **+18%** |
+| 20 | 14,056 | 16,454 | **+17%** |
+| 50 | 24,609 | 27,176 | **+10%** |
+
+Fibers: 10,20,50 | Total ops per run: 100000 | Build: userver-tarantool-vshard-sample
+
