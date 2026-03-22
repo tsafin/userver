@@ -406,6 +406,36 @@ components_manager:
     return config_path
 
 
+def _start_cpp_proxy(binary, proxy_port, secdist_path, tmpdir, startup_wait=0):
+    config_path = _generate_static_config(proxy_port, secdist_path, tmpdir)
+    stdout_path = os.path.join(tmpdir, 'proxy_stdout.log')
+    stderr_path = os.path.join(tmpdir, 'proxy_stderr.log')
+
+    proc = subprocess.Popen(
+        [binary, '--config', config_path],
+        stdout=open(stdout_path, 'w'),
+        stderr=open(stderr_path, 'w'),
+    )
+
+    if not _wait_for_port('127.0.0.1', proxy_port, timeout=15):
+        proc.kill()
+        raise RuntimeError(
+            f"C++ proxy on port {proxy_port} did not start.\n"
+            f"Check logs: {stdout_path}, {stderr_path}"
+        )
+
+    if startup_wait > 0:
+        time.sleep(startup_wait)
+
+    return {
+        'port': proxy_port,
+        'proc': proc,
+        'config_path': config_path,
+        'stdout_log': stdout_path,
+        'stderr_log': stderr_path,
+    }
+
+
 @pytest.fixture(scope='session')
 def cpp_proxy(request, vshard_cluster, secdist_config):
     """Start the C++ vshard proxy as a subprocess.
@@ -421,32 +451,15 @@ def cpp_proxy(request, vshard_cluster, secdist_config):
     proxy_port = ports['cpp_proxy']
     tmpdir = vshard_cluster['tmpdir']
 
-    config_path = _generate_static_config(proxy_port, secdist_config, tmpdir)
-
-    proc = subprocess.Popen(
-        [binary, '--config', config_path],
-        stdout=open(os.path.join(tmpdir, 'proxy_stdout.log'), 'w'),
-        stderr=open(os.path.join(tmpdir, 'proxy_stderr.log'), 'w'),
+    proxy = _start_cpp_proxy(
+        binary, proxy_port, secdist_config, tmpdir, startup_wait=2
     )
 
-    if not _wait_for_port('127.0.0.1', proxy_port, timeout=15):
-        proc.kill()
-        stdout_log = os.path.join(tmpdir, 'proxy_stdout.log')
-        stderr_log = os.path.join(tmpdir, 'proxy_stderr.log')
-        raise RuntimeError(
-            f"C++ proxy on port {proxy_port} did not start.\n"
-            f"Check logs: {stdout_log}, {stderr_log}")
+    yield proxy
 
-    # Wait for the proxy to complete initial discovery.
-    time.sleep(2)
-
-    yield {
-        'port': proxy_port,
-        'proc': proc,
-    }
-
-    proc.kill()
+    proc = proxy['proc']
     try:
+        proc.kill()
         proc.wait(timeout=5)
     except subprocess.TimeoutExpired:
         proc.terminate()
@@ -462,6 +475,28 @@ def cpp_conn(cpp_proxy):
     conn.connect()
     yield conn
     conn.close()
+
+
+@pytest.fixture
+def fresh_cpp_proxy(request, secdist_config, tmp_path):
+    """Start a fresh C++ proxy without post-start warmup delay."""
+    binary = request.config.getoption('--proxy-binary')
+    if binary is None:
+        pytest.skip(
+            "C++ proxy binary not specified. Use --proxy-binary=<path>"
+        )
+
+    proxy = _start_cpp_proxy(
+        binary, 13307, secdist_config, str(tmp_path), startup_wait=0
+    )
+    yield proxy
+
+    proc = proxy['proc']
+    try:
+        proc.kill()
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.terminate()
 
 
 @pytest.fixture(scope='session')

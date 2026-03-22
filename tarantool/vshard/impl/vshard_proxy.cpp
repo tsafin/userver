@@ -316,8 +316,18 @@ VshardProxy::VshardProxy(clients::dns::Resolver& resolver,
       settings_{std::move(settings)},
       fetcher_{std::make_unique<impl::TopologyFetcher>(
           resolver, pool_config, settings_.topology)} {
-    // Build initial routing table synchronously at startup.
-    routing_table_.Assign(fetcher_->BuildFromConfig());    StartRefreshTask();
+    // Build the initial routing table synchronously from live storage state.
+    // Falling back to config-only ownership here can misroute immediate
+    // post-start traffic when the actual bucket layout differs from config
+    // order.
+    try {
+        routing_table_.Assign(fetcher_->RefreshFull());
+    } catch (const std::exception& ex) {
+        LOG_WARNING() << "vshard initial topology refresh failed: "
+                      << ex.what() << ", falling back to config";
+        routing_table_.Assign(fetcher_->BuildFromConfig());
+    }
+    StartRefreshTask();
 }
 
 VshardProxy::~VshardProxy() {

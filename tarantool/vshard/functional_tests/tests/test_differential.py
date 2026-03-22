@@ -4,6 +4,10 @@ Each test sends the EXACT same request to both routers and asserts
 the responses are equivalent. This catches any behavioral divergence
 between the Lua vshard reference and our C++ implementation.
 """
+import pathlib
+import re
+import subprocess
+
 import pytest
 
 
@@ -154,3 +158,31 @@ class TestDifferentialCallVariants:
         lua_r, cpp_r = self._seed_and_read(
             lua_conn, cpp_conn, 65, 'vshard.router.callre')
         assert cpp_r.data == lua_r.data
+
+
+class TestStartupRoutingRegression:
+    """Regression tests for immediate post-start routing under load."""
+
+    def test_fresh_proxy_benchmark_has_no_not_found_errors(
+        self, fresh_cpp_proxy
+    ):
+        bench_script = (
+            pathlib.Path(__file__).resolve().parents[2] /
+            'bench' / 'bench_vshard.lua'
+        )
+        result = subprocess.run(
+            [
+                'tarantool',
+                str(bench_script),
+                f"127.0.0.1:{fresh_cpp_proxy['port']}",
+                '100',
+                '50000',
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+        match = re.search(r'errors=(\d+)', result.stdout)
+        assert match is not None, result.stdout
+        assert int(match.group(1)) == 0, result.stdout
