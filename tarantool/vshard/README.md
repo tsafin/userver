@@ -367,17 +367,57 @@ Environment variables:
 ### Benchmark results (WSL2, loopback, 100k ops)
 
 See [`bench/benchmark_results.md`](bench/benchmark_results.md) for full history.
-Summary at 50 concurrent fibers:
+Full scalability sweep (Round 6, 2026-03-22):
 
-| Mode | ops/sec | vs Lua router |
-|------|--------:|---------------:|
-| Lua vshard router (baseline) | 22,868 | 1.00× |
-| **C++ proxy (IPROTO mode)** | **26,498** | **+17%** |
-| C++ library embedded (no proxy hop) | 77,517 | +239% |
+| Fibers | Lua router (ops/sec) | C++ proxy (ops/sec) | vs Lua | C++ in-process (ops/sec) |
+|-------:|---------------------:|--------------------:|-------:|-------------------------:|
+| 10 | 8,680 | 10,150 | **+17%** | 22,410 |
+| 20 | 13,879 | 16,744 | **+21%** | 39,816 |
+| 50 | 24,771 | 27,187 | **+10%** | 80,094 |
+| 100 | 31,283 | 34,654 | **+11%** | 123,174 |
+| 150 | 33,232 | 36,125 | **+9%** | 153,113 |
 
-The proxy mode (+17%) wins over the Lua router with the same topology (client →
-router/proxy → storage).  The embedded mode removes the proxy-process network
-round-trip entirely and is ~3× faster still.
+Key observations:
+- The **C++ proxy** is consistently **9–21% faster** than the Lua vshard router at all concurrency levels.
+- Both the Lua router and the C++ proxy saturate at ~33–36k op/s above 100 fibers — the **Tarantool storage RTT is the bottleneck**, not the router.
+- The **C++ in-process library** (no proxy hop, no extra loopback) keeps scaling linearly, reaching **153k op/s** at 150 fibers — **3–4.6× faster** than the Lua router.
+
+### Option C — Automated benchmark via CMake target
+
+Runs the full scalability sweep (Lua router + C++ proxy + in-process), appends a
+new section to `bench/benchmark_results.md`.  Auto-starts the vshard cluster if
+it is not already running (requires `--vshard-path`).
+
+```bash
+# Configure once (add to Makefile.local or pass on command line):
+cmake -DVSHARD_PATH=/path/to/vshard \
+      -DVSHARD_BENCH_FIBER_COUNTS=10,20,50,100,150 \
+      -DVSHARD_BENCH_OPS=100000 \
+      -B build_release .
+
+# Run benchmark (cluster auto-started/stopped if VSHARD_PATH is set):
+cmake --build build_release --target benchmark-vshard
+```
+
+CMake variables for the `benchmark-vshard` target:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `VSHARD_PATH` | unset | Path to vshard repo root (or `example/` subdir); used for `make start`/`make stop` |
+| `VSHARD_LUA_ROUTER` | `localhost:3305` | Address of the running Lua vshard router |
+| `VSHARD_BENCH_FIBER_COUNTS` | `10,20,50,100,150` | Comma-separated fiber counts to sweep |
+| `VSHARD_BENCH_OPS` | `100000` | Operations per run per fiber count |
+| `VSHARD_BENCH_CPP_PORT` | `3306` | Port for the temporary C++ proxy process |
+
+Or invoke the script directly:
+
+```bash
+bash tarantool/vshard/bench/run_benchmarks.sh \
+    --proxy-binary build_release/userver/tarantool/vshard/userver-tarantool-vshard-sample \
+    --vshard-path /path/to/vshard \
+    --fiber-counts 10,20,50,100,150 \
+    --ops 100000
+```
 
 ## Embedding `VshardProxy` in your service
 
