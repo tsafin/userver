@@ -14,8 +14,14 @@ namespace storages::tarantool::vshard::impl {
 
 namespace {
 
+// Tarantool's digest.crc32 uses CRC32C (Castagnoli polynomial 0x1EDC6F41)
+// with initial value 0xFFFFFFFF and NO final XOR, matching tnt_crc32c().
+// This is equivalent to boost::crc_optimal<32,0x1EDC6F41,0xFFFFFFFF,0,true,true>.
+using TarantoolCrc32 =
+    boost::crc_optimal<32, 0x1EDC6F41, 0xFFFFFFFF, 0x00000000, true, true>;
+
 uint32_t Crc32Bytes(const void* data, std::size_t len) noexcept {
-    boost::crc_32_type crc;
+    TarantoolCrc32 crc;
     crc.process_bytes(data, len);
     return crc.checksum();
 }

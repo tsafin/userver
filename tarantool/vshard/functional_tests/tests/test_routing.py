@@ -221,7 +221,6 @@ class TestCallVariants:
         )
         assert cpp_result.data == lua_result.data
 
-    @pytest.mark.skip(reason="callbre needs replica nodes; masters-only cluster")
     def test_callbre(self, lua_conn, cpp_conn):
         """callbre (best-read-only-error with prefer_replica + balance)."""
         bid = 90
@@ -266,7 +265,6 @@ class TestCallVariants:
 class TestBucketId:
     """Bucket ID computation consistency between Lua and C++ routers."""
 
-    @pytest.mark.skip(reason="bucket_id_mpcrc32 not yet exposed via C++ IPROTO server")
     def test_bucket_id_uint(self, lua_conn, cpp_conn):
         """bucket_id_mpcrc32 for integer keys should match."""
         for key in [1, 42, 100, 999, 12345]:
@@ -279,7 +277,6 @@ class TestBucketId:
             assert cpp_bid.data == lua_bid.data, \
                 f"Mismatch for key={key}: cpp={cpp_bid.data} lua={lua_bid.data}"
 
-    @pytest.mark.skip(reason="bucket_id_mpcrc32 not yet exposed via C++ IPROTO server")
     def test_bucket_id_string(self, lua_conn, cpp_conn):
         """bucket_id_mpcrc32 for string keys should match."""
         for key in ['hello', 'world', '', 'test123', 'user@example.com']:
@@ -296,12 +293,35 @@ class TestBucketId:
 class TestRouteAll:
     """vshard.router.routeall — list all replicasets."""
 
-    @pytest.mark.skip(reason="routeall not yet exposed via C++ IPROTO server")
-    def test_routeall_returns_both_rs(self, lua_conn, cpp_conn):
-        """routeall should return 2 replicasets."""
-        lua_result = lua_conn.call('vshard.router.routeall', [])
-        cpp_result = cpp_conn.call('vshard.router.routeall', [])
+    def test_routeall_returns_both_rs(self, lua_conn, cpp_conn, bucket_count):
+        """routeall should return data for all replicasets.
 
-        # Both should return data for 2 replicasets.
-        assert lua_result.data is not None
-        assert cpp_result.data is not None
+        Note: the Lua router's routeall() returns internal replicaset objects
+        that contain Lua function references, which cannot be serialized over
+        IPROTO.  We therefore only validate the C++ proxy result; if the Lua
+        call happens to succeed (future Tarantool / vshard version) we also
+        cross-check the UUID count.
+        """
+        import tarantool
+
+        cpp_result = cpp_conn.call('vshard.router.routeall', [])
+        assert cpp_result.data is not None, "C++ routeall returned no data"
+
+        # C++ returns [{uuid: {uuid: uuid}, ...}]
+        rs_map = cpp_result.data[0]
+        assert isinstance(rs_map, dict), \
+            f"Expected dict from C++ routeall, got {type(rs_map)}"
+        assert len(rs_map) == 2, \
+            f"Expected 2 replicasets, got {len(rs_map)}: {list(rs_map.keys())}"
+
+        # Lua vshard.router.routeall() returns objects with function fields,
+        # which Tarantool cannot serialize over IPROTO ("unsupported Lua type
+        # 'function'").  Treat this as a known limitation and skip comparison.
+        try:
+            lua_result = lua_conn.call('vshard.router.routeall', [])
+            if lua_result.data is not None:
+                lua_rs_map = lua_result.data[0]
+                assert len(lua_rs_map) == len(rs_map), \
+                    f"RS count mismatch: lua={len(lua_rs_map)} cpp={len(rs_map)}"
+        except tarantool.error.DatabaseError:
+            pass  # expected: Lua replicaset objects are not IPROTO-serializable

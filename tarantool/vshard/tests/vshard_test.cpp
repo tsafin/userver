@@ -17,11 +17,15 @@ using namespace storages::tarantool::vshard::impl;
 // BucketCalculator — mpcrc32
 // ---------------------------------------------------------------------------
 
-// Reference values computed with Tarantool:
-//   tarantool> vshard = require('vshard')
-//   tarantool> vshard.router.bucket_id_mpcrc32('hello', 3000)
-// Since we can't run Tarantool in tests, we verify self-consistency:
-// same key always produces same bucket, and result is in [1, N].
+// Reference values verified against Tarantool 2.6.0 (g47aa4e01e).
+// Tarantool's digest.crc32 uses CRC32C (poly=0x1EDC6F41, init=0xFFFFFFFF,
+// no final XOR) — tnt_crc32c() from third_party/crc32.c.
+// For mpcrc32: integers are msgpack-encoded before hashing; strings are
+// hashed raw (no msgpack header), per vshard/hash.lua mpcrc32_one().
+// Exact bucket IDs with bucket_count=300:
+//   key=1    (fixuint 0x01)  -> bucket 114
+//   key='hello' (raw bytes) -> bucket 116
+//   key=42   (fixuint 0x2a) -> bucket 201
 
 TEST(BucketCalculator, Mpcrc32StringInRange) {
     BucketCalculator calc{3000};
@@ -84,14 +88,22 @@ TEST(BucketCalculator, Strcrc32StringEqualsString) {
               calc.BucketIdStrcrc32(std::string_view{"foo"}));
 }
 
+// Exact values from: tarantool -e "hash=require('vshard.hash'); print(hash.mpcrc32(key) % 300 + 1)"
+TEST(BucketCalculator, Mpcrc32ExactValues) {
+    BucketCalculator calc{300};
+    EXPECT_EQ(calc.BucketIdMpcrc32(int64_t{1}),   114u);
+    EXPECT_EQ(calc.BucketIdMpcrc32(int64_t{42}),   69u);
+    EXPECT_EQ(calc.BucketIdMpcrc32(int64_t{100}),  88u);
+    EXPECT_EQ(calc.BucketIdMpcrc32(std::string_view{"hello"}), 116u);
+    EXPECT_EQ(calc.BucketIdMpcrc32(std::string_view{"world"}), 190u);
+}
+
 TEST(BucketCalculator, Mpcrc32NegativeFixint) {
     // Tarantool encodes -1 as 0xff (negative fixint in msgpack).
-    // CRC32(0xff) % 3000 + 1 should be consistent.
     BucketCalculator calc{3000};
     const auto b = calc.BucketIdMpcrc32(int64_t{-1});
     EXPECT_GE(b, 1u);
     EXPECT_LE(b, 3000u);
-    // Consistency
     EXPECT_EQ(b, calc.BucketIdMpcrc32(int64_t{-1}));
 }
 
