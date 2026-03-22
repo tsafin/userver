@@ -160,6 +160,10 @@ class VshardProxy final {
 
     uint32_t GetBucketCount() const noexcept;
 
+    /// Return the UUIDs of all known replicasets from the current routing table.
+    /// Used by vshard.router.routeall handler.
+    std::vector<std::string> GetReplicasetUUIDs() const;
+
     /// Force an immediate full topology refresh (e.g. after deployment).
     void RefreshTopology();
 

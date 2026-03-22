@@ -143,7 +143,6 @@ class TestDifferentialCallVariants:
             lua_conn, cpp_conn, 45, 'vshard.router.callbro')
         assert cpp_r.data == lua_r.data
 
-    @pytest.mark.skip(reason="callbre needs replica nodes; masters-only cluster")
     def test_callbre_differential(self, lua_conn, cpp_conn):
         """callbre results match."""
         lua_r, cpp_r = self._seed_and_read(

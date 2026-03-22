@@ -4,6 +4,7 @@
 --   TARANTOOL_RS_UUID      -- replicaset UUID for this instance
 --   TARANTOOL_INSTANCE_UUID -- instance UUID
 --   TARANTOOL_IS_MASTER    -- "1" if master, "0" if replica
+--   TARANTOOL_REPLICATION_SOURCE -- URI of master to replicate from (replica only)
 --   TARANTOOL_RS1_MASTER_PORT, TARANTOOL_RS1_REPLICA_PORT
 --   TARANTOOL_RS2_MASTER_PORT, TARANTOOL_RS2_REPLICA_PORT
 --   TARANTOOL_BUCKET_COUNT -- total bucket count (default 300)
@@ -25,6 +26,7 @@ local bucket_count = tonumber(os.getenv('TARANTOOL_BUCKET_COUNT')) or 300
 local instance_uuid = os.getenv('TARANTOOL_INSTANCE_UUID')
 local rs_uuid = os.getenv('TARANTOOL_RS_UUID')
 local is_master = os.getenv('TARANTOOL_IS_MASTER') == '1'
+local replication_source = os.getenv('TARANTOOL_REPLICATION_SOURCE')
 
 local rs1_master_port = tonumber(os.getenv('TARANTOOL_RS1_MASTER_PORT')) or 3301
 local rs1_replica_port = tonumber(os.getenv('TARANTOOL_RS1_REPLICA_PORT')) or 3302
@@ -84,7 +86,7 @@ local function make_vshard_cfg()
     }
 end
 
-box.cfg{
+local box_cfg = {
     listen = port,
     replication_connect_quorum = 0,
     instance_uuid = instance_uuid,
@@ -96,6 +98,14 @@ box.cfg{
     background = background,
     memtx_memory = 64 * 1024 * 1024,
 }
+
+-- Replicas need replication source and read_only=true.
+if replication_source then
+    box_cfg.replication = {replication_source}
+    box_cfg.read_only = not is_master
+end
+
+box.cfg(box_cfg)
 
 -- Create storage user.
 box.once('init_storage_user', function()

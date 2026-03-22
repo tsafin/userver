@@ -710,6 +710,16 @@ uint32_t VshardProxy::GetBucketCount() const noexcept {
     return calculator_.GetBucketCount();
 }
 
+std::vector<std::string> VshardProxy::GetReplicasetUUIDs() const {
+    auto snapshot = routing_table_.Read();
+    std::vector<std::string> uuids;
+    uuids.reserve(snapshot->replicasets.size());
+    for (const auto& rs : snapshot->replicasets) {
+        uuids.push_back(rs->GetUuid());
+    }
+    return uuids;
+}
+
 void VshardProxy::RefreshTopology() {
     routing_table_.Assign(fetcher_->RefreshFull());
 }

@@ -539,6 +539,124 @@ ParseVshardRouterCallArgs(const uint8_t* p, std::size_t len) noexcept {
 // Build the IPROTO OK response carrying the VshardProxy result value.
 // ---------------------------------------------------------------------------
 
+/// Compact msgpack uint encoding: fixint (0..127) or uint16 (128..65535) or uint32.
+inline void PushUint32Compact(std::vector<uint8_t>& buf, uint32_t v) {
+    if (v <= 0x7fu) {
+        buf.push_back(static_cast<uint8_t>(v));
+    } else if (v <= 0xffffu) {
+        buf.push_back(mp::kUint16);
+        buf.push_back(static_cast<uint8_t>(v >> 8));
+        buf.push_back(static_cast<uint8_t>(v));
+    } else {
+        PushU32(buf, v);
+    }
+}
+
+/// Map encoding header for N entries.
+inline void PushMapHeader(std::vector<uint8_t>& buf, std::size_t n) {
+    if (n <= 15) {
+        buf.push_back(static_cast<uint8_t>(mp::kFixMapMin | (n & 0x0fu)));
+    } else if (n <= 0xffffu) {
+        buf.push_back(mp::kMap16);
+        buf.push_back(static_cast<uint8_t>(n >> 8));
+        buf.push_back(static_cast<uint8_t>(n));
+    } else {
+        buf.push_back(mp::kMap32);
+        buf.push_back(static_cast<uint8_t>(n >> 24));
+        buf.push_back(static_cast<uint8_t>(n >> 16));
+        buf.push_back(static_cast<uint8_t>(n >> 8));
+        buf.push_back(static_cast<uint8_t>(n));
+    }
+}
+
+/// Read the first element of a 1-element msgpack array as a sharding key.
+/// Returns {is_string=true, str_val, 0} for strings.
+/// Returns {is_string=false, {}, int_val} for integers.
+/// Returns std::nullopt if the tuple cannot be parsed.
+struct TupleKey {
+    bool is_string{false};
+    std::string_view str_val;
+    int64_t int_val{0};
+};
+
+static std::optional<TupleKey> ReadTupleFirstKey(
+    const uint8_t* p, std::size_t len) noexcept {
+    using namespace storages::tarantool::impl::msgpack_scan;
+    std::size_t pos = 0;
+    const auto alen = ReadArrayHeader(p, len, pos);
+    if (alen < 1 || pos >= len) return std::nullopt;
+    const uint8_t b = p[pos];
+    // String
+    if ((b & 0xe0u) == mp::kFixStrMin || b == mp::kStr8 ||
+        b == mp::kStr16 || b == mp::kStr32) {
+        auto [sv, np] = ReadStr(p, len, pos);
+        (void)np;
+        return TupleKey{true, sv, 0};
+    }
+    // Negative fixint (0xe0..0xff → -32..-1)
+    if (b >= mp::kNegFixIntMin) {
+        return TupleKey{false, {}, static_cast<int64_t>(static_cast<int8_t>(b))};
+    }
+    // Signed ints
+    if (b == mp::kInt8 && pos + 1 < len)
+        return TupleKey{false, {}, static_cast<int64_t>(static_cast<int8_t>(p[pos + 1]))};
+    if (b == mp::kInt16 && pos + 2 < len) {
+        int16_t v = static_cast<int16_t>((uint16_t)p[pos + 1] << 8 | p[pos + 2]);
+        return TupleKey{false, {}, static_cast<int64_t>(v)};
+    }
+    if (b == mp::kInt32 && pos + 4 < len) {
+        int32_t v = static_cast<int32_t>(
+            (uint32_t)p[pos + 1] << 24 | (uint32_t)p[pos + 2] << 16 |
+            (uint32_t)p[pos + 3] << 8 | p[pos + 4]);
+        return TupleKey{false, {}, static_cast<int64_t>(v)};
+    }
+    if (b == mp::kInt64 && pos + 8 < len) {
+        int64_t v = 0;
+        for (int i = 1; i <= 8; ++i) v = (v << 8) | p[pos + i];
+        return TupleKey{false, {}, v};
+    }
+    // Unsigned: use ReadUint (handles fixint, uint8/16/32/64)
+    auto [uval, np] = ReadUint(p, len, pos);
+    (void)np;
+    return TupleKey{false, {}, static_cast<int64_t>(uval)};
+}
+
+/// Build DATA response carrying a single uint32 (used for bucket_id_mpcrc32).
+static std::vector<uint8_t> BuildUint32ResultFrame(uint64_t sync, uint32_t val) {
+    std::vector<uint8_t> body;
+    body.reserve(8);
+    PushFixMap(body, 1);
+    body.push_back(static_cast<uint8_t>(Iproto::DATA));
+    PushFixArray(body, 1);
+    PushUint32Compact(body, val);
+    return BuildOkFrame(sync, body.data(), body.size());
+}
+
+/// Build DATA response carrying a msgpack map {uuid: {uuid: uuid}} per RS.
+/// Used for vshard.router.routeall — the caller iterates the replicasets
+/// vector from the routing table snapshot.
+static std::vector<uint8_t> BuildRouteAllResultFrame(
+    uint64_t sync, const std::vector<std::string>& uuids) {
+    std::vector<uint8_t> inner;
+    inner.reserve(uuids.size() * 50);
+    PushMapHeader(inner, uuids.size());
+    for (const auto& uuid : uuids) {
+        PushStr(inner, uuid);
+        // Encode minimal replicaset descriptor: {uuid: uuid}
+        PushFixMap(inner, 1);
+        PushStr(inner, "uuid");
+        PushStr(inner, uuid);
+    }
+    // Wrap as DATA: [inner_map]
+    std::vector<uint8_t> body;
+    body.reserve(3 + inner.size());
+    PushFixMap(body, 1);
+    body.push_back(static_cast<uint8_t>(Iproto::DATA));
+    PushFixArray(body, 1);
+    body.insert(body.end(), inner.begin(), inner.end());
+    return BuildOkFrame(sync, body.data(), body.size());
+}
+
 /// Encode {DATA: [result_value]} and build the full OK frame.
 [[maybe_unused]] static std::vector<uint8_t> BuildResultFrame(
     uint64_t sync, const formats::msgpack::Value& result) {
@@ -714,6 +832,33 @@ static void HandleConnection(engine::io::Socket sock,
                     mode = CallMode::kBestReadOnlyError;  // prefer_replica + balance
                 } else if (body->func_name == "vshard.router.call") {
                     is_generic_call = true;
+
+                // ---- Utility functions (no routing) -------------------------
+
+                } else if (body->func_name == "vshard.router.bucket_id_mpcrc32") {
+                    // [key] → bucket_id
+                    const auto key = ReadTupleFirstKey(
+                        body->tuple_begin, body->tuple_len);
+                    if (!key) {
+                        const auto resp = BuildErrorFrame(req.sync,
+                            "bad bucket_id_mpcrc32 args: expected [key]");
+                        (void)sock.SendAll(resp.data(), resp.size(), engine::Deadline{});
+                        continue;
+                    }
+                    const uint32_t bid = key->is_string
+                        ? proxy.ComputeBucketId(key->str_val)
+                        : proxy.ComputeBucketId(key->int_val);
+                    const auto resp = BuildUint32ResultFrame(req.sync, bid);
+                    (void)sock.SendAll(resp.data(), resp.size(), engine::Deadline{});
+                    continue;
+
+                } else if (body->func_name == "vshard.router.routeall") {
+                    // [] → {uuid: {uuid: uuid}, ...} for all known replicasets
+                    const auto uuids = proxy.GetReplicasetUUIDs();
+                    const auto resp = BuildRouteAllResultFrame(req.sync, uuids);
+                    (void)sock.SendAll(resp.data(), resp.size(), engine::Deadline{});
+                    continue;
+
                 } else {
                     LOG_WARNING() << "iproto_server: unknown vshard function '"
                                   << body->func_name << "'";
