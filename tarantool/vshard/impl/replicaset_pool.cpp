@@ -67,6 +67,31 @@ storages::tarantool::ExecutionResult ReplicasetPool::Execute(
     return master_->Execute(cc, query);
 }
 
+engine::Future<storages::tarantool::ExecutionResult> ReplicasetPool::ExecuteAsync(
+    CallMode mode,
+    const storages::tarantool::Query& query,
+    storages::tarantool::OptionalCommandControl cc) {
+
+    switch (mode) {
+        case CallMode::kReadWrite:
+            return master_->ExecuteAsync(cc, query);
+
+        case CallMode::kReadOnly:
+        case CallMode::kBestReadOnly:
+            if (replicas_.empty()) {
+                return master_->ExecuteAsync(cc, query);
+            }
+            return SelectReplica().ExecuteAsync(cc, query);
+
+        case CallMode::kBestReadOnlyError:
+            if (replicas_.empty() || !replicas_.front()->IsAvailable()) {
+                throw ReplicaUnavailableError{uuid_};
+            }
+            return SelectReplica().ExecuteAsync(cc, query);
+    }
+    return master_->ExecuteAsync(cc, query);
+}
+
 storages::tarantool::impl::ConnectionPtr ReplicasetPool::AcquireMaster(
     engine::Deadline deadline) {
     return master_->Acquire(deadline);

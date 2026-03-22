@@ -233,6 +233,41 @@ class TestGenericCall:
         assert _strip_trace_locations(cpp_result.data) == \
             _strip_trace_locations(lua_result.data)
 
+    def test_generic_call_return_raw_matches_lua(self, lua_conn, cpp_conn):
+        bid = 76
+        args = [bid, 'write', 'echo', ['raw'], {'return_raw': True}]
+        with pytest.raises(tarantool.error.DatabaseError) as lua_error:
+            lua_conn.call('vshard.router.call', args)
+        with pytest.raises(tarantool.error.DatabaseError) as cpp_error:
+            cpp_conn.call('vshard.router.call', args)
+
+        assert 'Msgpack object feature is not supported' in str(lua_error.value)
+        assert 'Msgpack object feature is not supported' in str(cpp_error.value)
+
+    def test_generic_call_is_async_matches_lua(self, lua_conn, cpp_conn):
+        bid = 77
+        args = [bid, 'write', 'echo', ['async'], {'is_async': True}]
+
+        lua_result = lua_conn.call('vshard.router.call', args)
+        cpp_result = cpp_conn.call('vshard.router.call', args)
+
+        assert cpp_result.data == lua_result.data
+
+    def test_generic_call_is_async_return_raw_matches_lua(self, lua_conn, cpp_conn):
+        bid = 78
+        args = [
+            bid, 'write', 'echo', ['async_raw'],
+            {'is_async': True, 'return_raw': True},
+        ]
+
+        with pytest.raises(tarantool.error.DatabaseError) as lua_error:
+            lua_conn.call('vshard.router.call', args)
+        with pytest.raises(tarantool.error.DatabaseError) as cpp_error:
+            cpp_conn.call('vshard.router.call', args)
+
+        assert 'Msgpack object feature is not supported' in str(lua_error.value)
+        assert 'Msgpack object feature is not supported' in str(cpp_error.value)
+
 
 
 class TestCallVariants:
@@ -453,6 +488,28 @@ class TestSync:
             assert err['code'] == 78
             assert err['type'] == 'ClientError'
             assert err['message'] == 'Timeout exceeded'
+
+
+class TestBootstrap:
+    """vshard.router.bootstrap."""
+
+    def test_bootstrap_non_empty_matches_lua(self, lua_conn, cpp_conn):
+        lua_result = lua_conn.call('vshard.router.bootstrap', [])
+        cpp_result = cpp_conn.call('vshard.router.bootstrap', [])
+        assert _strip_trace_locations(cpp_result.data) == \
+            _strip_trace_locations(lua_result.data)
+
+    def test_bootstrap_if_not_bootstrapped_matches_lua(self, lua_conn, cpp_conn):
+        args = [{'if_not_bootstrapped': True}]
+        lua_result = lua_conn.call('vshard.router.bootstrap', args)
+        cpp_result = cpp_conn.call('vshard.router.bootstrap', args)
+        assert cpp_result.data == lua_result.data
+
+    def test_bootstrap_invalid_arg_matches_lua(self, lua_conn, cpp_conn):
+        with pytest.raises(tarantool.error.DatabaseError):
+            lua_conn.call('vshard.router.bootstrap', [123])
+        with pytest.raises(tarantool.error.DatabaseError):
+            cpp_conn.call('vshard.router.bootstrap', [123])
 
 
 class TestMapCallRW:

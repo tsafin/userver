@@ -96,6 +96,31 @@ ExecutionResult Pool::Execute(OptionalCommandControl cc, const Query& query) {
     }
 }
 
+engine::Future<ExecutionResult> Pool::ExecuteAsync(
+    OptionalCommandControl cc, const Query& query) {
+    const engine::Deadline deadline =
+        cc ? engine::Deadline::FromDuration(cc->execute)
+           : engine::Deadline::FromDuration(impl_->GetSettings().queue_timeout);
+
+    tracing::Span span{scopes::kCall};
+    span.AddTag(tracing::kDatabaseType, "tarantool");
+    span.AddTag(tracing::kDatabaseInstance, impl_->GetHostName());
+    query.FillSpanTags(span);
+
+    auto& req_stats = impl_->GetStatistics().calls;
+    ++req_stats.total;
+
+    try {
+        auto conn_ptr = std::make_unique<ConnectionPtr>(impl_->Acquire(deadline));
+        auto fut = (*conn_ptr)->ExecuteAsync(deadline, query);
+        conn_ptr.reset();
+        return fut;
+    } catch (...) {
+        ++req_stats.error;
+        throw;
+    }
+}
+
 ExecutionResult Pool::ForwardStorageCall(const CallRouteInfo& info,
                                           OptionalCommandControl cc) {
     const engine::Deadline deadline =

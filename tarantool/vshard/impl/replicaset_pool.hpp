@@ -9,6 +9,7 @@
 #include <vector>
 
 #include <userver/engine/deadline.hpp>
+#include <userver/engine/future.hpp>
 #include <userver/storages/tarantool/options.hpp>
 #include <userver/storages/tarantool/query.hpp>
 #include <userver/storages/tarantool/result.hpp>
@@ -49,6 +50,10 @@ class ReplicasetPool final {
 
     /// Execute a query on the appropriate pool based on call mode.
     storages::tarantool::ExecutionResult Execute(
+        CallMode mode,
+        const storages::tarantool::Query& query,
+        storages::tarantool::OptionalCommandControl cc = {});
+    engine::Future<storages::tarantool::ExecutionResult> ExecuteAsync(
         CallMode mode,
         const storages::tarantool::Query& query,
         storages::tarantool::OptionalCommandControl cc = {});

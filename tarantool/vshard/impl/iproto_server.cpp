@@ -190,13 +190,23 @@ struct VshardRouterArgs {
     bool             balance{false};
     double           timeout{0.0};   ///< total timeout in seconds (0 = use default)
     double           request_timeout{0.0};  ///< per-attempt timeout in seconds
+    bool             return_raw{false};
+    bool             is_async{false};
     bool             opts_valid{true};
 };
 
 struct ParsedRouterOpts {
     double timeout{0.0};
     double request_timeout{0.0};
+    bool return_raw{false};
+    bool is_async{false};
     bool valid{true};
+};
+
+struct ParsedBootstrapArgs {
+    bool valid{true};
+    bool if_not_bootstrapped{false};
+    double timeout{0.0};
 };
 
 struct ParsedMapCallRWArgs {
@@ -242,11 +252,65 @@ static ParsedRouterOpts ParseCallOpts(const uint8_t* p, std::size_t len,
                 continue;
             }
             opts.request_timeout = ReadNumberAsDouble(p, len, pos);
+        } else if (key == "return_raw") {
+            if (pos >= len) {
+                opts.return_raw = false;
+                continue;
+            }
+            const auto val = p[pos];
+            opts.return_raw = (val != mp::kNil && val != mp::kFalse);
+            pos = SkipValue(p, len, pos);
+        } else if (key == "is_async") {
+            if (pos >= len) {
+                opts.is_async = false;
+                continue;
+            }
+            const auto val = p[pos];
+            opts.is_async = (val != mp::kNil && val != mp::kFalse);
+            pos = SkipValue(p, len, pos);
         } else {
             pos = SkipValue(p, len, pos);
         }
     }
     return opts;
+}
+
+static ParsedBootstrapArgs ParseBootstrapArgs(
+    const uint8_t* p, std::size_t len) noexcept {
+    using namespace storages::tarantool::impl::msgpack_scan;
+    ParsedBootstrapArgs out;
+    std::size_t pos = 0;
+    const auto alen = ReadArrayHeader(p, len, pos);
+    if (alen == 0) return out;
+    if (alen != 1 || !IsMap(p, len, pos)) {
+        out.valid = false;
+        return out;
+    }
+
+    const auto map_len = ReadMapHeader(p, len, pos);
+    for (std::size_t i = 0; i < map_len; ++i) {
+        auto [key, kp] = ReadStr(p, len, pos);
+        pos = kp;
+        if (key == "if_not_bootstrapped") {
+            if (pos >= len) {
+                out.if_not_bootstrapped = false;
+                continue;
+            }
+            const auto val = p[pos];
+            out.if_not_bootstrapped = (val != mp::kNil && val != mp::kFalse);
+            pos = SkipValue(p, len, pos);
+        } else if (key == "timeout") {
+            if (!IsNumber(p, len, pos)) {
+                pos = SkipValue(p, len, pos);
+                out.valid = false;
+                continue;
+            }
+            out.timeout = ReadNumberAsDouble(p, len, pos);
+        } else {
+            pos = SkipValue(p, len, pos);
+        }
+    }
+    return out;
 }
 
 static std::optional<std::vector<BucketId>> ParseBucketIdArray(
@@ -421,6 +485,8 @@ ParseVshardRouterArgs(const uint8_t* p, std::size_t len) noexcept {
         const auto opts = ParseCallOpts(p, len, pos);
         out.timeout = opts.timeout;
         out.request_timeout = opts.request_timeout;
+        out.return_raw = opts.return_raw;
+        out.is_async = opts.is_async;
         out.opts_valid = opts.valid;
     }
 
@@ -490,6 +556,8 @@ ParseVshardRouterCallArgs(const uint8_t* p, std::size_t len) noexcept {
         const auto opts = ParseCallOpts(p, len, pos);
         out.timeout = opts.timeout;
         out.request_timeout = opts.request_timeout;
+        out.return_raw = opts.return_raw;
+        out.is_async = opts.is_async;
         out.opts_valid = opts.valid;
     }
 
@@ -822,6 +890,19 @@ static std::vector<uint8_t> BuildResultFrameRaw(
     return tnt::BuildIprotoOkFrame(sync, kSchemaVersion, body.data(), body.size());
 }
 
+static std::vector<uint8_t> BuildAsyncFuturePlaceholderReturn() {
+    std::vector<uint8_t> result;
+    tnt::EncodeArray(result, 1);
+    tnt::EncodeArray(result, 0);
+    return result;
+}
+
+static std::string BuildReturnRawUnsupportedError() {
+    return std::string{kThisFile} +
+           ":" + std::to_string(__LINE__) +
+           ": Msgpack object feature is not supported by current Tarantool version";
+}
+
 // ---------------------------------------------------------------------------
 // Per-connection handler
 // ---------------------------------------------------------------------------
@@ -1085,6 +1166,29 @@ static void HandleConnection(engine::io::Socket sock,
                     (void)sock.SendAll(resp.data(), resp.size(), engine::Deadline{});
                     continue;
 
+                } else if (body->func_name == "vshard.router.bootstrap") {
+                    const auto bootstrap_args = ParseBootstrapArgs(
+                        body->tuple_begin, body->tuple_len);
+                    if (!bootstrap_args.valid) {
+                        const auto resp = tnt::BuildIprotoErrorFrame(
+                            req.sync, kSchemaVersion,
+                            "Usage: vshard.router.bootstrap({<options>})");
+                        (void)sock.SendAll(resp.data(), resp.size(), engine::Deadline{});
+                        continue;
+                    }
+
+                    storages::tarantool::OptionalCommandControl cc;
+                    if (const auto timeout_ms =
+                            MillisecondsFromSeconds(bootstrap_args.timeout)) {
+                        cc = storages::tarantool::CommandControl{*timeout_ms};
+                    }
+                    const auto result_bytes = proxy.Bootstrap(
+                        bootstrap_args.if_not_bootstrapped, cc);
+                    const auto resp = BuildResultFrameRaw(
+                        req.sync, result_bytes.data(), result_bytes.size());
+                    (void)sock.SendAll(resp.data(), resp.size(), engine::Deadline{});
+                    continue;
+
                 } else if (body->func_name == "vshard.router.map_callrw") {
                     const auto map_args = ParseMapCallRWArgs(
                         body->tuple_begin, body->tuple_len);
@@ -1201,15 +1305,33 @@ static void HandleConnection(engine::io::Socket sock,
                     cc = storages::tarantool::CommandControl{*timeout_ms};
                 }
                 std::vector<uint8_t> result_bytes;
+                if (vargs->return_raw) {
+                    const auto resp = tnt::BuildIprotoErrorFrame(
+                        req.sync, kSchemaVersion,
+                        BuildReturnRawUnsupportedError());
+                    (void)sock.SendAll(resp.data(), resp.size(), engine::Deadline{});
+                    continue;
+                }
                 try {
-                    result_bytes = is_generic_call
-                        ? proxy.CallRawBytesWithModeString(
-                              vargs->bucket_id, mode, vargs->storage_mode,
-                              vargs->func_name, vargs->args_begin,
-                              vargs->args_len, cc)
-                        : proxy.CallRawBytes(
-                              vargs->bucket_id, mode, vargs->func_name,
-                              vargs->args_begin, vargs->args_len, cc);
+                    if (vargs->is_async) {
+                        proxy.CallAsyncWithModeString(
+                            vargs->bucket_id, mode,
+                            is_generic_call
+                                ? vargs->storage_mode
+                                : (mode == CallMode::kReadWrite ? "write" : "read"),
+                            vargs->func_name, vargs->args_begin,
+                            vargs->args_len, cc);
+                        result_bytes = BuildAsyncFuturePlaceholderReturn();
+                    } else {
+                        result_bytes = is_generic_call
+                            ? proxy.CallRawBytesWithModeString(
+                                  vargs->bucket_id, mode, vargs->storage_mode,
+                                  vargs->func_name, vargs->args_begin,
+                                  vargs->args_len, cc)
+                            : proxy.CallRawBytes(
+                                  vargs->bucket_id, mode, vargs->func_name,
+                                  vargs->args_begin, vargs->args_len, cc);
+                    }
                 } catch (const storages::tarantool::vshard::UnreachableReplicasetError& ex) {
                     result_bytes = BuildRouterShardingErrorReturn(
                         8, "UNREACHABLE_REPLICASET", ex.what(),

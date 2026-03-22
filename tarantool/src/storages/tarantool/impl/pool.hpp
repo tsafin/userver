@@ -5,6 +5,7 @@
 
 #include <userver/clients/dns/resolver_fwd.hpp>
 #include <userver/engine/deadline.hpp>
+#include <userver/engine/future.hpp>
 #include <userver/storages/tarantool/options.hpp>
 #include <userver/storages/tarantool/query.hpp>
 #include <userver/storages/tarantool/result.hpp>
@@ -29,6 +30,8 @@ class Pool final {
     Pool(Pool&&) = default;
 
     ExecutionResult Execute(OptionalCommandControl cc, const Query& query);
+    engine::Future<ExecutionResult> ExecuteAsync(
+        OptionalCommandControl cc, const Query& query);
 
     ConnectionPtr Acquire(engine::Deadline deadline);
 

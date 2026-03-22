@@ -117,6 +117,10 @@ class VshardProxy final {
         BucketId bucket_id, impl::CallMode mode, std::string_view mode_string,
         std::string_view func, const uint8_t* args_data, std::size_t args_len,
         storages::tarantool::OptionalCommandControl = {});
+    void CallAsyncWithModeString(
+        BucketId bucket_id, impl::CallMode mode, std::string_view mode_string,
+        std::string_view func, const uint8_t* args_data, std::size_t args_len,
+        storages::tarantool::OptionalCommandControl = {});
 
     // ---- Zero-copy forwarding -----------------------------------------------
 
@@ -204,6 +208,9 @@ class VshardProxy final {
     };
 
     SyncResult Sync(double timeout_seconds);
+    std::vector<uint8_t> Bootstrap(
+        bool if_not_bootstrapped,
+        storages::tarantool::OptionalCommandControl cc = {});
 
     formats::msgpack::Value GetInfo(bool with_services);
 
@@ -234,6 +241,10 @@ class VshardProxy final {
     /// Shared retry loop returning raw router multi-return bytes — no Value
     /// tree at any point.
     std::vector<uint8_t> DoCallRawBytes(
+        BucketId bucket_id, impl::CallMode mode,
+        const storages::tarantool::Query& query,
+        storages::tarantool::OptionalCommandControl cc);
+    void DoCallAsync(
         BucketId bucket_id, impl::CallMode mode,
         const storages::tarantool::Query& query,
         storages::tarantool::OptionalCommandControl cc);

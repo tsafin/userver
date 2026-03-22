@@ -4,6 +4,7 @@
 #include <cctype>
 #include <cstdint>
 #include <algorithm>
+#include <span>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -110,6 +111,28 @@ std::vector<uint8_t> BuildNetboxClientErrorReturn(std::string_view message) {
     tnt::EncodeUint(buf, __LINE__);
 
     return buf;
+}
+
+std::vector<uint8_t> CopyRawBytes(std::span<const uint8_t> raw) {
+    return {raw.begin(), raw.end()};
+}
+
+std::vector<uint8_t> BuildNonEmptyBootstrapErrorReturn() {
+    std::vector<uint8_t> payload;
+    payload.reserve(96);
+
+    tnt::EncodeArray(payload, 2);
+    payload.push_back(mp::kNil);
+    tnt::EncodeFixMap(payload, 4);
+    tnt::EncodeStr(payload, "message");
+    tnt::EncodeStr(payload, "Cluster is already bootstrapped");
+    tnt::EncodeStr(payload, "type");
+    tnt::EncodeStr(payload, "ShardingError");
+    tnt::EncodeStr(payload, "code");
+    tnt::EncodeUint(payload, 10);
+    tnt::EncodeStr(payload, "name");
+    tnt::EncodeStr(payload, "NON_EMPTY");
+    return payload;
 }
 
 [[noreturn]] void RethrowDirectCallNetworkError(
@@ -267,6 +290,15 @@ std::vector<uint8_t> VshardProxy::CallRawBytesWithModeString(
     auto query = BuildStorageCallQueryRawWithModeString(
         bucket_id, mode_string, func, args_data, args_len);
     return DoCallRawBytes(bucket_id, mode, query, cc);
+}
+
+void VshardProxy::CallAsyncWithModeString(
+    BucketId bucket_id, impl::CallMode mode, std::string_view mode_string,
+    std::string_view func, const uint8_t* args_data, std::size_t args_len,
+    storages::tarantool::OptionalCommandControl cc) {
+    auto query = BuildStorageCallQueryRawWithModeString(
+        bucket_id, mode_string, func, args_data, args_len);
+    DoCallAsync(bucket_id, mode, query, cc);
 }
 
 // ---------------------------------------------------------------------------
@@ -602,6 +634,36 @@ std::vector<uint8_t> VshardProxy::DoCallRawBytes(
 
         HandleVshardError(env.vshard_error, bucket_id, attempt, snapshot, rs, deadline);
     }
+}
+
+void VshardProxy::DoCallAsync(
+    BucketId bucket_id, impl::CallMode mode,
+    const storages::tarantool::Query& query,
+    storages::tarantool::OptionalCommandControl cc) {
+
+    if (bucket_id < 1 || bucket_id > calculator_.GetBucketCount()) {
+        throw NoReplicasetError{bucket_id};
+    }
+
+    auto snapshot = routing_table_.Read();
+    impl::ReplicasetPool* rs = ResolveReplicaset(bucket_id, snapshot);
+    if (!rs) throw NoReplicasetError{bucket_id};
+
+    const auto deadline = cc
+        ? engine::Deadline::FromDuration(cc->execute)
+        : engine::Deadline::FromDuration(std::chrono::milliseconds{500});
+
+    if (deadline.IsReachable()) {
+        const auto left = deadline.TimeLeft();
+        if (left <= engine::Deadline::Duration::zero()) {
+            throw VshardException{"vshard.router.call timeout exceeded"};
+        }
+        cc = storages::tarantool::CommandControl{
+            std::chrono::duration_cast<std::chrono::milliseconds>(left)};
+    }
+
+    auto future = rs->ExecuteAsync(mode, query, cc);
+    static_cast<void>(future);
 }
 
 formats::msgpack::Value VshardProxy::ForwardCall(
@@ -1008,6 +1070,76 @@ VshardProxy::SyncResult VshardProxy::Sync(double timeout_seconds) {
     }
 
     return SyncResult{true, false, std::nullopt};
+}
+
+std::vector<uint8_t> VshardProxy::Bootstrap(
+    bool if_not_bootstrapped,
+    storages::tarantool::OptionalCommandControl cc) {
+    auto snapshot = routing_table_.Read();
+    const auto num_rs = snapshot->replicasets.size();
+
+    if (num_rs == 0) {
+        return BuildStorageCallErrorReturn("No replicasets available");
+    }
+
+    std::optional<std::vector<uint8_t>> last_error;
+    for (const auto& rs : snapshot->replicasets) {
+        const auto raw = rs->Execute(
+            impl::CallMode::kReadWrite,
+            storages::tarantool::Query::Call(
+                "vshard.storage.buckets_count",
+                formats::msgpack::ValueBuilder::Array()),
+            cc);
+        raw.AssertOk();
+        const auto& data = raw.GetData();
+        if (!data.IsArray() || data.GetSize() == 0 || data[0].IsNull()) {
+            if (!if_not_bootstrapped) {
+                return CopyRawBytes(raw.GetRawBytes());
+            }
+            last_error = CopyRawBytes(raw.GetRawBytes());
+            continue;
+        }
+        if (data[0].As<uint64_t>(0) > 0) {
+            if (if_not_bootstrapped) {
+                std::vector<uint8_t> result;
+                tnt::EncodeArray(result, 1);
+                result.push_back(mp::kTrue);
+                return result;
+            }
+            return BuildNonEmptyBootstrapErrorReturn();
+        }
+    }
+    if (last_error) return *last_error;
+
+    const uint32_t base = calculator_.GetBucketCount() / num_rs;
+    const uint32_t extra = calculator_.GetBucketCount() % num_rs;
+    uint32_t next_bucket = 1;
+    for (std::size_t i = 0; i < num_rs; ++i) {
+        const uint32_t count = base + (i < extra ? 1 : 0);
+        if (count == 0) continue;
+
+        auto args = formats::msgpack::ValueBuilder::Array();
+        args.PushBack(formats::msgpack::ValueBuilder{
+            static_cast<uint64_t>(next_bucket)});
+        args.PushBack(formats::msgpack::ValueBuilder{
+            static_cast<uint64_t>(count)});
+        const auto raw = snapshot->replicasets[i]->Execute(
+            impl::CallMode::kReadWrite,
+            storages::tarantool::Query::Call(
+                "vshard.storage.bucket_force_create", std::move(args)),
+            cc);
+        raw.AssertOk();
+        const auto& data = raw.GetData();
+        if (!data.IsArray() || data.GetSize() == 0 || !data[0].As<bool>(false)) {
+            return CopyRawBytes(raw.GetRawBytes());
+        }
+        next_bucket += count;
+    }
+
+    std::vector<uint8_t> result;
+    tnt::EncodeArray(result, 1);
+    result.push_back(mp::kTrue);
+    return result;
 }
 
 formats::msgpack::Value VshardProxy::GetInfo(bool with_services) {
