@@ -135,6 +135,74 @@ std::vector<uint8_t> BuildNonEmptyBootstrapErrorReturn() {
     return payload;
 }
 
+std::vector<uint8_t> BuildTimeoutClientErrorReturn() {
+    std::vector<uint8_t> buf;
+    buf.reserve(96);
+
+    tnt::EncodeArray(buf, 2);
+    buf.push_back(mp::kNil);
+    tnt::EncodeFixMap(buf, 5);
+    tnt::EncodeStr(buf, "code");
+    tnt::EncodeUint(buf, 78);
+    tnt::EncodeStr(buf, "base_type");
+    tnt::EncodeStr(buf, "ClientError");
+    tnt::EncodeStr(buf, "type");
+    tnt::EncodeStr(buf, "ClientError");
+    tnt::EncodeStr(buf, "message");
+    tnt::EncodeStr(buf, "Timeout exceeded");
+    tnt::EncodeStr(buf, "trace");
+    tnt::EncodeArray(buf, 1);
+    tnt::EncodeFixMap(buf, 2);
+    tnt::EncodeStr(buf, "file");
+    tnt::EncodeStr(buf, kThisFile);
+    tnt::EncodeStr(buf, "line");
+    tnt::EncodeUint(buf, __LINE__);
+    return buf;
+}
+
+std::vector<uint8_t> BuildVshardStorageErrorReturn(
+    const VshardStorageError& ex) {
+    std::size_t field_count = 3;
+    if (!ex.GetName().empty()) ++field_count;
+    if (ex.GetReplicaset()) ++field_count;
+    if (ex.GetReplica()) ++field_count;
+    if (ex.GetMaster()) ++field_count;
+
+    std::vector<uint8_t> buf;
+    buf.reserve(160);
+
+    tnt::EncodeArray(buf, 2);
+    buf.push_back(mp::kNil);
+    if (field_count <= 15) {
+        tnt::EncodeFixMap(buf, static_cast<uint8_t>(field_count));
+    } else {
+        tnt::EncodeFixMap(buf, 15);
+    }
+    tnt::EncodeStr(buf, "code");
+    tnt::EncodeUint(buf, ex.GetCode());
+    tnt::EncodeStr(buf, "type");
+    tnt::EncodeStr(buf, ex.GetType());
+    tnt::EncodeStr(buf, "message");
+    tnt::EncodeStr(buf, ex.what());
+    if (!ex.GetName().empty()) {
+        tnt::EncodeStr(buf, "name");
+        tnt::EncodeStr(buf, ex.GetName());
+    }
+    if (ex.GetReplicaset()) {
+        tnt::EncodeStr(buf, "replicaset");
+        tnt::EncodeStr(buf, *ex.GetReplicaset());
+    }
+    if (ex.GetReplica()) {
+        tnt::EncodeStr(buf, "replica");
+        tnt::EncodeStr(buf, *ex.GetReplica());
+    }
+    if (ex.GetMaster()) {
+        tnt::EncodeStr(buf, "master");
+        tnt::EncodeStr(buf, *ex.GetMaster());
+    }
+    return buf;
+}
+
 [[noreturn]] void RethrowDirectCallNetworkError(
     const impl::ReplicasetPool& rs, BucketId bucket_id,
     const std::exception& ex) {
@@ -395,8 +463,20 @@ VshardProxy::RetryAction VshardProxy::HandleVshardError(
         throw VshardException{"vshard.router.call timeout exceeded"};
     }
 
-    // WRONG_BUCKET / BUCKET_IS_LOCKED: bucket migrated or locked during rebalance
-    if (err.IsWrongBucket() || err.IsBucketIsLocked()) {
+    if (err.IsBucketIsLocked()) {
+        const auto left = deadline.TimeLeft();
+        if (left <= engine::Deadline::Duration::zero()) {
+            throw VshardException{"vshard.router.call timeout exceeded"};
+        }
+        const auto sleep_for = std::min(
+            std::chrono::duration_cast<std::chrono::milliseconds>(left),
+            std::chrono::milliseconds{10});
+        engine::SleepFor(sleep_for);
+        return RetryAction::kRetrySleep;
+    }
+
+    // WRONG_BUCKET: bucket migrated during rebalance.
+    if (err.IsWrongBucket()) {
         if (attempt >= settings_.max_moved_retries) {
             throw MovedError{
                 bucket_id,
@@ -443,7 +523,14 @@ VshardProxy::RetryAction VshardProxy::HandleVshardError(
     // NON_MASTER: routing table stale — refresh and retry
     if (err.IsNonMaster()) {
         if (attempt >= settings_.max_moved_retries) {
-            throw VshardStorageError{err.code, "NON_MASTER", err.message};
+            throw VshardStorageError{
+                err.code,
+                "ShardingError",
+                err.name.empty() ? "NON_MASTER" : err.name,
+                err.message,
+                err.replicaset_uuid,
+                err.replica_uuid,
+                err.master_uuid};
         }
         ++attempt;
         try {
@@ -591,11 +678,15 @@ std::vector<uint8_t> VshardProxy::DoCallRawBytes(
         : engine::Deadline::FromDuration(std::chrono::milliseconds{500});
 
     uint32_t attempt = 0;
+    bool waiting_on_locked_bucket = false;
     while (true) {
         // Update cc with remaining time for each attempt
         if (deadline.IsReachable()) {
             const auto left = deadline.TimeLeft();
             if (left <= engine::Deadline::Duration::zero()) {
+                if (waiting_on_locked_bucket) {
+                    return BuildTimeoutClientErrorReturn();
+                }
                 throw VshardException{"vshard.router.call timeout exceeded"};
             }
             cc = storages::tarantool::CommandControl{
@@ -609,6 +700,15 @@ std::vector<uint8_t> VshardProxy::DoCallRawBytes(
         } catch (const engine::io::IoException& ex) {
             return BuildNetboxClientErrorReturn(ex.what());
         } catch (const storages::tarantool::TarantoolException& ex) {
+            if (
+                waiting_on_locked_bucket &&
+                (std::string_view{ex.what()}.find("deadline exceeded") !=
+                     std::string_view::npos ||
+                 std::string_view{ex.what()}.find("deadline expired") !=
+                     std::string_view::npos)
+            ) {
+                return BuildTimeoutClientErrorReturn();
+            }
             if (IsConnectivityErrorMessage(ex.what())) {
                 return BuildNetboxClientErrorReturn(ex.what());
             }
@@ -631,8 +731,20 @@ std::vector<uint8_t> VshardProxy::DoCallRawBytes(
         if (env.status != impl::RawEnvelopeStatus::kVshardError) {
             return std::move(env.return_values_bytes);
         }
+        waiting_on_locked_bucket = env.vshard_error.IsBucketIsLocked();
 
-        HandleVshardError(env.vshard_error, bucket_id, attempt, snapshot, rs, deadline);
+        try {
+            HandleVshardError(
+                env.vshard_error, bucket_id, attempt, snapshot, rs, deadline);
+        } catch (const VshardStorageError& ex) {
+            return BuildVshardStorageErrorReturn(ex);
+        } catch (const VshardException& ex) {
+            if (std::string_view{ex.what()} ==
+                "vshard.router.call timeout exceeded") {
+                return BuildTimeoutClientErrorReturn();
+            }
+            throw;
+        }
     }
 }
 
@@ -1050,18 +1162,16 @@ VshardProxy::SyncResult VshardProxy::Sync(double timeout_seconds) {
         const auto query = storages::tarantool::Query::Call(
             "vshard.storage.sync", std::move(args));
 
-        const auto timeout_ms = std::chrono::duration_cast<
-            std::chrono::milliseconds>(remaining);
-        storages::tarantool::OptionalCommandControl cc =
-            storages::tarantool::CommandControl{
-                timeout_ms >= std::chrono::milliseconds::zero()
-                    ? timeout_ms
-                    : std::chrono::milliseconds::zero()};
-
         try {
-            rs->Execute(impl::CallMode::kReadWrite, query, cc);
+            rs->Execute(impl::CallMode::kReadWrite, query);
         } catch (const storages::tarantool::CommandException& ex) {
             if (std::string_view{ex.what()}.find("Timeout exceeded") !=
+                std::string_view::npos) {
+                return SyncResult{false, true, rs->GetUuid()};
+            }
+            throw;
+        } catch (const storages::tarantool::TarantoolException& ex) {
+            if (std::string_view{ex.what()}.find("execute deadline expired") !=
                 std::string_view::npos) {
                 return SyncResult{false, true, rs->GetUuid()};
             }

@@ -120,12 +120,40 @@ class VshardStorageError final : public VshardException {
           code_{code},
           type_{std::move(type)} {}
 
+    VshardStorageError(
+        uint32_t code, std::string type, std::string name,
+        std::string msg,
+        std::optional<std::string> replicaset = std::nullopt,
+        std::optional<std::string> replica = std::nullopt,
+        std::optional<std::string> master = std::nullopt)
+        : VshardException{msg},
+          code_{code},
+          type_{std::move(type)},
+          name_{std::move(name)},
+          replicaset_{std::move(replicaset)},
+          replica_{std::move(replica)},
+          master_{std::move(master)} {}
+
     uint32_t GetCode() const noexcept { return code_; }
     const std::string& GetType() const noexcept { return type_; }
+    const std::string& GetName() const noexcept { return name_; }
+    const std::optional<std::string>& GetReplicaset() const noexcept {
+        return replicaset_;
+    }
+    const std::optional<std::string>& GetReplica() const noexcept {
+        return replica_;
+    }
+    const std::optional<std::string>& GetMaster() const noexcept {
+        return master_;
+    }
 
  private:
     uint32_t code_;
     std::string type_;
+    std::string name_;
+    std::optional<std::string> replicaset_;
+    std::optional<std::string> replica_;
+    std::optional<std::string> master_;
 };
 
 }  // namespace storages::tarantool::vshard

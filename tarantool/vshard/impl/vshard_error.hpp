@@ -31,8 +31,12 @@ enum class VshardErrorType : uint32_t {
 struct VshardError {
     VshardErrorType type{VshardErrorType::kUnknown};
     uint32_t code{0};
+    std::string name;
     std::string message;
     std::optional<std::string> destination_uuid;  ///< Non-null on WRONG_BUCKET
+    std::optional<std::string> replicaset_uuid;
+    std::optional<std::string> replica_uuid;
+    std::optional<std::string> master_uuid;
 
     bool IsNull() const noexcept { return code == 0 && message.empty(); }
     bool IsWrongBucket() const noexcept {

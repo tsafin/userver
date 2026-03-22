@@ -59,6 +59,40 @@ def _find_bucket_on_storage(port, bucket_count=3000):
     raise AssertionError(f"Could not find bucket on storage port {port}")
 
 
+def _find_unique_bucket(owner_port, other_port, bucket_count=3000):
+    owner = tarantool.connect(
+        '127.0.0.1', owner_port, user='storage', password='storage',
+    )
+    other = tarantool.connect(
+        '127.0.0.1', other_port, user='storage', password='storage',
+    )
+    try:
+        for bucket_id in range(1, bucket_count + 1):
+            owner_stat = owner.call('vshard.storage.bucket_stat', [bucket_id]).data
+            other_stat = other.call('vshard.storage.bucket_stat', [bucket_id]).data
+            if (
+                owner_stat and owner_stat[0] is not None and
+                other_stat and other_stat[0] is None
+            ):
+                return bucket_id
+    finally:
+        owner.close()
+        other.close()
+    raise AssertionError(
+        f'Could not find unique bucket on {owner_port} against {other_port}'
+    )
+
+
+def _admin_eval(example_dir, instance, code):
+    result = test_conftest._run_tarantoolctl(
+        example_dir, 'enter', instance, check=False, input_text=code + '\n',
+    )
+    output = (result.stdout or '') + (result.stderr or '')
+    if result.returncode != 0 or 'error:' in output:
+        raise AssertionError(output)
+    return output
+
+
 def _start_standalone_proxy(binary, secdist_config, tmp_path, proxy_port):
     config_path = test_conftest._generate_static_config(
         proxy_port, secdist_config, str(tmp_path)
@@ -216,6 +250,91 @@ class TestDiscoveryClassification:
             test_conftest._wait_for_storage_ready(
                 vshard_cluster['ports']['rs2_master']
             )
+
+
+class TestRebalancePaths:
+    """Force reversible rebalance states and compare router behavior."""
+
+    def test_bucket_is_locked_matches_lua(self, lua_conn, cpp_conn, vshard_cluster):
+        example_dir = vshard_cluster['example_dir']
+        bucket_id = _find_unique_bucket(
+            vshard_cluster['ports']['rs1_master'],
+            vshard_cluster['ports']['rs2_master'],
+        )
+        code_set = (
+            "local ffi=require('ffi'); "
+            "local M=rawget(_G,'__module_vshard_storage'); "
+            f"local ref=ffi.new('struct bucket_ref'); ref.rw_lock=true; "
+            f"M.bucket_refs[{bucket_id}]=ref"
+        )
+        code_clear = (
+            "local M=rawget(_G,'__module_vshard_storage'); "
+            f"M.bucket_refs[{bucket_id}]=nil"
+        )
+
+        _admin_eval(example_dir, 'storage_1_a.lua', code_set)
+        try:
+            args = [bucket_id, 'echo', ['locked'], {'timeout': 0.05}]
+            lua_result = lua_conn.call('vshard.router.callrw', args)
+            cpp_result = cpp_conn.call('vshard.router.callrw', args)
+
+            assert _strip_trace_locations(cpp_result.data) == \
+                _strip_trace_locations(lua_result.data)
+        finally:
+            _admin_eval(example_dir, 'storage_1_a.lua', code_clear)
+
+    def test_transfer_in_progress_matches_lua(
+        self, lua_conn, cpp_conn, vshard_cluster
+    ):
+        example_dir = vshard_cluster['example_dir']
+        bucket_id = _find_unique_bucket(
+            vshard_cluster['ports']['rs1_master'],
+            vshard_cluster['ports']['rs2_master'],
+        )
+        code_set = (
+            "local M=rawget(_G,'__module_vshard_storage'); "
+            "M.errinj.ERRINJ_SKIP_BUCKET_STATUS_VALIDATE=true; "
+            f"box.space._bucket:replace{{{bucket_id}, 'sending', "
+            f"'{test_conftest.RS2_UUID}'}}; "
+            "M.errinj.ERRINJ_SKIP_BUCKET_STATUS_VALIDATE=false"
+        )
+        code_clear = (
+            "local M=rawget(_G,'__module_vshard_storage'); "
+            "M.errinj.ERRINJ_SKIP_BUCKET_STATUS_VALIDATE=true; "
+            f"box.space._bucket:replace{{{bucket_id}, 'active'}}; "
+            "M.errinj.ERRINJ_SKIP_BUCKET_STATUS_VALIDATE=false"
+        )
+
+        _admin_eval(example_dir, 'storage_1_a.lua', code_set)
+        try:
+            args = [bucket_id, 'echo', ['transfer'], {'timeout': 0.05}]
+            lua_result = lua_conn.call('vshard.router.callrw', args)
+            cpp_result = cpp_conn.call('vshard.router.callrw', args)
+
+            assert _strip_trace_locations(cpp_result.data) == \
+                _strip_trace_locations(lua_result.data)
+        finally:
+            _admin_eval(example_dir, 'storage_1_a.lua', code_clear)
+
+    def test_non_master_matches_lua(self, lua_conn, cpp_conn, vshard_cluster):
+        example_dir = vshard_cluster['example_dir']
+        bucket_id = _find_unique_bucket(
+            vshard_cluster['ports']['rs1_master'],
+            vshard_cluster['ports']['rs2_master'],
+        )
+        code_set = "local M=rawget(_G,'__module_vshard_storage'); M.is_master=false"
+        code_clear = "local M=rawget(_G,'__module_vshard_storage'); M.is_master=true"
+
+        _admin_eval(example_dir, 'storage_1_a.lua', code_set)
+        try:
+            args = [bucket_id, 'echo', ['non_master'], {'timeout': 0.05}]
+            lua_result = lua_conn.call('vshard.router.callrw', args)
+            cpp_result = cpp_conn.call('vshard.router.callrw', args)
+
+            assert _strip_trace_locations(cpp_result.data) == \
+                _strip_trace_locations(lua_result.data)
+        finally:
+            _admin_eval(example_dir, 'storage_1_a.lua', code_clear)
 
 
 class TestTimeout:

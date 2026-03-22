@@ -44,7 +44,14 @@ VshardError ParseVshardError(const formats::msgpack::Value& val) {
     if (err.type == VshardErrorType::kUnknown) {
         const auto& name_val = val["name"];
         if (!name_val.IsMissing() && name_val.IsString()) {
-            err.type = ErrorTypeFromName(name_val.As<std::string>(""));
+            err.name = name_val.As<std::string>("");
+            err.type = ErrorTypeFromName(err.name);
+        }
+    }
+    if (err.name.empty()) {
+        const auto& name_val = val["name"];
+        if (!name_val.IsMissing() && name_val.IsString()) {
+            err.name = name_val.As<std::string>("");
         }
     }
     const auto& msg_val = val["message"];
@@ -54,6 +61,18 @@ VshardError ParseVshardError(const formats::msgpack::Value& val) {
     const auto& dst_val = val["destination"];
     if (!dst_val.IsMissing() && !dst_val.IsNull()) {
         err.destination_uuid = dst_val.As<std::string>("");
+    }
+    const auto& rs_val = val["replicaset"];
+    if (!rs_val.IsMissing() && !rs_val.IsNull()) {
+        err.replicaset_uuid = rs_val.As<std::string>("");
+    }
+    const auto& replica_val = val["replica"];
+    if (!replica_val.IsMissing() && !replica_val.IsNull()) {
+        err.replica_uuid = replica_val.As<std::string>("");
+    }
+    const auto& master_val = val["master"];
+    if (!master_val.IsMissing() && !master_val.IsNull()) {
+        err.master_uuid = master_val.As<std::string>("");
     }
     return err;
 }
