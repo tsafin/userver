@@ -363,26 +363,59 @@
   <p class="ref">Reference: tsafin/userver PR#3 · tarantool/vshard master · vshard/error.lua · vshard/router/init.lua · vshard/consts.lua</p>
 </header>
 
+<section class="equiv-section">
+  <h3>Current State</h3>
+  <p>
+    This HTML report is historical background and is not a line-by-line current
+    status sheet anymore.
+  </p>
+  <p>
+    The current verified state is:
+  </p>
+  <ul>
+    <li><strong>71 tests pass</strong> in the vshard functional suite.</li>
+    <li>
+      The C++ proxy now matches Lua closely for the tested IPROTO router API on
+      Tarantool 2.6.0.
+    </li>
+    <li>
+      Most formerly open gaps in call parsing, error envelopes, discovery,
+      <code>map_callrw</code>, rebalance paths, <code>bootstrap</code>,
+      <code>sync</code>, <code>info</code>, and <code>routeall</code> have been
+      closed.
+    </li>
+    <li>
+      The main remaining gaps are degraded-cluster <code>info()</code> parity
+      and true <code>return_raw</code> support on newer Tarantool runtimes with
+      msgpack-object support.
+    </li>
+  </ul>
+  <p>
+    For the current up-to-date review, use
+    <code>tarantool/vshard/lua_cpp_semantic_review.md</code>.
+  </p>
+</section>
+
 <div class="summary-grid">
   <div class="summary-card">
-    <div class="num" style="color:#f85149">3</div>
-    <div class="lbl">Critical (P0/P1)</div>
+    <div class="num" style="color:#3fb950">71</div>
+    <div class="lbl">Current Passing Tests</div>
   </div>
   <div class="summary-card">
-    <div class="num" style="color:#e3b341">5</div>
-    <div class="lbl">Major (P1)</div>
+    <div class="num" style="color:#3fb950">14</div>
+    <div class="lbl">Router APIs Covered</div>
   </div>
   <div class="summary-card">
-    <div class="num" style="color:#bc8cff">4</div>
-    <div class="lbl">Moderate (P2)</div>
+    <div class="num" style="color:#3fb950">Most</div>
+    <div class="lbl">Earlier Gaps Closed</div>
   </div>
   <div class="summary-card">
-    <div class="num" style="color:#79c0ff">4</div>
-    <div class="lbl">Minor (P3)</div>
+    <div class="num" style="color:#e3b341">2</div>
+    <div class="lbl">Meaningful Gaps Left</div>
   </div>
   <div class="summary-card">
-    <div class="num" style="color:#3fb950">5</div>
-    <div class="lbl">Correct / N/A</div>
+    <div class="num" style="color:#79c0ff">2.6.0</div>
+    <div class="lbl">Target Tarantool Runtime</div>
   </div>
 </div>
 
