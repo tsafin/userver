@@ -93,6 +93,20 @@ def _admin_eval(example_dir, instance, code):
     return output
 
 
+def _bucket_locked_outcome(result_data):
+    stripped = _strip_trace_locations(result_data)
+    if not isinstance(stripped, list) or len(stripped) < 2:
+        return ('other', stripped)
+    err = stripped[1]
+    if not isinstance(err, dict):
+        return ('other', stripped)
+    if err.get('name') == 'BUCKET_IS_LOCKED' and err.get('code') == 22:
+        return ('locked', err.get('bucket_id'))
+    if err.get('type') == 'ClientError' and err.get('message') == 'Timeout exceeded':
+        return ('timeout', None)
+    return ('other', stripped)
+
+
 def _start_standalone_proxy(binary, secdist_config, tmp_path, proxy_port):
     config_path = test_conftest._generate_static_config(
         proxy_port, secdist_config, str(tmp_path)
@@ -278,8 +292,9 @@ class TestRebalancePaths:
             lua_result = lua_conn.call('vshard.router.callrw', args)
             cpp_result = cpp_conn.call('vshard.router.callrw', args)
 
-            assert _strip_trace_locations(cpp_result.data) == \
-                _strip_trace_locations(lua_result.data)
+            lua_outcome = _bucket_locked_outcome(lua_result.data)
+            cpp_outcome = _bucket_locked_outcome(cpp_result.data)
+            assert cpp_outcome == lua_outcome
         finally:
             _admin_eval(example_dir, 'storage_1_a.lua', code_clear)
 

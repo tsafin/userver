@@ -32,6 +32,20 @@ def _strip_trace_locations(value):
     return value
 
 
+def _strip_service_status_idx(value):
+    if isinstance(value, dict):
+        return {
+            key: _strip_service_status_idx(item)
+            for key, item in value.items()
+            if key != 'status_idx'
+        }
+    if isinstance(value, list):
+        return [_strip_service_status_idx(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_strip_service_status_idx(item) for item in value)
+    return value
+
+
 class TestCallRW:
     """vshard.router.callrw — write operations through the proxy."""
 
@@ -421,6 +435,8 @@ class TestInfo:
         cpp_info = cpp_result.data[0]
 
         assert cpp_info['bucket'] == lua_info['bucket']
+        assert cpp_info['alerts'] == lua_info['alerts']
+        assert cpp_info['status'] == lua_info['status']
         assert cpp_info['identification_mode'] == lua_info['identification_mode']
         assert cpp_info['is_enabled'] == lua_info['is_enabled']
         assert set(cpp_info['replicasets'].keys()) == set(lua_info['replicasets'].keys())
@@ -450,19 +466,8 @@ class TestInfo:
         lua_info = lua_result.data[0]
         cpp_info = cpp_result.data[0]
 
-        assert cpp_info['bucket'] == lua_info['bucket']
-        assert 'services' in cpp_info
-        assert 'discovery' in cpp_info['services']
-        assert cpp_info['services']['discovery']['name'] == 'discovery'
-        assert cpp_info['services']['discovery']['status'] == 'ok'
-        assert cpp_info['services']['discovery']['activity'] == 'idling'
-
-        for rs_uuid in lua_info['replicasets']:
-            assert 'services' in cpp_info['replicasets'][rs_uuid]
-            assert 'failover' in cpp_info['replicasets'][rs_uuid]['services']
-            assert 'master_search' in cpp_info['replicasets'][rs_uuid]['services']
-            assert cpp_info['replicasets'][rs_uuid]['services']['failover']['status'] == 'ok'
-            assert cpp_info['replicasets'][rs_uuid]['services']['master_search'] == []
+        assert _strip_service_status_idx(cpp_info) == \
+            _strip_service_status_idx(lua_info)
 
     def test_info_rejects_non_map_non_bool_arg_like_lua(self, lua_conn, cpp_conn):
         with pytest.raises(tarantool.error.DatabaseError):

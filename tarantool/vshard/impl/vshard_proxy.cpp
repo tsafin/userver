@@ -203,6 +203,51 @@ std::vector<uint8_t> BuildVshardStorageErrorReturn(
     return buf;
 }
 
+std::vector<uint8_t> BuildVshardErrorReturn(const impl::VshardError& err) {
+    std::size_t field_count = 4;
+    if (err.bucket_id) ++field_count;
+    if (err.destination_uuid) ++field_count;
+    if (err.replicaset_uuid) ++field_count;
+    if (err.replica_uuid) ++field_count;
+    if (err.master_uuid) ++field_count;
+
+    std::vector<uint8_t> buf;
+    buf.reserve(160);
+
+    tnt::EncodeArray(buf, 2);
+    buf.push_back(mp::kNil);
+    tnt::EncodeFixMap(buf, static_cast<uint8_t>(field_count));
+    tnt::EncodeStr(buf, "code");
+    tnt::EncodeUint(buf, err.code);
+    tnt::EncodeStr(buf, "type");
+    tnt::EncodeStr(buf, "ShardingError");
+    tnt::EncodeStr(buf, "message");
+    tnt::EncodeStr(buf, err.message);
+    tnt::EncodeStr(buf, "name");
+    tnt::EncodeStr(buf, err.name);
+    if (err.bucket_id) {
+        tnt::EncodeStr(buf, "bucket_id");
+        tnt::EncodeUint(buf, *err.bucket_id);
+    }
+    if (err.destination_uuid) {
+        tnt::EncodeStr(buf, "destination");
+        tnt::EncodeStr(buf, *err.destination_uuid);
+    }
+    if (err.replicaset_uuid) {
+        tnt::EncodeStr(buf, "replicaset");
+        tnt::EncodeStr(buf, *err.replicaset_uuid);
+    }
+    if (err.replica_uuid) {
+        tnt::EncodeStr(buf, "replica");
+        tnt::EncodeStr(buf, *err.replica_uuid);
+    }
+    if (err.master_uuid) {
+        tnt::EncodeStr(buf, "master");
+        tnt::EncodeStr(buf, *err.master_uuid);
+    }
+    return buf;
+}
+
 [[noreturn]] void RethrowDirectCallNetworkError(
     const impl::ReplicasetPool& rs, BucketId bucket_id,
     const std::exception& ex) {
@@ -679,13 +724,14 @@ std::vector<uint8_t> VshardProxy::DoCallRawBytes(
 
     uint32_t attempt = 0;
     bool waiting_on_locked_bucket = false;
+    std::optional<impl::VshardError> last_locked_error;
     while (true) {
         // Update cc with remaining time for each attempt
         if (deadline.IsReachable()) {
             const auto left = deadline.TimeLeft();
             if (left <= engine::Deadline::Duration::zero()) {
-                if (waiting_on_locked_bucket) {
-                    return BuildTimeoutClientErrorReturn();
+                if (last_locked_error) {
+                    return BuildVshardErrorReturn(*last_locked_error);
                 }
                 throw VshardException{"vshard.router.call timeout exceeded"};
             }
@@ -701,7 +747,7 @@ std::vector<uint8_t> VshardProxy::DoCallRawBytes(
             return BuildNetboxClientErrorReturn(ex.what());
         } catch (const storages::tarantool::TarantoolException& ex) {
             if (
-                waiting_on_locked_bucket &&
+                last_locked_error &&
                 (std::string_view{ex.what()}.find("deadline exceeded") !=
                      std::string_view::npos ||
                  std::string_view{ex.what()}.find("deadline expired") !=
@@ -732,6 +778,9 @@ std::vector<uint8_t> VshardProxy::DoCallRawBytes(
             return std::move(env.return_values_bytes);
         }
         waiting_on_locked_bucket = env.vshard_error.IsBucketIsLocked();
+        if (waiting_on_locked_bucket) {
+            last_locked_error = env.vshard_error;
+        }
 
         try {
             HandleVshardError(
@@ -1144,6 +1193,7 @@ uint32_t VshardProxy::GetBucketCount() const noexcept {
 VshardProxy::SyncResult VshardProxy::Sync(double timeout_seconds) {
     auto snapshot = routing_table_.Read();
     const auto& replicasets = snapshot->replicasets;
+    std::optional<std::string> last_replicaset_id;
 
     const auto total_timeout = std::chrono::duration_cast<
         std::chrono::milliseconds>(std::chrono::duration<double>{timeout_seconds});
@@ -1154,8 +1204,9 @@ VshardProxy::SyncResult VshardProxy::Sync(double timeout_seconds) {
         const auto remaining_seconds =
             std::chrono::duration<double>(remaining).count();
         if (remaining_seconds < 0.0) {
-            return SyncResult{false, true, std::nullopt};
+            return SyncResult{false, true, last_replicaset_id};
         }
+        last_replicaset_id = rs->GetUuid();
 
         auto args = formats::msgpack::ValueBuilder::Array();
         args.PushBack(formats::msgpack::ValueBuilder{remaining_seconds});
@@ -1305,20 +1356,28 @@ formats::msgpack::Value VshardProxy::GetInfo(bool with_services) {
         rs_info["master"] = std::move(master);
 
         auto replica = formats::msgpack::ValueBuilder::Object();
-        if (rs->HasReplica() && rs->IsReplicaAvailable()) {
+        if (rs->IsMasterAvailable()) {
+            replica["uri"] = formats::msgpack::ValueBuilder{
+                "storage@" + master_meta.host + ":" +
+                std::to_string(master_meta.port)};
+            replica["network_timeout"] = formats::msgpack::ValueBuilder{0.5};
+            if (!master_meta.uuid.empty()) {
+                replica["uuid"] = formats::msgpack::ValueBuilder{
+                    master_meta.uuid};
+            }
+            replica["status"] = formats::msgpack::ValueBuilder{"available"};
+        } else if (rs->HasReplica() && rs->IsReplicaAvailable()) {
             const auto* replica_meta = rs->GetReplicaMeta();
             if (replica_meta) {
                 replica["uri"] = formats::msgpack::ValueBuilder{
                     "storage@" + replica_meta->host + ":" +
                     std::to_string(replica_meta->port)};
                 replica["network_timeout"] = formats::msgpack::ValueBuilder{0.5};
+                if (!replica_meta->uuid.empty()) {
+                    replica["uuid"] = formats::msgpack::ValueBuilder{
+                        replica_meta->uuid};
+                }
             }
-            replica["status"] = formats::msgpack::ValueBuilder{"available"};
-        } else if (rs->IsMasterAvailable()) {
-            replica["uri"] = formats::msgpack::ValueBuilder{
-                "storage@" + master_meta.host + ":" +
-                std::to_string(master_meta.port)};
-            replica["network_timeout"] = formats::msgpack::ValueBuilder{0.5};
             replica["status"] = formats::msgpack::ValueBuilder{"available"};
         } else {
             replica["status"] = formats::msgpack::ValueBuilder{
@@ -1356,7 +1415,19 @@ formats::msgpack::Value VshardProxy::GetInfo(bool with_services) {
             failover["status_idx"] = formats::msgpack::ValueBuilder{0};
             failover["activity"] = formats::msgpack::ValueBuilder{"idling"};
             failover["error"] = formats::msgpack::ValueBuilder{""};
-            failover["replicas"] = formats::msgpack::ValueBuilder::Object();
+            auto failover_replicas = formats::msgpack::ValueBuilder::Object();
+            for (const auto& meta : rs->GetAllInstanceMetas()) {
+                if (meta.uuid.empty()) continue;
+                auto replica_service = formats::msgpack::ValueBuilder::Object();
+                replica_service["name"] =
+                    formats::msgpack::ValueBuilder{"replica_failover"};
+                replica_service["status"] = formats::msgpack::ValueBuilder{"ok"};
+                replica_service["status_idx"] = formats::msgpack::ValueBuilder{0};
+                replica_service["activity"] = formats::msgpack::ValueBuilder{"idling"};
+                replica_service["error"] = formats::msgpack::ValueBuilder{""};
+                failover_replicas[meta.uuid] = std::move(replica_service);
+            }
+            failover["replicas"] = std::move(failover_replicas);
             services["failover"] = std::move(failover);
 
             services["master_search"] = formats::msgpack::ValueBuilder::Array();

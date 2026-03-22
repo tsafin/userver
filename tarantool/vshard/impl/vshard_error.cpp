@@ -58,6 +58,10 @@ VshardError ParseVshardError(const formats::msgpack::Value& val) {
     if (!msg_val.IsMissing() && !msg_val.IsNull()) {
         err.message = msg_val.As<std::string>("");
     }
+    const auto& bucket_id_val = val["bucket_id"];
+    if (!bucket_id_val.IsMissing() && !bucket_id_val.IsNull()) {
+        err.bucket_id = bucket_id_val.As<uint32_t>();
+    }
     const auto& dst_val = val["destination"];
     if (!dst_val.IsMissing() && !dst_val.IsNull()) {
         err.destination_uuid = dst_val.As<std::string>("");

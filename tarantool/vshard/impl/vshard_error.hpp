@@ -33,6 +33,7 @@ struct VshardError {
     uint32_t code{0};
     std::string name;
     std::string message;
+    std::optional<uint32_t> bucket_id;
     std::optional<std::string> destination_uuid;  ///< Non-null on WRONG_BUCKET
     std::optional<std::string> replicaset_uuid;
     std::optional<std::string> replica_uuid;

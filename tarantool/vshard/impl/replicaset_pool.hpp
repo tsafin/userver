@@ -96,6 +96,12 @@ class ReplicasetPool final {
     const InstanceMeta* GetReplicaMeta() const noexcept {
         return replica_metas_.empty() ? nullptr : &replica_metas_.front();
     }
+    std::vector<InstanceMeta> GetAllInstanceMetas() const {
+        auto result = std::vector<InstanceMeta>{master_meta_};
+        result.insert(
+            result.end(), replica_metas_.begin(), replica_metas_.end());
+        return result;
+    }
 
     void WriteStatistics(utils::statistics::Writer& writer) const;
 
