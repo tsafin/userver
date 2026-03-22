@@ -64,6 +64,18 @@ struct VshardTopologyConfig {
 /// available.
 class TopologyFetcher final {
  public:
+    struct BucketDiscoveryResult {
+        uint16_t rs_idx{0};
+        std::string unreachable_replicaset_id;
+        std::string error_message;
+
+        bool HasOwner() const noexcept { return rs_idx != 0; }
+        bool HasUnreachableReplicaset() const noexcept {
+            return !unreachable_replicaset_id.empty();
+        }
+        bool HasOtherError() const noexcept { return !error_message.empty(); }
+    };
+
     TopologyFetcher(clients::dns::Resolver& resolver,
                     const components::ComponentConfig& pool_config,
                     const VshardTopologyConfig& config);
@@ -79,8 +91,12 @@ class TopologyFetcher final {
 
     /// Discover which RS owns a specific bucket by calling
     /// `vshard.storage.bucket_stat` on each RS master.
-    /// Returns the 1-based RS index, or 0 if no RS claims the bucket.
-    uint16_t DiscoverBucket(uint32_t bucket_id);
+    /// Distinguishes:
+    ///  - found owner
+    ///  - no route to bucket
+    ///  - unreachable replicaset during probe
+    ///  - other probe error
+    BucketDiscoveryResult DiscoverBucket(uint32_t bucket_id);
 
  private:
     clients::dns::Resolver& resolver_;

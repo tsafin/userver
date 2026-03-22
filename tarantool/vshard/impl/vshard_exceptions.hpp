@@ -60,6 +60,41 @@ class NoReplicasetError final : public VshardException {
     uint32_t bucket_id_;
 };
 
+/// Discovery could not probe a replicaset while resolving an unmapped bucket.
+/// Mirrors Lua's UNREACHABLE_REPLICASET classification.
+class UnreachableReplicasetError final : public VshardException {
+ public:
+    UnreachableReplicasetError(std::string replicaset_id, uint32_t bucket_id)
+        : VshardException{"There is no active replicas in replicaset " +
+                          replicaset_id},
+          replicaset_id_{std::move(replicaset_id)},
+          bucket_id_{bucket_id} {}
+
+    const std::string& GetReplicasetId() const noexcept {
+        return replicaset_id_;
+    }
+    uint32_t GetBucketId() const noexcept { return bucket_id_; }
+
+ private:
+    std::string replicaset_id_;
+    uint32_t bucket_id_;
+};
+
+/// All replicasets were scanned during discovery, but none claimed the bucket.
+/// Mirrors Lua's NO_ROUTE_TO_BUCKET classification.
+class NoRouteToBucketError final : public VshardException {
+ public:
+    explicit NoRouteToBucketError(uint32_t bucket_id)
+        : VshardException{"Bucket " + std::to_string(bucket_id) +
+                          " cannot be found. Is rebalancing in progress?"},
+          bucket_id_{bucket_id} {}
+
+    uint32_t GetBucketId() const noexcept { return bucket_id_; }
+
+ private:
+    uint32_t bucket_id_;
+};
+
 /// All replicas are unavailable in BRE (best-read-only-error) mode.
 class ReplicaUnavailableError final : public VshardException {
  public:

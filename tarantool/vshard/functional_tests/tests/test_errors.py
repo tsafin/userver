@@ -3,7 +3,15 @@
 Tests WRONG_BUCKET retry, invalid bucket IDs, missing functions,
 and other error scenarios.
 """
+import os
+import subprocess
+import time
+import uuid
+
 import pytest
+import tarantool
+
+import conftest as test_conftest
 
 
 def _call_outcome(conn, func_name, args):
@@ -11,6 +19,46 @@ def _call_outcome(conn, func_name, args):
         return ('data', conn.call(func_name, args).data)
     except Exception as exc:
         return ('exc', str(exc))
+
+
+def _find_bucket_on_storage(port, bucket_count=3000):
+    conn = tarantool.connect(
+        '127.0.0.1', port, user='storage', password='storage',
+    )
+    try:
+        for bucket_id in range(1, bucket_count + 1):
+            result = conn.call('vshard.storage.bucket_stat', [bucket_id])
+            if result.data and result.data[0] is not None:
+                return bucket_id
+    finally:
+        conn.close()
+    raise AssertionError(f"Could not find bucket on storage port {port}")
+
+
+def _start_standalone_proxy(binary, secdist_config, tmp_path, proxy_port):
+    config_path = test_conftest._generate_static_config(
+        proxy_port, secdist_config, str(tmp_path)
+    )
+    config_text = open(config_path, 'r').read()
+    config_text = config_text.replace(
+        "            max_pool_size: 8\n",
+        "            max_pool_size: 8\n"
+        "            topology_refresh_interval: 100ms\n"
+        "            moved_refresh_min_interval: 100ms\n",
+        1,
+    )
+    with open(config_path, 'w') as config_file:
+        config_file.write(config_text)
+    proc = subprocess.Popen(
+        [binary, '--config', config_path],
+        stdout=open(os.path.join(tmp_path, 'proxy_stdout.log'), 'w'),
+        stderr=open(os.path.join(tmp_path, 'proxy_stderr.log'), 'w'),
+    )
+    if not test_conftest._wait_for_port('127.0.0.1', proxy_port, timeout=15):
+        proc.kill()
+        raise RuntimeError(f"Standalone proxy on port {proxy_port} did not start")
+    time.sleep(2)
+    return proc
 
 
 class TestInvalidBucket:
@@ -79,6 +127,69 @@ class TestWrongBucketRetry:
                 [bid, 'box.space.customer:replace', [row]],
             )
             assert result.data is not None, f"Failed for bucket {bid}"
+
+
+class TestDiscoveryClassification:
+    """Discovery-only failures should match Lua router error classification."""
+
+    def test_unreachable_replicaset_matches_lua(
+        self,
+        request,
+        lua_conn,
+        vshard_cluster,
+        secdist_config,
+        tmp_path,
+    ):
+        binary = request.config.getoption('--proxy-binary')
+        if binary is None:
+            pytest.skip("C++ proxy binary not specified")
+
+        example_dir = vshard_cluster['example_dir']
+        bucket_id = _find_bucket_on_storage(vshard_cluster['ports']['rs2_master'])
+        proxy_port = 14000 + (uuid.uuid4().int % 1000)
+        proc = None
+        conn = None
+
+        test_conftest._run_tarantoolctl(
+            example_dir, 'stop', 'storage_2_a.lua', check=False
+        )
+        test_conftest._run_tarantoolctl(
+            example_dir, 'stop', 'storage_2_b.lua', check=False
+        )
+        time.sleep(1)
+        try:
+            proc = _start_standalone_proxy(
+                binary, secdist_config, tmp_path, proxy_port
+            )
+            conn = tarantool.Connection(
+                '127.0.0.1', proxy_port, fetch_schema=False
+            )
+            conn.connect()
+
+            args = [bucket_id, 'echo', ['probe']]
+            lua_result = lua_conn.call('vshard.router.callrw', args)
+            cpp_result = conn.call('vshard.router.callrw', args)
+
+            assert lua_result.data[0] is None
+            assert cpp_result.data == lua_result.data
+        finally:
+            if conn is not None:
+                conn.close()
+            if proc is not None:
+                proc.kill()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.terminate()
+            test_conftest._run_tarantoolctl(
+                example_dir, 'start', 'storage_2_a.lua', check=False
+            )
+            test_conftest._run_tarantoolctl(
+                example_dir, 'start', 'storage_2_b.lua', check=False
+            )
+            test_conftest._wait_for_storage_ready(
+                vshard_cluster['ports']['rs2_master']
+            )
 
 
 class TestTimeout:

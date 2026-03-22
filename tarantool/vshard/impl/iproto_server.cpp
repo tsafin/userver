@@ -18,6 +18,7 @@
 #include <vshard/impl/iproto_server.hpp>
 
 #include <array>
+#include <cctype>
 #include <cstring>
 #include <optional>
 #include <string_view>
@@ -705,6 +706,94 @@ static std::vector<uint8_t> BuildRouteAllResultFrame(
     return BuildOkFrame(sync, body.data(), body.size());
 }
 
+static bool IsConnectivityErrorMessage(std::string_view message) {
+    return message.find("Error while establishing connection") !=
+               std::string_view::npos ||
+           message.find("connection is broken") != std::string_view::npos ||
+           message.find("Failed to connect to ") != std::string_view::npos;
+}
+
+static std::string NormalizeNetboxClientErrorMessage(std::string_view message) {
+    const auto detail_pos = message.find("Error while establishing connection");
+    if (detail_pos != std::string_view::npos) {
+        message = message.substr(0, detail_pos);
+    }
+    constexpr std::string_view kSocketPrefix = "Socket: ";
+    if (message.substr(0, kSocketPrefix.size()) == kSocketPrefix) {
+        message.remove_prefix(kSocketPrefix.size());
+    }
+    while (!message.empty() &&
+           std::isspace(static_cast<unsigned char>(message.back()))) {
+        message.remove_suffix(1);
+    }
+    if (!message.empty()) {
+        return std::string{message};
+    }
+    return "Connection refused";
+}
+
+static std::vector<uint8_t> BuildNetboxClientErrorReturn(
+    std::string_view message) {
+    static constexpr uint32_t kNoConnectionCode = 77;
+
+    std::vector<uint8_t> payload;
+    const auto normalized = NormalizeNetboxClientErrorMessage(message);
+    payload.reserve(128 + normalized.size());
+
+    PushFixArray(payload, 2);
+    payload.push_back(mp::kNil);
+    PushMapHeader(payload, 5);
+    PushStr(payload, "code");
+    PushUint32Compact(payload, kNoConnectionCode);
+    PushStr(payload, "base_type");
+    PushStr(payload, "ClientError");
+    PushStr(payload, "type");
+    PushStr(payload, "ClientError");
+    PushStr(payload, "message");
+    PushStr(payload, normalized);
+    PushStr(payload, "trace");
+    PushFixArray(payload, 1);
+    PushMapHeader(payload, 2);
+    PushStr(payload, "file");
+    PushStr(payload, "builtin/box/net_box.lua");
+    PushStr(payload, "line");
+    PushUint32Compact(payload, 540);
+    return payload;
+}
+
+static std::vector<uint8_t> BuildRouterShardingErrorReturn(
+    uint32_t code, std::string_view name, std::string_view message,
+    std::optional<std::string_view> replicaset_id,
+    std::optional<uint32_t> bucket_id) {
+    std::size_t field_count = 4;
+    if (replicaset_id) ++field_count;
+    if (bucket_id) ++field_count;
+
+    std::vector<uint8_t> payload;
+    payload.reserve(128 + message.size() + name.size());
+
+    PushFixArray(payload, 2);
+    payload.push_back(mp::kNil);
+    PushMapHeader(payload, field_count);
+    PushStr(payload, "message");
+    PushStr(payload, message);
+    PushStr(payload, "type");
+    PushStr(payload, "ShardingError");
+    PushStr(payload, "code");
+    PushUint32Compact(payload, code);
+    PushStr(payload, "name");
+    PushStr(payload, name);
+    if (replicaset_id) {
+        PushStr(payload, "replicaset");
+        PushStr(payload, *replicaset_id);
+    }
+    if (bucket_id) {
+        PushStr(payload, "bucket_id");
+        PushUint32Compact(payload, *bucket_id);
+    }
+    return payload;
+}
+
 /// Encode {DATA: [result_value]} and build the full OK frame.
 [[maybe_unused]] static std::vector<uint8_t> BuildResultFrame(
     uint64_t sync, const formats::msgpack::Value& result) {
@@ -967,13 +1056,31 @@ static void HandleConnection(engine::io::Socket sock,
                         MillisecondsFromSeconds(vargs->timeout)) {
                     cc = storages::tarantool::CommandControl{*timeout_ms};
                 }
-                const auto result_bytes = is_generic_call
-                    ? proxy.CallRawBytesWithModeString(
-                          vargs->bucket_id, mode, vargs->storage_mode,
-                          vargs->func_name, vargs->args_begin, vargs->args_len, cc)
-                    : proxy.CallRawBytes(
-                          vargs->bucket_id, mode, vargs->func_name,
-                          vargs->args_begin, vargs->args_len, cc);
+                std::vector<uint8_t> result_bytes;
+                try {
+                    result_bytes = is_generic_call
+                        ? proxy.CallRawBytesWithModeString(
+                              vargs->bucket_id, mode, vargs->storage_mode,
+                              vargs->func_name, vargs->args_begin,
+                              vargs->args_len, cc)
+                        : proxy.CallRawBytes(
+                              vargs->bucket_id, mode, vargs->func_name,
+                              vargs->args_begin, vargs->args_len, cc);
+                } catch (const storages::tarantool::vshard::UnreachableReplicasetError& ex) {
+                    result_bytes = BuildRouterShardingErrorReturn(
+                        8, "UNREACHABLE_REPLICASET", ex.what(),
+                        ex.GetReplicasetId(), ex.GetBucketId());
+                } catch (const storages::tarantool::vshard::NoRouteToBucketError& ex) {
+                    result_bytes = BuildRouterShardingErrorReturn(
+                        9, "NO_ROUTE_TO_BUCKET", ex.what(),
+                        std::nullopt, ex.GetBucketId());
+                } catch (const std::exception& ex) {
+                    if (IsConnectivityErrorMessage(ex.what())) {
+                        result_bytes = BuildNetboxClientErrorReturn(ex.what());
+                    } else {
+                        throw;
+                    }
+                }
 
                 const auto resp = BuildResultFrameRaw(
                     req.sync, result_bytes.data(), result_bytes.size());

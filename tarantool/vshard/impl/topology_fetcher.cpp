@@ -6,6 +6,7 @@
 #include <userver/formats/json/value.hpp>
 #include <userver/formats/msgpack/value_builder.hpp>
 #include <userver/logging/log.hpp>
+#include <userver/storages/tarantool/exceptions.hpp>
 
 #include <storages/tarantool/impl/pool.hpp>
 #include <storages/tarantool/impl/settings.hpp>
@@ -146,10 +147,22 @@ RoutingTable TopologyFetcher::BuildFromConfig() {
     return table;
 }
 
+enum class BucketProbeStatus {
+    kFound,
+    kWrongBucket,
+    kBackoff,
+    kUnreachableReplicaset,
+    kOtherError,
+};
+
+struct BucketProbeResult {
+    BucketProbeStatus status{BucketProbeStatus::kWrongBucket};
+    std::string error_message;
+};
+
 /// Probe a single bucket on a ReplicasetPool master by calling
 /// vshard.storage.bucket_stat({bucket_id}).
-/// Returns true if the RS owns the bucket (no WRONG_BUCKET response).
-static bool ProbesBucket(ReplicasetPool& rs_pool, uint32_t bucket_id) {
+static BucketProbeResult ProbeBucket(ReplicasetPool& rs_pool, uint32_t bucket_id) {
     try {
         auto args_b = formats::msgpack::ValueBuilder::Array();
         args_b.PushBack(formats::msgpack::ValueBuilder{
@@ -165,11 +178,23 @@ static bool ProbesBucket(ReplicasetPool& rs_pool, uint32_t bucket_id) {
         const auto& data = raw.GetData();
         if (data.IsArray() && data.GetSize() >= 1 && !data[0].IsMissing() &&
             !data[0].IsNull()) {
-            return true;
+            return {BucketProbeStatus::kFound, {}};
         }
-        return false;
-    } catch (...) {
-        return false;
+        if (data.IsArray() && data.GetSize() >= 2 && !data[1].IsMissing() &&
+            !data[1].IsNull()) {
+            const auto err_code = data[1]["code"].As<uint32_t>(0);
+            if (err_code == 1) {
+                return {BucketProbeStatus::kWrongBucket, {}};
+            }
+            if (err_code == 32) {
+                return {BucketProbeStatus::kBackoff, {}};
+            }
+            const auto msg = data[1]["message"].As<std::string>("");
+            return {BucketProbeStatus::kOtherError, msg};
+        }
+        return {BucketProbeStatus::kWrongBucket, {}};
+    } catch (const storages::tarantool::TarantoolException& ex) {
+        return {BucketProbeStatus::kUnreachableReplicaset, ex.what()};
     }
 }
 
@@ -292,14 +317,33 @@ RoutingTable TopologyFetcher::RefreshFull() {
     return table;
 }
 
-uint16_t TopologyFetcher::DiscoverBucket(uint32_t bucket_id) {
+TopologyFetcher::BucketDiscoveryResult TopologyFetcher::DiscoverBucket(
+    uint32_t bucket_id) {
     const auto num_rs = static_cast<uint32_t>(pools_.size());
+    BucketDiscoveryResult result;
     for (uint32_t i = 0; i < num_rs; ++i) {
-        if (ProbesBucket(*pools_[i], bucket_id)) {
-            return static_cast<uint16_t>(i + 1);
+        const auto probe = ProbeBucket(*pools_[i], bucket_id);
+        switch (probe.status) {
+            case BucketProbeStatus::kFound:
+                result.rs_idx = static_cast<uint16_t>(i + 1);
+                return result;
+            case BucketProbeStatus::kWrongBucket:
+            case BucketProbeStatus::kBackoff:
+                break;
+            case BucketProbeStatus::kUnreachableReplicaset:
+                result.unreachable_replicaset_id = pools_[i]->GetUuid();
+                if (result.error_message.empty()) {
+                    result.error_message = probe.error_message;
+                }
+                break;
+            case BucketProbeStatus::kOtherError:
+                if (result.error_message.empty()) {
+                    result.error_message = probe.error_message;
+                }
+                break;
         }
     }
-    return 0;
+    return result;
 }
 
 }  // namespace storages::tarantool::vshard::impl

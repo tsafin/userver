@@ -1,9 +1,11 @@
 #include <vshard/impl/vshard_proxy.hpp>
 
 #include <chrono>
+#include <cctype>
 #include <cstdint>
 
 #include <userver/engine/deadline.hpp>
+#include <userver/engine/io/exception.hpp>
 #include <userver/engine/sleep.hpp>
 #include <userver/formats/msgpack/value_builder.hpp>
 #include <userver/logging/log.hpp>
@@ -73,6 +75,81 @@ std::vector<uint8_t> BuildStorageCallErrorReturn(std::string_view message) {
     PushUint(buf, 1005);
 
     return buf;
+}
+
+bool IsConnectivityErrorMessage(std::string_view message) {
+    return message.find("Error while establishing connection") !=
+               std::string_view::npos ||
+           message.find("connection is broken") != std::string_view::npos ||
+           message.find("Failed to connect to ") != std::string_view::npos;
+}
+
+std::string NormalizeNetboxClientErrorMessage(std::string_view message) {
+    const auto detail_pos = message.find("Error while establishing connection");
+    if (detail_pos != std::string_view::npos) {
+        message = message.substr(0, detail_pos);
+    }
+    constexpr std::string_view kSocketPrefix = "Socket: ";
+    if (message.substr(0, kSocketPrefix.size()) == kSocketPrefix) {
+        message.remove_prefix(kSocketPrefix.size());
+    }
+    while (!message.empty() && std::isspace(message.back())) {
+        message.remove_suffix(1);
+    }
+    if (!message.empty()) {
+        return std::string{message};
+    }
+    return "Connection refused";
+}
+
+std::vector<uint8_t> BuildNetboxClientErrorReturn(std::string_view message) {
+    static constexpr uint32_t kNoConnectionCode = 77;
+    static constexpr std::string_view kErrorType = "ClientError";
+    static constexpr std::string_view kTraceFile = "builtin/box/net_box.lua";
+    static constexpr uint32_t kTraceLine = 540;
+
+    std::vector<uint8_t> buf;
+    const auto normalized = NormalizeNetboxClientErrorMessage(message);
+    buf.reserve(128 + normalized.size());
+
+    buf.push_back(static_cast<uint8_t>(mp::kFixArrayMin | 2));
+    buf.push_back(mp::kNil);
+
+    buf.push_back(static_cast<uint8_t>(mp::kFixMapMin | 5));
+    PushString(buf, "code");
+    PushUint(buf, kNoConnectionCode);
+    PushString(buf, "base_type");
+    PushString(buf, kErrorType);
+    PushString(buf, "type");
+    PushString(buf, kErrorType);
+    PushString(buf, "message");
+    PushString(buf, normalized);
+    PushString(buf, "trace");
+    buf.push_back(static_cast<uint8_t>(mp::kFixArrayMin | 1));
+    buf.push_back(static_cast<uint8_t>(mp::kFixMapMin | 2));
+    PushString(buf, "file");
+    PushString(buf, kTraceFile);
+    PushString(buf, "line");
+    PushUint(buf, kTraceLine);
+
+    return buf;
+}
+
+[[noreturn]] void RethrowDirectCallNetworkError(
+    const impl::ReplicasetPool& rs, BucketId bucket_id,
+    const std::exception& ex) {
+    LOG_WARNING() << "vshard direct call network error (bucket=" << bucket_id
+                  << ", replicaset=" << rs.GetUuid() << "): " << ex.what();
+    throw UnreachableReplicasetError{rs.GetUuid(), bucket_id};
+}
+
+void HandleDirectCallException(
+    const impl::ReplicasetPool& rs, BucketId bucket_id,
+    const std::exception& ex) {
+    if (IsConnectivityErrorMessage(ex.what())) {
+        RethrowDirectCallNetworkError(rs, bucket_id, ex);
+    }
+    throw;
 }
 
 }  // namespace
@@ -351,15 +428,22 @@ impl::ReplicasetPool* VshardProxy::ResolveReplicaset(
     LOG_INFO() << "vshard bucket " << bucket_id
                << " has no route, running on-demand discovery";
 
-    const auto rs_idx = fetcher_->DiscoverBucket(bucket_id);
-    if (rs_idx == 0) return nullptr;
+    const auto discovery = fetcher_->DiscoverBucket(bucket_id);
+    if (discovery.HasOwner()) {
+        routing_table_.PatchBucketOwnerByIndex(bucket_id, discovery.rs_idx);
 
-    // Update the routing table using RCU write
-    routing_table_.PatchBucketOwnerByIndex(bucket_id, rs_idx);
-
-    // Re-read the snapshot so the caller sees the updated table
-    snapshot = routing_table_.Read();
-    return snapshot->FindReplicaset(bucket_id);
+        // Re-read the snapshot so the caller sees the updated table
+        snapshot = routing_table_.Read();
+        return snapshot->FindReplicaset(bucket_id);
+    }
+    if (discovery.HasUnreachableReplicaset()) {
+        throw UnreachableReplicasetError{
+            discovery.unreachable_replicaset_id, bucket_id};
+    }
+    if (discovery.HasOtherError()) {
+        throw VshardException{discovery.error_message};
+    }
+    throw NoRouteToBucketError{bucket_id};
 }
 
 // ---------------------------------------------------------------------------
@@ -412,11 +496,12 @@ formats::msgpack::Value VshardProxy::DoCallWithQuery(
         storages::tarantool::ExecutionResult raw;
         try {
             raw = rs->Execute(mode, query, cc);
+        } catch (const engine::io::IoException& ex) {
+            RethrowDirectCallNetworkError(*rs, bucket_id, ex);
         } catch (const storages::tarantool::TarantoolException& ex) {
-            LOG_WARNING() << "vshard.storage.call network error (bucket="
-                          << bucket_id << " attempt=" << attempt
-                          << "): " << ex.what();
-            throw;
+            HandleDirectCallException(*rs, bucket_id, ex);
+        } catch (const std::exception& ex) {
+            HandleDirectCallException(*rs, bucket_id, ex);
         }
 
         // Decode vshard envelope
@@ -470,10 +555,17 @@ std::vector<uint8_t> VshardProxy::DoCallRawBytes(
             raw = rs->Execute(mode, query, cc);
         } catch (const storages::tarantool::CommandException& ex) {
             return BuildStorageCallErrorReturn(ex.what());
+        } catch (const engine::io::IoException& ex) {
+            return BuildNetboxClientErrorReturn(ex.what());
         } catch (const storages::tarantool::TarantoolException& ex) {
-            LOG_WARNING() << "vshard.storage.call network error (bucket="
-                          << bucket_id << " attempt=" << attempt
-                          << "): " << ex.what();
+            if (IsConnectivityErrorMessage(ex.what())) {
+                return BuildNetboxClientErrorReturn(ex.what());
+            }
+            throw;
+        } catch (const std::exception& ex) {
+            if (IsConnectivityErrorMessage(ex.what())) {
+                return BuildNetboxClientErrorReturn(ex.what());
+            }
             throw;
         }
 
@@ -532,11 +624,12 @@ formats::msgpack::Value VshardProxy::ForwardCall(
         storages::tarantool::ExecutionResult raw;
         try {
             raw = rs->ForwardStorageCall(mode, *route, cc);
+        } catch (const engine::io::IoException& ex) {
+            RethrowDirectCallNetworkError(*rs, bucket_id, ex);
         } catch (const storages::tarantool::TarantoolException& ex) {
-            LOG_WARNING() << "vshard.storage.call forward error (bucket="
-                          << bucket_id << " attempt=" << attempt
-                          << "): " << ex.what();
-            throw;
+            HandleDirectCallException(*rs, bucket_id, ex);
+        } catch (const std::exception& ex) {
+            HandleDirectCallException(*rs, bucket_id, ex);
         }
 
         impl::VshardEnvelope env;
@@ -598,11 +691,12 @@ formats::msgpack::Value VshardProxy::ForwardVshardCall(
         storages::tarantool::ExecutionResult raw;
         try {
             raw = rs->ForwardVshardCall(*info, body, body_len, cc);
+        } catch (const engine::io::IoException& ex) {
+            RethrowDirectCallNetworkError(*rs, bucket_id, ex);
         } catch (const storages::tarantool::TarantoolException& ex) {
-            LOG_WARNING() << "IPROTO_VSHARD_CALL forward error (bucket="
-                          << bucket_id << " attempt=" << attempt
-                          << "): " << ex.what();
-            throw;
+            HandleDirectCallException(*rs, bucket_id, ex);
+        } catch (const std::exception& ex) {
+            HandleDirectCallException(*rs, bucket_id, ex);
         }
 
         impl::VshardEnvelope env;
