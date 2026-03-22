@@ -107,7 +107,8 @@ high concurrency, making both routers "equally free."
 Start a 4-node vshard cluster (see `configs/` for static config and secdist) then run:
 
 ```bash
-# Using the CMake benchmark target (recommended):
+# Using the CMake benchmark target (recommended — auto-starts cluster if needed):
+cmake -DVSHARD_PATH=/path/to/vshard -B build_release
 cmake --build build_release --target benchmark-vshard
 
 # Manually — Lua router baseline:
@@ -117,16 +118,22 @@ tarantool bench/bench_vshard.lua localhost:3305 20 100000
 tarantool bench/bench_vshard.lua localhost:3306 20 100000
 ```
 
-### Round 5 — 2026-03-22 (ops=100000, git=9d96e8c85)
+### Round 6 — 2026-03-22 (ops=100000, git=083fb278c)
 
-C++ proxy now fully operational end-to-end (rebuilt release binary). Results match
-expected format: 10–18% faster than Lua router at low-to-medium concurrency.
+Extended scalability sweep: Lua router and C++ proxy saturate at ~33–36k op/s
+(storage RTT dominates); C++ in-process library keeps scaling linearly to 153k op/s.
 
-| Fibers | Lua router (ops/sec) | C++ proxy (ops/sec) | vs Lua |
-|-------:|---------------------:|--------------------:|-------:|
-| 10 | 8,679 | 10,201 | **+18%** |
-| 20 | 14,056 | 16,454 | **+17%** |
-| 50 | 24,609 | 27,176 | **+10%** |
+| Fibers | Lua router (ops/sec) | C++ proxy (ops/sec) | vs Lua | C++ in-process RW (ops/sec) |
+|-------:|---------------------:|--------------------:|-------:|----------------------------:|
+| 10 | 8,680 | 10,150 | **+17%** | 22,410 |
+| 20 | 13,879 | 16,744 | **+21%** | 39,816 |
+| 50 | 24,771 | 27,187 | **+10%** | 80,094 |
+| 100 | 31,283 | 34,654 | **+11%** | 123,174 |
+| 150 | 33,232 | 36,125 | **+9%** | 153,113 |
 
-Fibers: 10,20,50 | Total ops per run: 100000 | Build: userver-tarantool-vshard-sample
+The C++ proxy adds **~9–21% throughput** over the Lua router across all concurrency levels.
+The in-process library (no extra loopback hop) scales **~3–4.6× vs Lua router** at high concurrency,
+demonstrating that the storage nodes — not the router — are the throughput bottleneck above 50 fibers.
+
+Fibers: 10,20,50,100,150 | Total ops per run: 100000 | Build: userver-tarantool-vshard-sample
 
