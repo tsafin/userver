@@ -7,6 +7,8 @@ and compares results (lock-step differential testing).
 import pytest
 import tarantool
 
+import conftest as test_conftest
+
 
 def _strip_trace_locations(value):
     if isinstance(value, dict):
@@ -566,35 +568,21 @@ class TestMapCallRW:
 class TestRouteAll:
     """vshard.router.routeall — list all replicasets."""
 
-    def test_routeall_returns_both_rs(self, lua_conn, cpp_conn, bucket_count):
-        """routeall should return data for all replicasets.
-
-        Note: the Lua router's routeall() returns internal replicaset objects
-        that contain Lua function references, which cannot be serialized over
-        IPROTO.  We therefore only validate the C++ proxy result; if the Lua
-        call happens to succeed (future Tarantool / vshard version) we also
-        cross-check the UUID count.
-        """
-        import tarantool
-
+    def test_routeall_matches_lua_serializable_subset(self, lua_conn, cpp_conn):
         cpp_result = cpp_conn.call('vshard.router.routeall', [])
-        assert cpp_result.data is not None, "C++ routeall returned no data"
+        assert cpp_result.data is not None
 
-        # C++ returns [{uuid: {uuid: uuid}, ...}]
         rs_map = cpp_result.data[0]
-        assert isinstance(rs_map, dict), \
-            f"Expected dict from C++ routeall, got {type(rs_map)}"
-        assert len(rs_map) == 2, \
-            f"Expected 2 replicasets, got {len(rs_map)}: {list(rs_map.keys())}"
+        assert isinstance(rs_map, dict)
+        assert set(rs_map.keys()) == {
+            test_conftest.RS1_UUID,
+            test_conftest.RS2_UUID,
+        }
 
-        # Lua vshard.router.routeall() returns objects with function fields,
-        # which Tarantool cannot serialize over IPROTO ("unsupported Lua type
-        # 'function'").  Treat this as a known limitation and skip comparison.
         try:
             lua_result = lua_conn.call('vshard.router.routeall', [])
-            if lua_result.data is not None:
-                lua_rs_map = lua_result.data[0]
-                assert len(lua_rs_map) == len(rs_map), \
-                    f"RS count mismatch: lua={len(lua_rs_map)} cpp={len(rs_map)}"
-        except tarantool.error.DatabaseError:
-            pass  # expected: Lua replicaset objects are not IPROTO-serializable
+        except tarantool.error.DatabaseError as exc:
+            assert "unsupported Lua type 'function'" in str(exc)
+            return
+
+        assert cpp_result.data == lua_result.data

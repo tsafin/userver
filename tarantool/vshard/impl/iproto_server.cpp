@@ -666,31 +666,6 @@ static std::vector<uint8_t> BuildUint32ResultFrame(uint64_t sync, uint32_t val) 
     return tnt::BuildIprotoOkFrame(sync, kSchemaVersion, body.data(), body.size());
 }
 
-/// Build DATA response carrying a msgpack map {uuid: {uuid: uuid}} per RS.
-/// Used for vshard.router.routeall — the caller iterates the replicasets
-/// vector from the routing table snapshot.
-static std::vector<uint8_t> BuildRouteAllResultFrame(
-    uint64_t sync, const std::vector<std::string>& uuids) {
-    std::vector<uint8_t> inner;
-    inner.reserve(uuids.size() * 50);
-    PushMapHeader(inner, uuids.size());
-    for (const auto& uuid : uuids) {
-        tnt::EncodeStr(inner, uuid);
-        // Encode minimal replicaset descriptor: {uuid: uuid}
-        tnt::EncodeFixMap(inner, 1);
-        tnt::EncodeStr(inner, "uuid");
-        tnt::EncodeStr(inner, uuid);
-    }
-    // Wrap as DATA: [inner_map]
-    std::vector<uint8_t> body;
-    body.reserve(3 + inner.size());
-    tnt::EncodeFixMap(body, 1);
-    body.push_back(static_cast<uint8_t>(Iproto::DATA));
-    tnt::EncodeArray(body, 1);
-    body.insert(body.end(), inner.begin(), inner.end());
-    return tnt::BuildIprotoOkFrame(sync, kSchemaVersion, body.data(), body.size());
-}
-
 static std::vector<uint8_t> BuildRouteResultFrame(
     uint64_t sync, std::string_view uuid) {
     std::vector<uint8_t> inner;
@@ -1103,9 +1078,8 @@ static void HandleConnection(engine::io::Socket sock,
                     continue;
 
                 } else if (body->func_name == "vshard.router.routeall") {
-                    // [] → {uuid: {uuid: uuid}, ...} for all known replicasets
-                    const auto uuids = proxy.GetReplicasetUUIDs();
-                    const auto resp = BuildRouteAllResultFrame(req.sync, uuids);
+                    const auto routeall = proxy.GetRouteAll();
+                    const auto resp = BuildResultFrame(req.sync, routeall);
                     (void)sock.SendAll(resp.data(), resp.size(), engine::Deadline{});
                     continue;
 

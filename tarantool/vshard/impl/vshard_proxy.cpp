@@ -1493,14 +1493,66 @@ std::string VshardProxy::Route(BucketId bucket_id) {
     throw NoRouteToBucketError{bucket_id};
 }
 
-std::vector<std::string> VshardProxy::GetReplicasetUUIDs() const {
+formats::msgpack::Value VshardProxy::GetRouteAll() const {
     auto snapshot = routing_table_.Read();
-    std::vector<std::string> uuids;
-    uuids.reserve(snapshot->replicasets.size());
+    auto replicasets = formats::msgpack::ValueBuilder::Object();
+
     for (const auto& rs : snapshot->replicasets) {
-        uuids.push_back(rs->GetUuid());
+        if (!rs) continue;
+
+        auto rs_info = formats::msgpack::ValueBuilder::Object();
+        rs_info["uuid"] = formats::msgpack::ValueBuilder{rs->GetUuid()};
+
+        auto master = formats::msgpack::ValueBuilder::Object();
+        const auto& master_meta = rs->GetMasterMeta();
+        if (!master_meta.host.empty()) {
+            master["uri"] = formats::msgpack::ValueBuilder{
+                "storage@" + master_meta.host + ":" +
+                std::to_string(master_meta.port)};
+            master["network_timeout"] = formats::msgpack::ValueBuilder{0.5};
+        }
+        if (!master_meta.uuid.empty()) {
+            master["uuid"] = formats::msgpack::ValueBuilder{master_meta.uuid};
+        }
+        master["status"] = formats::msgpack::ValueBuilder{
+            rs->IsMasterAvailable() ? "available" : "unreachable"};
+        rs_info["master"] = std::move(master);
+
+        auto replica = formats::msgpack::ValueBuilder::Object();
+        if (rs->IsMasterAvailable()) {
+            replica["uri"] = formats::msgpack::ValueBuilder{
+                "storage@" + master_meta.host + ":" +
+                std::to_string(master_meta.port)};
+            replica["network_timeout"] = formats::msgpack::ValueBuilder{0.5};
+            if (!master_meta.uuid.empty()) {
+                replica["uuid"] = formats::msgpack::ValueBuilder{
+                    master_meta.uuid};
+            }
+            replica["status"] = formats::msgpack::ValueBuilder{"available"};
+        } else if (rs->HasReplica() && rs->IsReplicaAvailable()) {
+            const auto* replica_meta = rs->GetReplicaMeta();
+            if (replica_meta) {
+                replica["uri"] = formats::msgpack::ValueBuilder{
+                    "storage@" + replica_meta->host + ":" +
+                    std::to_string(replica_meta->port)};
+                replica["network_timeout"] = formats::msgpack::ValueBuilder{0.5};
+                if (!replica_meta->uuid.empty()) {
+                    replica["uuid"] = formats::msgpack::ValueBuilder{
+                        replica_meta->uuid};
+                }
+            }
+            replica["status"] = formats::msgpack::ValueBuilder{"available"};
+        } else {
+            replica["status"] = formats::msgpack::ValueBuilder{
+                rs->HasReplica() ? "unreachable" : "missing"};
+        }
+        rs_info["replica"] = std::move(replica);
+
+        replicasets[rs->GetUuid()] = std::move(rs_info);
     }
-    return uuids;
+
+    const auto bytes = replicasets.ToBytes();
+    return formats::msgpack::Value::FromBytes(bytes.data(), bytes.size());
 }
 
 void VshardProxy::RefreshTopology() {

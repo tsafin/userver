@@ -217,9 +217,8 @@ class VshardProxy final {
     /// Resolve a bucket to its current replicaset UUID.
     std::string Route(BucketId bucket_id);
 
-    /// Return the UUIDs of all known replicasets from the current routing table.
-    /// Used by vshard.router.routeall handler.
-    std::vector<std::string> GetReplicasetUUIDs() const;
+    /// Return the current routeall payload shaped like Lua router.replicasets.
+    formats::msgpack::Value GetRouteAll() const;
 
     /// Force an immediate full topology refresh (e.g. after deployment).
     void RefreshTopology();
