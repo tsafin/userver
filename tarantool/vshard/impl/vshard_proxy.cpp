@@ -1260,12 +1260,6 @@ formats::msgpack::Value VshardProxy::GetInfo(bool with_services) {
 
     auto snapshot = routing_table_.Read();
 
-    std::unordered_map<std::string, const impl::ReplicasetConfig*> config_by_uuid;
-    config_by_uuid.reserve(settings_.topology.replicasets.size());
-    for (const auto& rs_cfg : settings_.topology.replicasets) {
-        config_by_uuid.emplace(rs_cfg.uuid, &rs_cfg);
-    }
-
     formats::msgpack::ValueBuilder state = formats::msgpack::ValueBuilder::Object();
     auto replicasets = formats::msgpack::ValueBuilder::Object();
     auto bucket = formats::msgpack::ValueBuilder::Object();
@@ -1279,10 +1273,6 @@ formats::msgpack::Value VshardProxy::GetInfo(bool with_services) {
 
     for (const auto& rs : snapshot->replicasets) {
         if (!rs) continue;
-
-        const auto cfg_it = config_by_uuid.find(rs->GetUuid());
-        const impl::ReplicasetConfig* rs_cfg =
-            (cfg_it == config_by_uuid.end()) ? nullptr : cfg_it->second;
 
         const auto bucket_count = [&] {
             uint32_t count = 0;
@@ -1299,43 +1289,40 @@ formats::msgpack::Value VshardProxy::GetInfo(bool with_services) {
         rs_info["uuid"] = formats::msgpack::ValueBuilder{rs->GetUuid()};
         rs_info["bucket"] = formats::msgpack::ValueBuilder::Object();
 
-        const impl::ReplicasetConfig::NodeConfig* master_cfg = nullptr;
-        const impl::ReplicasetConfig::NodeConfig* replica_cfg = nullptr;
-        if (rs_cfg) {
-            for (const auto& node : rs_cfg->nodes) {
-                if (node.is_master && !master_cfg) {
-                    master_cfg = &node;
-                } else if (!node.is_master && !replica_cfg) {
-                    replica_cfg = &node;
-                }
-            }
-            if (!master_cfg && !rs_cfg->nodes.empty()) {
-                master_cfg = &rs_cfg->nodes.front();
-            }
-        }
-
         auto master = formats::msgpack::ValueBuilder::Object();
-        if (master_cfg) {
+        const auto& master_meta = rs->GetMasterMeta();
+        if (!master_meta.host.empty()) {
             master["uri"] = formats::msgpack::ValueBuilder{
-                "storage@" + master_cfg->host + ":" +
-                std::to_string(master_cfg->port)};
+                "storage@" + master_meta.host + ":" +
+                std::to_string(master_meta.port)};
             master["network_timeout"] = formats::msgpack::ValueBuilder{0.5};
+        }
+        if (!master_meta.uuid.empty()) {
+            master["uuid"] = formats::msgpack::ValueBuilder{master_meta.uuid};
         }
         master["status"] = formats::msgpack::ValueBuilder{
             rs->IsMasterAvailable() ? "available" : "unreachable"};
         rs_info["master"] = std::move(master);
 
         auto replica = formats::msgpack::ValueBuilder::Object();
-        if (replica_cfg) {
+        if (rs->HasReplica() && rs->IsReplicaAvailable()) {
+            const auto* replica_meta = rs->GetReplicaMeta();
+            if (replica_meta) {
+                replica["uri"] = formats::msgpack::ValueBuilder{
+                    "storage@" + replica_meta->host + ":" +
+                    std::to_string(replica_meta->port)};
+                replica["network_timeout"] = formats::msgpack::ValueBuilder{0.5};
+            }
+            replica["status"] = formats::msgpack::ValueBuilder{"available"};
+        } else if (rs->IsMasterAvailable()) {
             replica["uri"] = formats::msgpack::ValueBuilder{
-                "storage@" + replica_cfg->host + ":" +
-                std::to_string(replica_cfg->port)};
+                "storage@" + master_meta.host + ":" +
+                std::to_string(master_meta.port)};
             replica["network_timeout"] = formats::msgpack::ValueBuilder{0.5};
-            replica["status"] = formats::msgpack::ValueBuilder{
-                rs->IsReplicaAvailable() ? "available" : "unreachable"};
+            replica["status"] = formats::msgpack::ValueBuilder{"available"};
         } else {
             replica["status"] = formats::msgpack::ValueBuilder{
-                rs->IsMasterAvailable() ? "available" : "missing"};
+                rs->HasReplica() ? "unreachable" : "missing"};
         }
         rs_info["replica"] = std::move(replica);
 

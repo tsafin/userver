@@ -42,11 +42,22 @@ std::string_view ToString(CallMode) noexcept;
 /// - `kBestReadOnly` → round-robin `replicas_`; fall back to master silently
 class ReplicasetPool final {
  public:
-    explicit ReplicasetPool(std::string uuid,
-                            std::shared_ptr<storages::tarantool::impl::Pool> master);
+    struct InstanceMeta {
+        std::string host;
+        uint16_t port{0};
+        std::string uuid;
+        std::string name;
+    };
+
+    explicit ReplicasetPool(
+        std::string uuid, std::string name,
+        std::shared_ptr<storages::tarantool::impl::Pool> master,
+        InstanceMeta master_meta);
 
     /// Add a replica pool. Call before first request.
-    void AddReplica(std::shared_ptr<storages::tarantool::impl::Pool> replica);
+    void AddReplica(
+        std::shared_ptr<storages::tarantool::impl::Pool> replica,
+        InstanceMeta meta);
 
     /// Execute a query on the appropriate pool based on call mode.
     storages::tarantool::ExecutionResult Execute(
@@ -80,6 +91,11 @@ class ReplicasetPool final {
     bool HasReplica() const;
     bool IsReplicaAvailable() const;
     const std::string& GetUuid() const noexcept { return uuid_; }
+    const std::string& GetName() const noexcept { return name_; }
+    const InstanceMeta& GetMasterMeta() const noexcept { return master_meta_; }
+    const InstanceMeta* GetReplicaMeta() const noexcept {
+        return replica_metas_.empty() ? nullptr : &replica_metas_.front();
+    }
 
     void WriteStatistics(utils::statistics::Writer& writer) const;
 
@@ -87,8 +103,11 @@ class ReplicasetPool final {
     storages::tarantool::impl::Pool& SelectReplica() const;
 
     std::string uuid_;
+    std::string name_;
     std::shared_ptr<storages::tarantool::impl::Pool> master_;
     std::vector<std::shared_ptr<storages::tarantool::impl::Pool>> replicas_;
+    InstanceMeta master_meta_;
+    std::vector<InstanceMeta> replica_metas_;
     mutable std::atomic<std::size_t> replica_idx_{0};
 };
 

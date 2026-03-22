@@ -430,8 +430,17 @@ class TestInfo:
                 lua_info['replicasets'][rs_uuid]['bucket']
             assert cpp_info['replicasets'][rs_uuid]['master']['status'] == \
                 lua_info['replicasets'][rs_uuid]['master']['status']
+            assert cpp_info['replicasets'][rs_uuid]['master']['uuid'] == \
+                lua_info['replicasets'][rs_uuid]['master']['uuid']
+            assert cpp_info['replicasets'][rs_uuid]['master'].get('name') == \
+                lua_info['replicasets'][rs_uuid]['master'].get('name')
             assert cpp_info['replicasets'][rs_uuid]['replica']['status'] == \
                 lua_info['replicasets'][rs_uuid]['replica']['status']
+            if 'uuid' in cpp_info['replicasets'][rs_uuid]['replica']:
+                assert cpp_info['replicasets'][rs_uuid]['replica']['uuid'] == \
+                    lua_info['replicasets'][rs_uuid]['replica']['uuid']
+                assert cpp_info['replicasets'][rs_uuid]['replica'].get('name') == \
+                    lua_info['replicasets'][rs_uuid]['replica'].get('name')
 
     def test_info_with_services_matches_lua_on_stable_fields(self, lua_conn, cpp_conn):
         args = [{'with_services': True}]

@@ -29,11 +29,14 @@ VshardTopologyConfig VshardTopologyConfig::Parse(
     for (const auto& rs_json : json["replicasets"]) {
         ReplicasetConfig rs;
         rs.uuid = rs_json["uuid"].As<std::string>();
+        rs.name = rs_json["name"].As<std::string>("");
         for (const auto& node_json : rs_json["nodes"]) {
             ReplicasetConfig::NodeConfig node;
             node.host = node_json["host"].As<std::string>("127.0.0.1");
             node.port = node_json["port"].As<uint16_t>(3301);
             node.is_master = node_json["is_master"].As<bool>(false);
+            node.uuid = node_json["uuid"].As<std::string>("");
+            node.name = node_json["name"].As<std::string>("");
             rs.nodes.push_back(std::move(node));
         }
         cfg.replicasets.push_back(std::move(rs));
@@ -66,6 +69,8 @@ void TopologyFetcher::BuildPools() {
     for (const auto& rs_cfg : config_.replicasets) {
         std::shared_ptr<storages::tarantool::impl::Pool> master_pool;
         std::vector<std::shared_ptr<storages::tarantool::impl::Pool>> replica_pools;
+        ReplicasetPool::InstanceMeta master_meta;
+        std::vector<ReplicasetPool::InstanceMeta> replica_metas;
 
         for (const auto& node : rs_cfg.nodes) {
             storages::tarantool::impl::EndpointSettings ep;
@@ -81,10 +86,18 @@ void TopologyFetcher::BuildPools() {
             auto pool = std::make_shared<storages::tarantool::impl::Pool>(
                 resolver_, std::move(ps));
 
+            ReplicasetPool::InstanceMeta meta;
+            meta.host = node.host;
+            meta.port = node.port;
+            meta.uuid = node.uuid;
+            meta.name = node.name;
+
             if (node.is_master) {
                 master_pool = std::move(pool);
+                master_meta = std::move(meta);
             } else {
                 replica_pools.push_back(std::move(pool));
+                replica_metas.push_back(std::move(meta));
             }
         }
 
@@ -107,10 +120,12 @@ void TopologyFetcher::BuildPools() {
                 resolver_, std::move(ps));
         }
 
-        auto rs_pool = std::make_shared<ReplicasetPool>(rs_cfg.uuid,
-                                                         std::move(master_pool));
-        for (auto& r : replica_pools) {
-            rs_pool->AddReplica(std::move(r));
+        auto rs_pool = std::make_shared<ReplicasetPool>(
+            rs_cfg.uuid, rs_cfg.name, std::move(master_pool),
+            std::move(master_meta));
+        for (std::size_t i = 0; i < replica_pools.size(); ++i) {
+            rs_pool->AddReplica(
+                std::move(replica_pools[i]), std::move(replica_metas[i]));
         }
         pools_.push_back(std::move(rs_pool));
     }

@@ -20,13 +20,19 @@ std::string_view ToString(CallMode mode) noexcept {
 }
 
 ReplicasetPool::ReplicasetPool(
-    std::string uuid,
-    std::shared_ptr<storages::tarantool::impl::Pool> master)
-    : uuid_{std::move(uuid)}, master_{std::move(master)} {}
+    std::string uuid, std::string name,
+    std::shared_ptr<storages::tarantool::impl::Pool> master,
+    InstanceMeta master_meta)
+    : uuid_{std::move(uuid)},
+      name_{std::move(name)},
+      master_{std::move(master)},
+      master_meta_{std::move(master_meta)} {}
 
 void ReplicasetPool::AddReplica(
-    std::shared_ptr<storages::tarantool::impl::Pool> replica) {
+    std::shared_ptr<storages::tarantool::impl::Pool> replica,
+    InstanceMeta meta) {
     replicas_.push_back(std::move(replica));
+    replica_metas_.push_back(std::move(meta));
 }
 
 storages::tarantool::impl::Pool& ReplicasetPool::SelectReplica() const {

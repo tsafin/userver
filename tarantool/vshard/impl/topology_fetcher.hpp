@@ -21,10 +21,13 @@ namespace storages::tarantool::vshard::impl {
 /// Config for a single replicaset within the vshard cluster.
 struct ReplicasetConfig {
     std::string uuid;        ///< Replicaset UUID (or human-readable name on Tnt 3)
+    std::string name;
     struct NodeConfig {
         std::string host;
         uint16_t port{3301};
         bool is_master{false};
+        std::string uuid;
+        std::string name;
     };
     std::vector<NodeConfig> nodes;
 };
