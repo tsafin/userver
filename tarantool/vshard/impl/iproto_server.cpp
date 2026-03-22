@@ -303,7 +303,9 @@ struct VshardRouterArgs {
     CallMode         mode{CallMode::kReadWrite};  ///< resolved call mode
     bool             prefer_replica{false};
     bool             balance{false};
-    double           timeout{0.0};   ///< per-call timeout in seconds (0 = use default)
+    double           timeout{0.0};   ///< total timeout in seconds (0 = use default)
+    double           request_timeout{0.0};  ///< per-attempt timeout in seconds
+    bool             opts_valid{true};
 };
 
 /// Read the msgpack array header, return element count and advance pos.
@@ -365,6 +367,15 @@ static bool IsMsgpackMap(const uint8_t* p, std::size_t len,
     return (b & 0xf0u) == mp::kFixMapMin || b == mp::kMap16 || b == mp::kMap32;
 }
 
+static bool IsMsgpackNumber(const uint8_t* p, std::size_t len,
+                            std::size_t pos) noexcept {
+    if (pos >= len) return false;
+    const uint8_t b = p[pos];
+    return b <= 0x7f || b == mp::kUint8 || b == mp::kUint16 ||
+           b == mp::kUint32 || b == mp::kUint64 || b == mp::kFloat32 ||
+           b == mp::kFloat64;
+}
+
 /// Read a msgpack float64 (0xcb) or float32 (0xca) or positive integer as double.
 static double ReadNumericAsDouble(const uint8_t* p, std::size_t len,
                                    std::size_t& pos) noexcept {
@@ -393,27 +404,53 @@ static double ReadNumericAsDouble(const uint8_t* p, std::size_t len,
     return static_cast<double>(val);
 }
 
-/// Parse timeout from an opts map at the current position.
-/// Expects pos to point at a msgpack map. Extracts "timeout" key's double value.
-/// Returns 0.0 if no timeout found or not a map.
-static double ParseTimeoutFromOpts(const uint8_t* p, std::size_t len,
-                                    std::size_t& pos) noexcept {
+struct ParsedRouterOpts {
+    double timeout{0.0};
+    double request_timeout{0.0};
+    bool valid{true};
+};
+
+/// Parse call opts from a msgpack map at the current position.
+/// Expects pos to point at a msgpack map.
+/// Validates numeric timeout/request_timeout fields like Lua vshard does.
+static ParsedRouterOpts ParseCallOpts(const uint8_t* p, std::size_t len,
+                                      std::size_t& pos) noexcept {
     using namespace storages::tarantool::impl::msgpack_scan;
+    ParsedRouterOpts opts;
     if (!IsMsgpackMap(p, len, pos)) {
         pos = SkipValue(p, len, pos);
-        return 0.0;
+        opts.valid = false;
+        return opts;
     }
     const auto map_len = ReadMapHeader(p, len, pos);
-    double timeout = 0.0;
     for (std::size_t i = 0; i < map_len; ++i) {
         auto [key, kp] = ReadStr(p, len, pos); pos = kp;
         if (key == "timeout") {
-            timeout = ReadNumericAsDouble(p, len, pos);
+            if (!IsMsgpackNumber(p, len, pos)) {
+                pos = SkipValue(p, len, pos);
+                opts.valid = false;
+                continue;
+            }
+            opts.timeout = ReadNumericAsDouble(p, len, pos);
+        } else if (key == "request_timeout") {
+            if (!IsMsgpackNumber(p, len, pos)) {
+                pos = SkipValue(p, len, pos);
+                opts.valid = false;
+                continue;
+            }
+            opts.request_timeout = ReadNumericAsDouble(p, len, pos);
         } else {
             pos = SkipValue(p, len, pos);
         }
     }
-    return timeout;
+    return opts;
+}
+
+static std::optional<std::chrono::milliseconds> MillisecondsFromSeconds(
+    double seconds) noexcept {
+    if (seconds <= 0.0) return std::nullopt;
+    return std::chrono::milliseconds{
+        static_cast<int64_t>(seconds * 1000.0)};
 }
 
 /// Resolve CallMode from a mode string ("read" or "write").
@@ -465,7 +502,10 @@ ParseVshardRouterArgs(const uint8_t* p, std::size_t len) noexcept {
 
     // opts (optional 4th element): parse timeout
     if (alen >= 4 && pos < len) {
-        out.timeout = ParseTimeoutFromOpts(p, len, pos);
+        const auto opts = ParseCallOpts(p, len, pos);
+        out.timeout = opts.timeout;
+        out.request_timeout = opts.request_timeout;
+        out.opts_valid = opts.valid;
     }
 
     return out;
@@ -531,7 +571,10 @@ ParseVshardRouterCallArgs(const uint8_t* p, std::size_t len) noexcept {
 
     // 5. opts (optional) — parse timeout
     if (alen >= 5 && pos < len) {
-        out.timeout = ParseTimeoutFromOpts(p, len, pos);
+        const auto opts = ParseCallOpts(p, len, pos);
+        out.timeout = opts.timeout;
+        out.request_timeout = opts.request_timeout;
+        out.opts_valid = opts.valid;
     }
 
     // Resolve final CallMode from base mode + prefer_replica + balance flags
@@ -899,14 +942,30 @@ static void HandleConnection(engine::io::Socket sock,
                     (void)sock.SendAll(resp.data(), resp.size(), engine::Deadline{});
                     continue;
                 }
+                if (!vargs->opts_valid) {
+                    const auto resp = BuildErrorFrame(
+                        req.sync, is_generic_call
+                            ? "Usage: call(bucket_id, mode, func, args, opts)"
+                            : "Usage: call(bucket_id, func, args, opts)");
+                    (void)sock.SendAll(resp.data(), resp.size(), engine::Deadline{});
+                    continue;
+                }
+                const auto total_timeout =
+                    vargs->timeout > 0.0 ? vargs->timeout : 0.5;
+                if (vargs->request_timeout > 0.0 &&
+                    vargs->request_timeout > total_timeout) {
+                    const auto resp = BuildErrorFrame(
+                        req.sync, "request_timeout must be <= timeout");
+                    (void)sock.SendAll(resp.data(), resp.size(), engine::Deadline{});
+                    continue;
+                }
 
                 // Fully zero-copy: raw args in, raw result bytes out —
                 // no Value tree at any stage.
                 storages::tarantool::OptionalCommandControl cc;
-                if (vargs->timeout > 0.0) {
-                    cc = storages::tarantool::CommandControl{
-                        std::chrono::milliseconds{
-                            static_cast<int64_t>(vargs->timeout * 1000.0)}};
+                if (const auto timeout_ms =
+                        MillisecondsFromSeconds(vargs->timeout)) {
+                    cc = storages::tarantool::CommandControl{*timeout_ms};
                 }
                 const auto result_bytes = is_generic_call
                     ? proxy.CallRawBytesWithModeString(

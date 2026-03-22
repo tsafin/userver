@@ -6,6 +6,13 @@ and other error scenarios.
 import pytest
 
 
+def _call_outcome(conn, func_name, args):
+    try:
+        return ('data', conn.call(func_name, args).data)
+    except Exception as exc:
+        return ('exc', str(exc))
+
+
 class TestInvalidBucket:
     """Requests with out-of-range or invalid bucket IDs."""
 
@@ -87,3 +94,27 @@ class TestTimeout:
              [[bid, bid, 'timeout_test']], {'timeout': 5.0}],
         )
         assert result.data is not None
+
+    def test_request_timeout_must_not_exceed_timeout(self, lua_conn, cpp_conn):
+        """Lua-compatible validation: request_timeout must be <= timeout."""
+        args = [
+            10, 'write', 'echo', ['ok'],
+            {'timeout': 0.2, 'request_timeout': 0.3},
+        ]
+
+        with pytest.raises(Exception, match='request_timeout must be <= timeout'):
+            lua_conn.call('vshard.router.call', args)
+        with pytest.raises(Exception, match='request_timeout must be <= timeout'):
+            cpp_conn.call('vshard.router.call', args)
+
+    def test_request_timeout_is_per_attempt_not_total(self, lua_conn, cpp_conn):
+        """request_timeout behavior should match Lua on this Tarantool version."""
+        args = [
+            10, 'write', 'sleep', [0.2],
+            {'timeout': 1.0, 'request_timeout': 0.05},
+        ]
+
+        lua_outcome = _call_outcome(lua_conn, 'vshard.router.call', args)
+        cpp_outcome = _call_outcome(cpp_conn, 'vshard.router.call', args)
+
+        assert cpp_outcome == lua_outcome
