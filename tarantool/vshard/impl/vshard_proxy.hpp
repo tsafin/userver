@@ -168,6 +168,14 @@ class VshardProxy final {
 
     uint32_t GetBucketCount() const noexcept;
 
+    struct SyncResult {
+        bool ok{false};
+        bool timed_out{false};
+        std::optional<std::string> failed_replicaset_id;
+    };
+
+    SyncResult Sync(double timeout_seconds);
+
     /// Resolve a bucket to its current replicaset UUID.
     std::string Route(BucketId bucket_id);
 

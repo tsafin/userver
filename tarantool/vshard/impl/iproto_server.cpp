@@ -402,6 +402,11 @@ struct TupleKey {
     int64_t int_val{0};
 };
 
+struct OptionalTimeoutArg {
+    bool valid{false};
+    std::optional<double> timeout_seconds;
+};
+
 static std::optional<TupleKey> ReadTupleFirstKey(
     const uint8_t* p, std::size_t len) noexcept {
     using namespace storages::tarantool::impl::msgpack_scan;
@@ -442,6 +447,16 @@ static std::optional<TupleKey> ReadTupleFirstKey(
     auto [uval, np] = ReadUint(p, len, pos);
     (void)np;
     return TupleKey{false, {}, static_cast<int64_t>(uval)};
+}
+
+static OptionalTimeoutArg ParseOptionalTimeoutArg(
+    const uint8_t* p, std::size_t len) noexcept {
+    using namespace storages::tarantool::impl::msgpack_scan;
+    std::size_t pos = 0;
+    const auto alen = ReadArrayHeader(p, len, pos);
+    if (alen == 0) return {true, std::nullopt};
+    if (alen != 1 || !IsNumber(p, len, pos)) return {false, std::nullopt};
+    return {true, ReadNumberAsDouble(p, len, pos)};
 }
 
 /// Build DATA response carrying a single uint32 (used for bucket_id_mpcrc32).
@@ -549,6 +564,39 @@ static std::vector<uint8_t> BuildNetboxClientErrorReturn(
     tnt::EncodeStr(payload, "builtin/box/net_box.lua");
     tnt::EncodeStr(payload, "line");
     tnt::EncodeUint(payload, 540);
+    return payload;
+}
+
+static std::vector<uint8_t> BuildTimeoutClientErrorReturn(
+    std::optional<std::string_view> replicaset_id) {
+    static constexpr uint32_t kTimeoutCode = 78;
+
+    std::vector<uint8_t> payload;
+    payload.reserve(192);
+
+    tnt::EncodeArray(payload, 2);
+    payload.push_back(mp::kNil);
+    PushMapHeader(payload, replicaset_id ? 6 : 5);
+    tnt::EncodeStr(payload, "code");
+    tnt::EncodeUint(payload, kTimeoutCode);
+    tnt::EncodeStr(payload, "base_type");
+    tnt::EncodeStr(payload, "ClientError");
+    tnt::EncodeStr(payload, "type");
+    tnt::EncodeStr(payload, "ClientError");
+    tnt::EncodeStr(payload, "message");
+    tnt::EncodeStr(payload, "Timeout exceeded");
+    if (replicaset_id) {
+        tnt::EncodeStr(payload, "replicaset");
+        tnt::EncodeStr(payload, *replicaset_id);
+    }
+    tnt::EncodeStr(payload, "trace");
+    tnt::EncodeArray(payload, 1);
+    PushMapHeader(payload, 2);
+    tnt::EncodeStr(payload, "file");
+    tnt::EncodeStr(
+        payload, replicaset_id ? "builtin/box/net_box.lua" : "vshard/error.lua");
+    tnt::EncodeStr(payload, "line");
+    tnt::EncodeUint(payload, replicaset_id ? 422 : 322);
     return payload;
 }
 
@@ -819,6 +867,48 @@ static void HandleConnection(engine::io::Socket sock,
                     // [] → {uuid: {uuid: uuid}, ...} for all known replicasets
                     const auto uuids = proxy.GetReplicasetUUIDs();
                     const auto resp = BuildRouteAllResultFrame(req.sync, uuids);
+                    (void)sock.SendAll(resp.data(), resp.size(), engine::Deadline{});
+                    continue;
+
+                } else if (body->func_name == "vshard.router.sync") {
+                    const auto timeout_arg = ParseOptionalTimeoutArg(
+                        body->tuple_begin, body->tuple_len);
+                    if (!timeout_arg.valid) {
+                        const auto resp = tnt::BuildIprotoErrorFrame(
+                            req.sync, kSchemaVersion,
+                            "Usage: vshard.router.sync([timeout: number])");
+                        (void)sock.SendAll(resp.data(), resp.size(), engine::Deadline{});
+                        continue;
+                    }
+
+                    const double timeout =
+                        timeout_arg.timeout_seconds.value_or(1.0);
+                    if (timeout < 0.0) {
+                        const auto result_bytes =
+                            BuildTimeoutClientErrorReturn(std::nullopt);
+                        const auto resp = BuildResultFrameRaw(
+                            req.sync, result_bytes.data(), result_bytes.size());
+                        (void)sock.SendAll(resp.data(), resp.size(), engine::Deadline{});
+                        continue;
+                    }
+
+                    const auto sync_result = proxy.Sync(timeout);
+                    if (!sync_result.ok) {
+                        const auto result_bytes = BuildTimeoutClientErrorReturn(
+                            sync_result.failed_replicaset_id
+                                ? std::optional<std::string_view>{
+                                      *sync_result.failed_replicaset_id}
+                                : std::nullopt);
+                        const auto resp = BuildResultFrameRaw(
+                            req.sync, result_bytes.data(), result_bytes.size());
+                        (void)sock.SendAll(resp.data(), resp.size(), engine::Deadline{});
+                        continue;
+                    }
+
+                    const std::array<uint8_t, 2> result_bytes{
+                        static_cast<uint8_t>(mp::kFixArrayMin | 1), mp::kTrue};
+                    const auto resp = BuildResultFrameRaw(
+                        req.sync, result_bytes.data(), result_bytes.size());
                     (void)sock.SendAll(resp.data(), resp.size(), engine::Deadline{});
                     continue;
 

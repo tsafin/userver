@@ -10,7 +10,7 @@ status.
 ## Current Status
 
 - The current functional suite passes for the exercised subset:
-  - `49 passed`
+  - `55 passed`
 - That passing result does not imply full semantic equivalence with Lua vshard.
 - The C++ implementation is close for the tested `call*` hot path, but there
   are still observable API and behavior gaps outside that subset.
@@ -138,8 +138,11 @@ C++ IPROTO server currently exposes:
 - `vshard.router.callre`
 - `vshard.router.callbre`
 - `vshard.router.call`
+- `vshard.router.bucket_id_strcrc32`
 - `vshard.router.bucket_id_mpcrc32`
+- `vshard.router.route`
 - `vshard.router.routeall`
+- `vshard.router.sync`
 
 Reference:
 - [`tarantool/vshard/impl/iproto_server.cpp:823`](/home/tsafin/src/userver/tarantool/vshard/impl/iproto_server.cpp#L823)
@@ -154,21 +157,23 @@ Reference:
 Impact:
 - Full Lua router API equivalence is not yet present.
 
-## 6. `routeall` is not semantically equivalent
+## 6. `route` and `routeall` are not semantically equivalent
 
 Severity: Low
 
 Lua behavior:
-- Returns actual replicaset objects.
+- Return actual replicaset objects.
 
 Reference:
+- [`~/src/vshard/vshard/router/init.lua:1180`](/home/tsafin/src/vshard/vshard/router/init.lua#L1180)
 - [`~/src/vshard/vshard/router/init.lua:1191`](/home/tsafin/src/vshard/vshard/router/init.lua#L1191)
 
 C++ behavior:
+- `route()` returns a synthesized descriptor `{uuid: uuid}`.
 - Returns synthesized map entries of the form `{uuid: {uuid: uuid}}`.
 
 Reference:
-- [`tarantool/vshard/impl/iproto_server.cpp:638`](/home/tsafin/src/userver/tarantool/vshard/impl/iproto_server.cpp#L638)
+- [`tarantool/vshard/impl/iproto_server.cpp`](/home/tsafin/src/userver/tarantool/vshard/impl/iproto_server.cpp)
 
 Impact:
 - Acceptable over IPROTO for some clients, but not the same router API.
@@ -182,13 +187,19 @@ Current passing tests cover mainly:
 - `callbre`
 - `callre`
 - generic `call`
+- `bucket_id_strcrc32`
 - `bucket_id_mpcrc32`
+- `route`
 - synthetic `routeall`
+- `sync`
 - some happy-path differential comparison
 - strict missing-function parity
 - invalid generic-call mode parity
 - `request_timeout > timeout` validation parity
 - observed `request_timeout` runtime parity on Tarantool `2.6.0`
+- `sync()` success parity
+- `sync()` usage-error parity
+- `sync()` negative-timeout parity for key error fields
 
 References:
 - [`tarantool/vshard/functional_tests/tests/test_routing.py`](/home/tsafin/src/userver/tarantool/vshard/functional_tests/tests/test_routing.py)
@@ -205,12 +216,9 @@ The passing suite does not currently test:
 - forced `TRANSFER_IS_IN_PROGRESS`
 - forced `BUCKET_IS_LOCKED`
 - forced `NON_MASTER`
-- `bucket_id_strcrc32`
-- `route`
 - `map_callrw`
 - `bootstrap`
 - `info`
-- `sync`
 
 ## Recommended Next Tests
 
@@ -226,8 +234,6 @@ The passing suite does not currently test:
    - `is_async` if intended to be supported
 
 3. Add API-coverage tests for utility methods.
-   - `bucket_id_strcrc32`
-   - `route`
    - `map_callrw`
 
 4. Add rebalance/error-injection tests.
@@ -251,4 +257,4 @@ For full Lua vshard router equivalence, it is not finished yet.
 The biggest remaining semantic gaps are:
 - discovery error classification
 - partial opts support
-- missing public APIs
+- missing public APIs, especially `map_callrw`, `bootstrap`, and `info`

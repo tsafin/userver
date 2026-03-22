@@ -861,6 +861,49 @@ uint32_t VshardProxy::GetBucketCount() const noexcept {
     return calculator_.GetBucketCount();
 }
 
+VshardProxy::SyncResult VshardProxy::Sync(double timeout_seconds) {
+    auto snapshot = routing_table_.Read();
+    const auto& replicasets = snapshot->replicasets;
+
+    const auto total_timeout = std::chrono::duration_cast<
+        std::chrono::milliseconds>(std::chrono::duration<double>{timeout_seconds});
+    const auto deadline = engine::Deadline::FromDuration(total_timeout);
+
+    for (const auto& rs : replicasets) {
+        const auto remaining = deadline.TimeLeft();
+        const auto remaining_seconds =
+            std::chrono::duration<double>(remaining).count();
+        if (remaining_seconds < 0.0) {
+            return SyncResult{false, true, std::nullopt};
+        }
+
+        auto args = formats::msgpack::ValueBuilder::Array();
+        args.PushBack(formats::msgpack::ValueBuilder{remaining_seconds});
+        const auto query = storages::tarantool::Query::Call(
+            "vshard.storage.sync", std::move(args));
+
+        const auto timeout_ms = std::chrono::duration_cast<
+            std::chrono::milliseconds>(remaining);
+        storages::tarantool::OptionalCommandControl cc =
+            storages::tarantool::CommandControl{
+                timeout_ms >= std::chrono::milliseconds::zero()
+                    ? timeout_ms
+                    : std::chrono::milliseconds::zero()};
+
+        try {
+            rs->Execute(impl::CallMode::kReadWrite, query, cc);
+        } catch (const storages::tarantool::CommandException& ex) {
+            if (std::string_view{ex.what()}.find("Timeout exceeded") !=
+                std::string_view::npos) {
+                return SyncResult{false, true, rs->GetUuid()};
+            }
+            throw;
+        }
+    }
+
+    return SyncResult{true, false, std::nullopt};
+}
+
 std::string VshardProxy::Route(BucketId bucket_id) {
     if (bucket_id < 1 || bucket_id > calculator_.GetBucketCount()) {
         throw NoReplicasetError{bucket_id};

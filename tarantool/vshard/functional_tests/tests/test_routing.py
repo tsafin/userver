@@ -350,6 +350,34 @@ class TestRoute:
             )
 
 
+class TestSync:
+    """vshard.router.sync."""
+
+    def test_sync_matches_lua(self, lua_conn, cpp_conn):
+        lua_result = lua_conn.call('vshard.router.sync', [])
+        cpp_result = cpp_conn.call('vshard.router.sync', [])
+        assert cpp_result.data == lua_result.data == [True]
+
+    def test_sync_invalid_arg_matches_lua(self, lua_conn, cpp_conn):
+        import tarantool
+
+        with pytest.raises(tarantool.error.DatabaseError):
+            lua_conn.call('vshard.router.sync', ['bad'])
+        with pytest.raises(tarantool.error.DatabaseError):
+            cpp_conn.call('vshard.router.sync', ['bad'])
+
+    def test_sync_negative_timeout_matches_lua(self, lua_conn, cpp_conn):
+        lua_result = lua_conn.call('vshard.router.sync', [-0.001])
+        cpp_result = cpp_conn.call('vshard.router.sync', [-0.001])
+
+        for result in (lua_result, cpp_result):
+            assert result.data[0] is None
+            err = result.data[1]
+            assert err['code'] == 78
+            assert err['type'] == 'ClientError'
+            assert err['message'] == 'Timeout exceeded'
+
+
 class TestRouteAll:
     """vshard.router.routeall — list all replicasets."""
 
