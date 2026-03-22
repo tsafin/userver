@@ -38,6 +38,7 @@
 
 // Shared IPROTO frame utilities: ParseIprotoRequest, msgpack_scan::*, mp::k*
 #include <storages/tarantool/impl/iproto_frames.hpp>
+#include <storages/tarantool/impl/msgpack.hpp>
 
 // For VshardProxyComponent lookup
 #include <vshard/vshard_proxy_component.hpp>
@@ -47,6 +48,8 @@ USERVER_NAMESPACE_BEGIN
 namespace storages::tarantool::vshard::impl {
 
 namespace {
+
+namespace tnt = storages::tarantool::impl;
 
 // IPROTO request type codes — values not (yet) in tntcxx Iproto enum
 constexpr uint8_t kTypeCall16 = 0x06;  // IPROTO_CALL_16 (legacy, pre-2.0)
@@ -740,24 +743,24 @@ static std::vector<uint8_t> BuildNetboxClientErrorReturn(
     const auto normalized = NormalizeNetboxClientErrorMessage(message);
     payload.reserve(128 + normalized.size());
 
-    PushFixArray(payload, 2);
+    tnt::EncodeArray(payload, 2);
     payload.push_back(mp::kNil);
     PushMapHeader(payload, 5);
-    PushStr(payload, "code");
-    PushUint32Compact(payload, kNoConnectionCode);
-    PushStr(payload, "base_type");
-    PushStr(payload, "ClientError");
-    PushStr(payload, "type");
-    PushStr(payload, "ClientError");
-    PushStr(payload, "message");
-    PushStr(payload, normalized);
-    PushStr(payload, "trace");
-    PushFixArray(payload, 1);
+    tnt::EncodeStr(payload, "code");
+    tnt::EncodeUint(payload, kNoConnectionCode);
+    tnt::EncodeStr(payload, "base_type");
+    tnt::EncodeStr(payload, "ClientError");
+    tnt::EncodeStr(payload, "type");
+    tnt::EncodeStr(payload, "ClientError");
+    tnt::EncodeStr(payload, "message");
+    tnt::EncodeStr(payload, normalized);
+    tnt::EncodeStr(payload, "trace");
+    tnt::EncodeArray(payload, 1);
     PushMapHeader(payload, 2);
-    PushStr(payload, "file");
-    PushStr(payload, "builtin/box/net_box.lua");
-    PushStr(payload, "line");
-    PushUint32Compact(payload, 540);
+    tnt::EncodeStr(payload, "file");
+    tnt::EncodeStr(payload, "builtin/box/net_box.lua");
+    tnt::EncodeStr(payload, "line");
+    tnt::EncodeUint(payload, 540);
     return payload;
 }
 
@@ -772,24 +775,24 @@ static std::vector<uint8_t> BuildRouterShardingErrorReturn(
     std::vector<uint8_t> payload;
     payload.reserve(128 + message.size() + name.size());
 
-    PushFixArray(payload, 2);
+    tnt::EncodeArray(payload, 2);
     payload.push_back(mp::kNil);
     PushMapHeader(payload, field_count);
-    PushStr(payload, "message");
-    PushStr(payload, message);
-    PushStr(payload, "type");
-    PushStr(payload, "ShardingError");
-    PushStr(payload, "code");
-    PushUint32Compact(payload, code);
-    PushStr(payload, "name");
-    PushStr(payload, name);
+    tnt::EncodeStr(payload, "message");
+    tnt::EncodeStr(payload, message);
+    tnt::EncodeStr(payload, "type");
+    tnt::EncodeStr(payload, "ShardingError");
+    tnt::EncodeStr(payload, "code");
+    tnt::EncodeUint(payload, code);
+    tnt::EncodeStr(payload, "name");
+    tnt::EncodeStr(payload, name);
     if (replicaset_id) {
-        PushStr(payload, "replicaset");
-        PushStr(payload, *replicaset_id);
+        tnt::EncodeStr(payload, "replicaset");
+        tnt::EncodeStr(payload, *replicaset_id);
     }
     if (bucket_id) {
-        PushStr(payload, "bucket_id");
-        PushUint32Compact(payload, *bucket_id);
+        tnt::EncodeStr(payload, "bucket_id");
+        tnt::EncodeUint(payload, *bucket_id);
     }
     return payload;
 }

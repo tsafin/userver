@@ -13,7 +13,7 @@
 #include <userver/utils/async.hpp>
 
 #include <storages/tarantool/impl/iproto_frames.hpp>
-#include <storages/tarantool/impl/msgpack_constants.hpp>
+#include <storages/tarantool/impl/msgpack.hpp>
 #include <vshard/impl/iproto_vshard_frames.hpp>
 
 USERVER_NAMESPACE_BEGIN
@@ -22,32 +22,7 @@ namespace storages::tarantool::vshard {
 
 namespace {
 
-void PushString(std::vector<uint8_t>& buf, std::string_view value) {
-    if (value.size() <= 31) {
-        buf.push_back(static_cast<uint8_t>(mp::kFixStrMin | value.size()));
-    } else if (value.size() <= 0xff) {
-        buf.push_back(mp::kStr8);
-        buf.push_back(static_cast<uint8_t>(value.size()));
-    } else {
-        buf.push_back(mp::kStr16);
-        buf.push_back(static_cast<uint8_t>(value.size() >> 8));
-        buf.push_back(static_cast<uint8_t>(value.size()));
-    }
-    buf.insert(buf.end(), value.begin(), value.end());
-}
-
-void PushUint(std::vector<uint8_t>& buf, uint32_t value) {
-    if (value <= 0x7fu) {
-        buf.push_back(static_cast<uint8_t>(value));
-    } else if (value <= 0xffu) {
-        buf.push_back(mp::kUint8);
-        buf.push_back(static_cast<uint8_t>(value));
-    } else {
-        buf.push_back(mp::kUint16);
-        buf.push_back(static_cast<uint8_t>(value >> 8));
-        buf.push_back(static_cast<uint8_t>(value));
-    }
-}
+namespace tnt = storages::tarantool::impl;
 
 std::vector<uint8_t> BuildStorageCallErrorReturn(std::string_view message) {
     static constexpr std::string_view kErrorType = "LuajitError";
@@ -56,23 +31,23 @@ std::vector<uint8_t> BuildStorageCallErrorReturn(std::string_view message) {
     std::vector<uint8_t> buf;
     buf.reserve(96 + message.size());
 
-    buf.push_back(static_cast<uint8_t>(mp::kFixArrayMin | 2));
+    tnt::EncodeArray(buf, 2);
     buf.push_back(mp::kNil);
 
-    buf.push_back(static_cast<uint8_t>(mp::kFixMapMin | 4));
-    PushString(buf, "base_type");
-    PushString(buf, kErrorType);
-    PushString(buf, "type");
-    PushString(buf, kErrorType);
-    PushString(buf, "message");
-    PushString(buf, message);
-    PushString(buf, "trace");
-    buf.push_back(static_cast<uint8_t>(mp::kFixArrayMin | 1));
-    buf.push_back(static_cast<uint8_t>(mp::kFixMapMin | 2));
-    PushString(buf, "file");
-    PushString(buf, kTraceFile);
-    PushString(buf, "line");
-    PushUint(buf, 1005);
+    tnt::EncodeFixMap(buf, 4);
+    tnt::EncodeStr(buf, "base_type");
+    tnt::EncodeStr(buf, kErrorType);
+    tnt::EncodeStr(buf, "type");
+    tnt::EncodeStr(buf, kErrorType);
+    tnt::EncodeStr(buf, "message");
+    tnt::EncodeStr(buf, message);
+    tnt::EncodeStr(buf, "trace");
+    tnt::EncodeArray(buf, 1);
+    tnt::EncodeFixMap(buf, 2);
+    tnt::EncodeStr(buf, "file");
+    tnt::EncodeStr(buf, kTraceFile);
+    tnt::EncodeStr(buf, "line");
+    tnt::EncodeUint(buf, 1005);
 
     return buf;
 }
@@ -112,25 +87,25 @@ std::vector<uint8_t> BuildNetboxClientErrorReturn(std::string_view message) {
     const auto normalized = NormalizeNetboxClientErrorMessage(message);
     buf.reserve(128 + normalized.size());
 
-    buf.push_back(static_cast<uint8_t>(mp::kFixArrayMin | 2));
+    tnt::EncodeArray(buf, 2);
     buf.push_back(mp::kNil);
 
-    buf.push_back(static_cast<uint8_t>(mp::kFixMapMin | 5));
-    PushString(buf, "code");
-    PushUint(buf, kNoConnectionCode);
-    PushString(buf, "base_type");
-    PushString(buf, kErrorType);
-    PushString(buf, "type");
-    PushString(buf, kErrorType);
-    PushString(buf, "message");
-    PushString(buf, normalized);
-    PushString(buf, "trace");
-    buf.push_back(static_cast<uint8_t>(mp::kFixArrayMin | 1));
-    buf.push_back(static_cast<uint8_t>(mp::kFixMapMin | 2));
-    PushString(buf, "file");
-    PushString(buf, kTraceFile);
-    PushString(buf, "line");
-    PushUint(buf, kTraceLine);
+    tnt::EncodeFixMap(buf, 5);
+    tnt::EncodeStr(buf, "code");
+    tnt::EncodeUint(buf, kNoConnectionCode);
+    tnt::EncodeStr(buf, "base_type");
+    tnt::EncodeStr(buf, kErrorType);
+    tnt::EncodeStr(buf, "type");
+    tnt::EncodeStr(buf, kErrorType);
+    tnt::EncodeStr(buf, "message");
+    tnt::EncodeStr(buf, normalized);
+    tnt::EncodeStr(buf, "trace");
+    tnt::EncodeArray(buf, 1);
+    tnt::EncodeFixMap(buf, 2);
+    tnt::EncodeStr(buf, "file");
+    tnt::EncodeStr(buf, kTraceFile);
+    tnt::EncodeStr(buf, "line");
+    tnt::EncodeUint(buf, kTraceLine);
 
     return buf;
 }
