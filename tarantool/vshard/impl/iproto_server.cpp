@@ -50,6 +50,7 @@ namespace storages::tarantool::vshard::impl {
 namespace {
 
 namespace tnt = storages::tarantool::impl;
+constexpr std::string_view kThisFile = __FILE__;
 
 // IPROTO request type codes — values not (yet) in tntcxx Iproto enum
 constexpr uint8_t kTypeCall16 = 0x06;  // IPROTO_CALL_16 (legacy, pre-2.0)
@@ -688,9 +689,9 @@ static std::vector<uint8_t> BuildNetboxClientErrorReturn(
     tnt::EncodeArray(payload, 1);
     PushMapHeader(payload, 2);
     tnt::EncodeStr(payload, "file");
-    tnt::EncodeStr(payload, "builtin/box/net_box.lua");
+    tnt::EncodeStr(payload, kThisFile);
     tnt::EncodeStr(payload, "line");
-    tnt::EncodeUint(payload, 540);
+    tnt::EncodeUint(payload, __LINE__);
     return payload;
 }
 
@@ -720,18 +721,15 @@ static std::vector<uint8_t> BuildTimeoutClientErrorReturn(
     tnt::EncodeArray(payload, 1);
     PushMapHeader(payload, 2);
     tnt::EncodeStr(payload, "file");
-    tnt::EncodeStr(
-        payload, replicaset_id ? "builtin/box/net_box.lua" : "vshard/error.lua");
+    tnt::EncodeStr(payload, kThisFile);
     tnt::EncodeStr(payload, "line");
-    tnt::EncodeUint(payload, replicaset_id ? 422 : 322);
+    tnt::EncodeUint(payload, __LINE__);
     return payload;
 }
 
 static std::vector<uint8_t> BuildMapCallRWClientErrorReturn(
     std::string_view message, uint32_t code,
-    std::optional<std::string_view> replicaset_id,
-    std::string_view trace_file = "./src/box/lua/call.c",
-    uint32_t trace_line = 116) {
+    std::optional<std::string_view> replicaset_id) {
     std::vector<uint8_t> payload;
     payload.reserve(192 + message.size() +
                     (replicaset_id ? replicaset_id->size() : 0));
@@ -751,9 +749,9 @@ static std::vector<uint8_t> BuildMapCallRWClientErrorReturn(
     tnt::EncodeArray(payload, 1);
     PushMapHeader(payload, 2);
     tnt::EncodeStr(payload, "file");
-    tnt::EncodeStr(payload, trace_file);
+    tnt::EncodeStr(payload, kThisFile);
     tnt::EncodeStr(payload, "line");
-    tnt::EncodeUint(payload, trace_line);
+    tnt::EncodeUint(payload, __LINE__);
     if (replicaset_id) {
         tnt::EncodeStr(payload, *replicaset_id);
     }
@@ -1131,8 +1129,7 @@ static void HandleConnection(engine::io::Socket sock,
                         const auto result_bytes = IsConnectivityErrorMessage(ex.what())
                             ? BuildMapCallRWClientErrorReturn(
                                   NormalizeNetboxClientErrorMessage(ex.what()),
-                                  77, ex.GetReplicasetId(),
-                                  "builtin/box/net_box.lua", 540)
+                                  77, ex.GetReplicasetId())
                             : BuildMapCallRWClientErrorReturn(
                                   ex.what(),
                                   ex.GetErrorCode().value_or(32),

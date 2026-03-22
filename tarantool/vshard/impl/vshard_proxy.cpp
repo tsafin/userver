@@ -27,10 +27,10 @@ namespace storages::tarantool::vshard {
 namespace {
 
 namespace tnt = storages::tarantool::impl;
+constexpr std::string_view kThisFile = __FILE__;
 
 std::vector<uint8_t> BuildStorageCallErrorReturn(std::string_view message) {
     static constexpr std::string_view kErrorType = "LuajitError";
-    static constexpr std::string_view kTraceFile = "./src/lua/utils.c";
 
     std::vector<uint8_t> buf;
     buf.reserve(96 + message.size());
@@ -49,9 +49,9 @@ std::vector<uint8_t> BuildStorageCallErrorReturn(std::string_view message) {
     tnt::EncodeArray(buf, 1);
     tnt::EncodeFixMap(buf, 2);
     tnt::EncodeStr(buf, "file");
-    tnt::EncodeStr(buf, kTraceFile);
+    tnt::EncodeStr(buf, kThisFile);
     tnt::EncodeStr(buf, "line");
-    tnt::EncodeUint(buf, 1005);
+    tnt::EncodeUint(buf, __LINE__);
 
     return buf;
 }
@@ -84,8 +84,6 @@ std::string NormalizeNetboxClientErrorMessage(std::string_view message) {
 std::vector<uint8_t> BuildNetboxClientErrorReturn(std::string_view message) {
     static constexpr uint32_t kNoConnectionCode = 77;
     static constexpr std::string_view kErrorType = "ClientError";
-    static constexpr std::string_view kTraceFile = "builtin/box/net_box.lua";
-    static constexpr uint32_t kTraceLine = 540;
 
     std::vector<uint8_t> buf;
     const auto normalized = NormalizeNetboxClientErrorMessage(message);
@@ -107,9 +105,9 @@ std::vector<uint8_t> BuildNetboxClientErrorReturn(std::string_view message) {
     tnt::EncodeArray(buf, 1);
     tnt::EncodeFixMap(buf, 2);
     tnt::EncodeStr(buf, "file");
-    tnt::EncodeStr(buf, kTraceFile);
+    tnt::EncodeStr(buf, kThisFile);
     tnt::EncodeStr(buf, "line");
-    tnt::EncodeUint(buf, kTraceLine);
+    tnt::EncodeUint(buf, __LINE__);
 
     return buf;
 }

@@ -21,6 +21,30 @@ def _call_outcome(conn, func_name, args):
         return ('exc', str(exc))
 
 
+def _strip_trace_locations(value):
+    if isinstance(value, dict):
+        result = {}
+        for key, item in value.items():
+            if key == 'trace' and isinstance(item, list):
+                result[key] = [
+                    {
+                        subkey: _strip_trace_locations(subitem)
+                        for subkey, subitem in frame.items()
+                        if subkey not in ('file', 'line')
+                    }
+                    if isinstance(frame, dict) else _strip_trace_locations(frame)
+                    for frame in item
+                ]
+            else:
+                result[key] = _strip_trace_locations(item)
+        return result
+    if isinstance(value, list):
+        return [_strip_trace_locations(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_strip_trace_locations(item) for item in value)
+    return value
+
+
 def _find_bucket_on_storage(port, bucket_count=3000):
     conn = tarantool.connect(
         '127.0.0.1', port, user='storage', password='storage',
@@ -97,7 +121,8 @@ class TestMissingFunction:
         )
 
         assert lua_result.data[0] is None
-        assert cpp_result.data == lua_result.data
+        assert _strip_trace_locations(cpp_result.data) == \
+            _strip_trace_locations(lua_result.data)
 
 
 class TestUnknownFunction:
@@ -171,7 +196,8 @@ class TestDiscoveryClassification:
             cpp_result = conn.call('vshard.router.callrw', args)
 
             assert lua_result.data[0] is None
-            assert cpp_result.data == lua_result.data
+            assert _strip_trace_locations(cpp_result.data) == \
+                _strip_trace_locations(lua_result.data)
         finally:
             if conn is not None:
                 conn.close()

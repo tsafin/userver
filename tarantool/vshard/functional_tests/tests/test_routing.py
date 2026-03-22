@@ -8,6 +8,30 @@ import pytest
 import tarantool
 
 
+def _strip_trace_locations(value):
+    if isinstance(value, dict):
+        result = {}
+        for key, item in value.items():
+            if key == 'trace' and isinstance(item, list):
+                result[key] = [
+                    {
+                        subkey: _strip_trace_locations(subitem)
+                        for subkey, subitem in frame.items()
+                        if subkey not in ('file', 'line')
+                    }
+                    if isinstance(frame, dict) else _strip_trace_locations(frame)
+                    for frame in item
+                ]
+            else:
+                result[key] = _strip_trace_locations(item)
+        return result
+    if isinstance(value, list):
+        return [_strip_trace_locations(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_strip_trace_locations(item) for item in value)
+    return value
+
+
 class TestCallRW:
     """vshard.router.callrw — write operations through the proxy."""
 
@@ -206,7 +230,8 @@ class TestGenericCall:
         lua_result = lua_conn.call('vshard.router.call', args)
         cpp_result = cpp_conn.call('vshard.router.call', args)
 
-        assert cpp_result.data == lua_result.data
+        assert _strip_trace_locations(cpp_result.data) == \
+            _strip_trace_locations(lua_result.data)
 
 
 
