@@ -6,6 +6,7 @@
 ///   - `IprotoServer` (`iproto-vshard-server`): Tarantool IPROTO TCP listener
 
 #include <userver/clients/dns/component.hpp>
+#include <userver/components/logging_configurator.hpp>
 #include <userver/components/minimal_component_list.hpp>
 #include <userver/storages/secdist/component.hpp>
 #include <userver/storages/secdist/provider_component.hpp>
@@ -18,6 +19,7 @@ int main(int argc, char* argv[]) {
     const auto component_list =
         USERVER_NAMESPACE::components::MinimalComponentList()
             .Append<USERVER_NAMESPACE::clients::dns::Component>()
+            .Append<USERVER_NAMESPACE::components::LoggingConfigurator>()
             .Append<USERVER_NAMESPACE::components::Secdist>()
             .Append<USERVER_NAMESPACE::components::DefaultSecdistProvider>()
             .Append<USERVER_NAMESPACE::components::VshardProxyComponent>()
