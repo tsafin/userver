@@ -181,7 +181,8 @@ TEST(VshardError, EmptyValueIsNull) {
 // manually to test ParseVshardError without msgpack::ValueBuilder.
 TEST(VshardError, WrongBucketParsed) {
     formats::msgpack::ValueBuilder vb;
-    vb["code"] = formats::msgpack::ValueBuilder{32u};
+    vb["code"] = formats::msgpack::ValueBuilder{
+        static_cast<uint32_t>(VshardErrorType::kWrongBucket)};
     vb["message"] = formats::msgpack::ValueBuilder{std::string{"bucket 42 is not found on rs-001"}};
     vb["destination"] = formats::msgpack::ValueBuilder{std::string{"rs-002"}};
     const auto bytes = vb.ToBytes();
@@ -191,14 +192,15 @@ TEST(VshardError, WrongBucketParsed) {
     const auto err = ParseVshardError(val);
     EXPECT_FALSE(err.IsNull());
     EXPECT_TRUE(err.IsWrongBucket());
-    EXPECT_EQ(err.code, 32u);
+    EXPECT_EQ(err.code, static_cast<uint32_t>(VshardErrorType::kWrongBucket));
     ASSERT_TRUE(err.destination_uuid.has_value());
     EXPECT_EQ(*err.destination_uuid, "rs-002");
 }
 
 TEST(VshardError, NonMasterParsed) {
     formats::msgpack::ValueBuilder vb;
-    vb["code"] = formats::msgpack::ValueBuilder{40u};
+    vb["code"] = formats::msgpack::ValueBuilder{
+        static_cast<uint32_t>(VshardErrorType::kNonMaster)};
     vb["message"] = formats::msgpack::ValueBuilder{std::string{"non master"}};
     const auto bytes = vb.ToBytes();
     const auto val = formats::msgpack::Value::FromBytes(bytes.data(), bytes.size());
@@ -208,7 +210,8 @@ TEST(VshardError, NonMasterParsed) {
 
 TEST(VshardError, TransferParsed) {
     formats::msgpack::ValueBuilder vb;
-    vb["code"] = formats::msgpack::ValueBuilder{33u};
+    vb["code"] = formats::msgpack::ValueBuilder{
+        static_cast<uint32_t>(VshardErrorType::kTransfer)};
     vb["message"] = formats::msgpack::ValueBuilder{std::string{"bucket is transferring"}};
     const auto bytes = vb.ToBytes();
     const auto val = formats::msgpack::Value::FromBytes(bytes.data(), bytes.size());
