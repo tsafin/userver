@@ -54,8 +54,6 @@ namespace tnt = storages::tarantool::impl;
 // IPROTO request type codes — values not (yet) in tntcxx Iproto enum
 constexpr uint8_t kTypeCall16 = 0x06;  // IPROTO_CALL_16 (legacy, pre-2.0)
 constexpr uint8_t kTypeId     = 0x49;  // IPROTO_ID — feature negotiation (2.10+)
-constexpr uint32_t kTypeError = 0x8000;  // OR'd with error code in response header
-
 // IPROTO_ID body keys (Tarantool 2.10+, not in tntcxx enum yet)
 constexpr uint8_t kKeyVersion  = 0x54;  // IPROTO_VERSION
 constexpr uint8_t kKeyFeatures = 0x55;  // IPROTO_FEATURES
@@ -89,152 +87,34 @@ std::array<uint8_t, 128> MakeGreeting() {
     return g;
 }
 
-// ---------------------------------------------------------------------------
-// msgpack helpers — minimal zero-dependency encoding using mp::k* constants
-// ---------------------------------------------------------------------------
-
-inline void PushU8(std::vector<uint8_t>& buf, uint8_t v) {
-    buf.push_back(v);
-}
-
-inline void PushU32(std::vector<uint8_t>& buf, uint32_t v) {
-    buf.push_back(mp::kUint32);
-    buf.push_back(static_cast<uint8_t>(v >> 24));
-    buf.push_back(static_cast<uint8_t>(v >> 16));
-    buf.push_back(static_cast<uint8_t>(v >> 8));
-    buf.push_back(static_cast<uint8_t>(v));
-}
-
-inline void PushU64(std::vector<uint8_t>& buf, uint64_t v) {
-    buf.push_back(mp::kUint64);
-    for (int s = 56; s >= 0; s -= 8)
-        buf.push_back(static_cast<uint8_t>(v >> s));
-}
-
-inline void PushFixMap(std::vector<uint8_t>& buf, uint8_t n) {
-    buf.push_back(static_cast<uint8_t>(mp::kFixMapMin | (n & 0x0fu)));
-}
-
-inline void PushFixArray(std::vector<uint8_t>& buf, uint8_t n) {
-    buf.push_back(static_cast<uint8_t>(mp::kFixArrayMin | (n & 0x0fu)));
-}
-
-inline void PushKV_u32(std::vector<uint8_t>& buf, uint8_t key, uint32_t val) {
-    buf.push_back(key);
-    PushU32(buf, val);
-}
-
-inline void PushKV_u64(std::vector<uint8_t>& buf, uint8_t key, uint64_t val) {
-    buf.push_back(key);
-    PushU64(buf, val);
-}
-
-inline void PushStr(std::vector<uint8_t>& buf, std::string_view s) {
-    const auto len = s.size();
-    if (len <= 31) {
-        buf.push_back(static_cast<uint8_t>(mp::kFixStrMin | len));
-    } else {
-        buf.push_back(mp::kStr8);
-        buf.push_back(static_cast<uint8_t>(len));
-    }
-    buf.insert(buf.end(),
-               reinterpret_cast<const uint8_t*>(s.data()),
-               reinterpret_cast<const uint8_t*>(s.data()) + len);
-}
-
-inline void PushNil(std::vector<uint8_t>& buf) {
-    buf.push_back(mp::kNil);
-}
-
-inline void PushPreheader(std::vector<uint8_t>& buf, uint32_t body_len) {
-    buf.push_back(mp::kUint32);
-    buf.push_back(static_cast<uint8_t>(body_len >> 24));
-    buf.push_back(static_cast<uint8_t>(body_len >> 16));
-    buf.push_back(static_cast<uint8_t>(body_len >> 8));
-    buf.push_back(static_cast<uint8_t>(body_len));
-}
-
-// ---------------------------------------------------------------------------
-// Build IPROTO response frames
-// ---------------------------------------------------------------------------
-
-/// Build a wire-ready IPROTO OK response with the given body bytes
-/// (already msgpack-encoded {0x30: data}).
-std::vector<uint8_t> BuildOkFrame(uint64_t sync,
-                                   const uint8_t* body_data,
-                                   std::size_t body_len) {
-    // Header: fixmap(3) + {REQUEST_TYPE: 0, SYNC: sync, SCHEMA_VERSION: ver}
-    std::vector<uint8_t> hdr;
-    hdr.reserve(20);
-    PushFixMap(hdr, 3);
-    hdr.push_back(static_cast<uint8_t>(Iproto::REQUEST_TYPE));
-    hdr.push_back(0x00u);  // OK code = 0 (positive fixint)
-    PushKV_u64(hdr, static_cast<uint8_t>(Iproto::SYNC), sync);
-    PushKV_u32(hdr, static_cast<uint8_t>(Iproto::SCHEMA_VERSION), kSchemaVersion);
-
-    const uint32_t total_body = static_cast<uint32_t>(hdr.size() + body_len);
-
-    std::vector<uint8_t> frame;
-    frame.reserve(5 + total_body);
-    PushPreheader(frame, total_body);
-    frame.insert(frame.end(), hdr.begin(), hdr.end());
-    frame.insert(frame.end(), body_data, body_data + body_len);
-    return frame;
-}
-
-/// Build a wire-ready IPROTO error response.
-std::vector<uint8_t> BuildErrorFrame(uint64_t sync, std::string_view msg) {
-    // Header: fixmap(3) + {REQUEST_TYPE: 0x8001, SYNC: sync, SCHEMA_VERSION: ver}
-    std::vector<uint8_t> hdr;
-    PushFixMap(hdr, 3);
-    hdr.push_back(static_cast<uint8_t>(Iproto::REQUEST_TYPE));
-    PushU32(hdr, kTypeError | 1u);
-    PushKV_u64(hdr, static_cast<uint8_t>(Iproto::SYNC), sync);
-    PushKV_u32(hdr, static_cast<uint8_t>(Iproto::SCHEMA_VERSION), kSchemaVersion);
-
-    // Body: fixmap(1) + {ERROR_24: "error message"}
-    std::vector<uint8_t> body;
-    PushFixMap(body, 1);
-    body.push_back(static_cast<uint8_t>(Iproto::ERROR_24));
-    PushStr(body, msg);
-
-    const uint32_t total = static_cast<uint32_t>(hdr.size() + body.size());
-    std::vector<uint8_t> frame;
-    frame.reserve(5 + total);
-    PushPreheader(frame, total);
-    frame.insert(frame.end(), hdr.begin(), hdr.end());
-    frame.insert(frame.end(), body.begin(), body.end());
-    return frame;
-}
-
 /// Build an IPROTO OK response for AUTH (empty body).
 std::vector<uint8_t> BuildAuthOkFrame(uint64_t sync) {
     std::vector<uint8_t> body;
-    PushFixMap(body, 1);
+    tnt::EncodeFixMap(body, 1);
     body.push_back(static_cast<uint8_t>(Iproto::DATA));
-    PushFixArray(body, 0);
-    return BuildOkFrame(sync, body.data(), body.size());
+    tnt::EncodeArray(body, 0);
+    return tnt::BuildIprotoOkFrame(sync, kSchemaVersion, body.data(), body.size());
 }
 
 /// Build an IPROTO OK response for PING (empty data).
 std::vector<uint8_t> BuildPingOkFrame(uint64_t sync) {
     std::vector<uint8_t> body;
-    PushFixMap(body, 1);
+    tnt::EncodeFixMap(body, 1);
     body.push_back(static_cast<uint8_t>(Iproto::DATA));
-    PushFixArray(body, 0);
-    return BuildOkFrame(sync, body.data(), body.size());
+    tnt::EncodeArray(body, 0);
+    return tnt::BuildIprotoOkFrame(sync, kSchemaVersion, body.data(), body.size());
 }
 
 /// Build an IPROTO OK response for IPROTO_ID: {version: 0, features: []}.
 /// Satisfies net.box feature negotiation without advertising any features.
 std::vector<uint8_t> BuildIdOkFrame(uint64_t sync) {
     std::vector<uint8_t> body;
-    PushFixMap(body, 2);
+    tnt::EncodeFixMap(body, 2);
     body.push_back(kKeyVersion);
     body.push_back(0x00);  // version 0 (positive fixint)
     body.push_back(kKeyFeatures);
-    PushFixArray(body, 0);
-    return BuildOkFrame(sync, body.data(), body.size());
+    tnt::EncodeArray(body, 0);
+    return tnt::BuildIprotoOkFrame(sync, kSchemaVersion, body.data(), body.size());
 }
 
 /// Build an IPROTO OK response for IPROTO_SELECT: empty tuple set {DATA: []}.
@@ -242,10 +122,10 @@ std::vector<uint8_t> BuildIdOkFrame(uint64_t sync) {
 /// empty data lets it proceed without a real box schema.
 std::vector<uint8_t> BuildSelectEmptyFrame(uint64_t sync) {
     std::vector<uint8_t> body;
-    PushFixMap(body, 1);
+    tnt::EncodeFixMap(body, 1);
     body.push_back(static_cast<uint8_t>(Iproto::DATA));
-    PushFixArray(body, 0);
-    return BuildOkFrame(sync, body.data(), body.size());
+    tnt::EncodeArray(body, 0);
+    return tnt::BuildIprotoOkFrame(sync, kSchemaVersion, body.data(), body.size());
 }
 
 // ---------------------------------------------------------------------------
@@ -312,102 +192,6 @@ struct VshardRouterArgs {
     bool             opts_valid{true};
 };
 
-/// Read the msgpack array header, return element count and advance pos.
-/// Returns 0 on failure.
-static std::size_t ReadArrayHeader(const uint8_t* p, std::size_t len,
-                                    std::size_t& pos) noexcept {
-    using namespace storages::tarantool::impl::msgpack_scan;
-    if (pos >= len) return 0;
-    const uint8_t ab = p[pos++];
-    if ((ab & 0xf0u) == mp::kFixArrayMin) return ab & 0x0fu;
-    if (ab == mp::kArray16 && pos + 2 <= len) {
-        auto n = (std::size_t)p[pos] << 8 | p[pos + 1]; pos += 2; return n;
-    }
-    if (ab == mp::kArray32 && pos + 4 <= len) {
-        auto n = (std::size_t)p[pos] << 24 | (std::size_t)p[pos + 1] << 16 |
-                 (std::size_t)p[pos + 2] << 8 | p[pos + 3]; pos += 4;
-        return n;
-    }
-    return 0;
-}
-
-/// Read the msgpack map header, return element count and advance pos.
-/// Returns 0 on failure (also valid for empty map, but that's fine).
-static std::size_t ReadMapHeader(const uint8_t* p, std::size_t len,
-                                  std::size_t& pos) noexcept {
-    using namespace storages::tarantool::impl::msgpack_scan;
-    if (pos >= len) return 0;
-    const uint8_t mb = p[pos];
-    if ((mb & 0xf0u) == mp::kFixMapMin) { ++pos; return mb & 0x0fu; }
-    if (mb == mp::kMap16 && pos + 3 <= len) {
-        ++pos;
-        auto n = (std::size_t)p[pos] << 8 | p[pos + 1]; pos += 2; return n;
-    }
-    if (mb == mp::kMap32 && pos + 5 <= len) {
-        ++pos;
-        auto n = (std::size_t)p[pos] << 24 | (std::size_t)p[pos + 1] << 16 |
-                 (std::size_t)p[pos + 2] << 8 | p[pos + 3]; pos += 4;
-        return n;
-    }
-    return 0;
-}
-
-/// Check if byte at pos is a msgpack string type.
-static bool IsMsgpackStr(const uint8_t* p, std::size_t len,
-                          std::size_t pos) noexcept {
-    using namespace storages::tarantool::impl::msgpack_scan;
-    if (pos >= len) return false;
-    const uint8_t b = p[pos];
-    return (b & 0xe0u) == mp::kFixStrMin || b == mp::kStr8 ||
-           b == mp::kStr16 || b == mp::kStr32;
-}
-
-/// Check if byte at pos is a msgpack map type.
-static bool IsMsgpackMap(const uint8_t* p, std::size_t len,
-                          std::size_t pos) noexcept {
-    using namespace storages::tarantool::impl::msgpack_scan;
-    if (pos >= len) return false;
-    const uint8_t b = p[pos];
-    return (b & 0xf0u) == mp::kFixMapMin || b == mp::kMap16 || b == mp::kMap32;
-}
-
-static bool IsMsgpackNumber(const uint8_t* p, std::size_t len,
-                            std::size_t pos) noexcept {
-    if (pos >= len) return false;
-    const uint8_t b = p[pos];
-    return b <= 0x7f || b == mp::kUint8 || b == mp::kUint16 ||
-           b == mp::kUint32 || b == mp::kUint64 || b == mp::kFloat32 ||
-           b == mp::kFloat64;
-}
-
-/// Read a msgpack float64 (0xcb) or float32 (0xca) or positive integer as double.
-static double ReadNumericAsDouble(const uint8_t* p, std::size_t len,
-                                   std::size_t& pos) noexcept {
-    using namespace storages::tarantool::impl::msgpack_scan;
-    if (pos >= len) return 0.0;
-    const uint8_t b = p[pos];
-    if (b == mp::kFloat64 && pos + 9 <= len) {
-        ++pos;
-        uint64_t bits = 0;
-        for (int i = 0; i < 8; ++i) bits = (bits << 8) | p[pos++];
-        double v;
-        std::memcpy(&v, &bits, 8);
-        return v;
-    }
-    if (b == mp::kFloat32 && pos + 5 <= len) {
-        ++pos;
-        uint32_t bits = 0;
-        for (int i = 0; i < 4; ++i) bits = (bits << 8) | p[pos++];
-        float v;
-        std::memcpy(&v, &bits, 4);
-        return static_cast<double>(v);
-    }
-    // Try reading as uint and convert
-    auto [val, np] = ReadUint(p, len, pos);
-    pos = np;
-    return static_cast<double>(val);
-}
-
 struct ParsedRouterOpts {
     double timeout{0.0};
     double request_timeout{0.0};
@@ -421,7 +205,7 @@ static ParsedRouterOpts ParseCallOpts(const uint8_t* p, std::size_t len,
                                       std::size_t& pos) noexcept {
     using namespace storages::tarantool::impl::msgpack_scan;
     ParsedRouterOpts opts;
-    if (!IsMsgpackMap(p, len, pos)) {
+    if (!IsMap(p, len, pos)) {
         pos = SkipValue(p, len, pos);
         opts.valid = false;
         return opts;
@@ -430,19 +214,19 @@ static ParsedRouterOpts ParseCallOpts(const uint8_t* p, std::size_t len,
     for (std::size_t i = 0; i < map_len; ++i) {
         auto [key, kp] = ReadStr(p, len, pos); pos = kp;
         if (key == "timeout") {
-            if (!IsMsgpackNumber(p, len, pos)) {
+            if (!IsNumber(p, len, pos)) {
                 pos = SkipValue(p, len, pos);
                 opts.valid = false;
                 continue;
             }
-            opts.timeout = ReadNumericAsDouble(p, len, pos);
+            opts.timeout = ReadNumberAsDouble(p, len, pos);
         } else if (key == "request_timeout") {
-            if (!IsMsgpackNumber(p, len, pos)) {
+            if (!IsNumber(p, len, pos)) {
                 pos = SkipValue(p, len, pos);
                 opts.valid = false;
                 continue;
             }
-            opts.request_timeout = ReadNumericAsDouble(p, len, pos);
+            opts.request_timeout = ReadNumberAsDouble(p, len, pos);
         } else {
             pos = SkipValue(p, len, pos);
         }
@@ -533,11 +317,11 @@ ParseVshardRouterCallArgs(const uint8_t* p, std::size_t len) noexcept {
     out.bucket_id = static_cast<uint32_t>(bid);
 
     // 2. mode: string or map
-    if (IsMsgpackStr(p, len, pos)) {
+    if (IsStr(p, len, pos)) {
         auto [mode_str, mp2] = ReadStr(p, len, pos); pos = mp2;
         out.storage_mode = mode_str;
         out.mode = ModeFromString(mode_str);
-    } else if (IsMsgpackMap(p, len, pos)) {
+    } else if (IsMap(p, len, pos)) {
         // Parse opts table: {mode=str, prefer_replica=bool, balance=bool}
         const auto save_pos = pos;
         const auto map_len = ReadMapHeader(p, len, pos);
@@ -590,19 +374,6 @@ ParseVshardRouterCallArgs(const uint8_t* p, std::size_t len) noexcept {
 // ---------------------------------------------------------------------------
 // Build the IPROTO OK response carrying the VshardProxy result value.
 // ---------------------------------------------------------------------------
-
-/// Compact msgpack uint encoding: fixint (0..127) or uint16 (128..65535) or uint32.
-inline void PushUint32Compact(std::vector<uint8_t>& buf, uint32_t v) {
-    if (v <= 0x7fu) {
-        buf.push_back(static_cast<uint8_t>(v));
-    } else if (v <= 0xffffu) {
-        buf.push_back(mp::kUint16);
-        buf.push_back(static_cast<uint8_t>(v >> 8));
-        buf.push_back(static_cast<uint8_t>(v));
-    } else {
-        PushU32(buf, v);
-    }
-}
 
 /// Map encoding header for N entries.
 inline void PushMapHeader(std::vector<uint8_t>& buf, std::size_t n) {
@@ -677,11 +448,11 @@ static std::optional<TupleKey> ReadTupleFirstKey(
 static std::vector<uint8_t> BuildUint32ResultFrame(uint64_t sync, uint32_t val) {
     std::vector<uint8_t> body;
     body.reserve(8);
-    PushFixMap(body, 1);
+    tnt::EncodeFixMap(body, 1);
     body.push_back(static_cast<uint8_t>(Iproto::DATA));
-    PushFixArray(body, 1);
-    PushUint32Compact(body, val);
-    return BuildOkFrame(sync, body.data(), body.size());
+    tnt::EncodeArray(body, 1);
+    tnt::EncodeUint(body, val);
+    return tnt::BuildIprotoOkFrame(sync, kSchemaVersion, body.data(), body.size());
 }
 
 /// Build DATA response carrying a msgpack map {uuid: {uuid: uuid}} per RS.
@@ -693,20 +464,20 @@ static std::vector<uint8_t> BuildRouteAllResultFrame(
     inner.reserve(uuids.size() * 50);
     PushMapHeader(inner, uuids.size());
     for (const auto& uuid : uuids) {
-        PushStr(inner, uuid);
+        tnt::EncodeStr(inner, uuid);
         // Encode minimal replicaset descriptor: {uuid: uuid}
-        PushFixMap(inner, 1);
-        PushStr(inner, "uuid");
-        PushStr(inner, uuid);
+        tnt::EncodeFixMap(inner, 1);
+        tnt::EncodeStr(inner, "uuid");
+        tnt::EncodeStr(inner, uuid);
     }
     // Wrap as DATA: [inner_map]
     std::vector<uint8_t> body;
     body.reserve(3 + inner.size());
-    PushFixMap(body, 1);
+    tnt::EncodeFixMap(body, 1);
     body.push_back(static_cast<uint8_t>(Iproto::DATA));
-    PushFixArray(body, 1);
+    tnt::EncodeArray(body, 1);
     body.insert(body.end(), inner.begin(), inner.end());
-    return BuildOkFrame(sync, body.data(), body.size());
+    return tnt::BuildIprotoOkFrame(sync, kSchemaVersion, body.data(), body.size());
 }
 
 static bool IsConnectivityErrorMessage(std::string_view message) {
@@ -806,12 +577,12 @@ static std::vector<uint8_t> BuildRouterShardingErrorReturn(
     // body = fixmap(1) + {DATA: [result_value]}
     std::vector<uint8_t> body;
     body.reserve(3 + result_bytes.size());
-    PushFixMap(body, 1);
+    tnt::EncodeFixMap(body, 1);
     body.push_back(static_cast<uint8_t>(Iproto::DATA));
-    PushFixArray(body, 1);  // net.box unpacks the outer array as multi-return
+    tnt::EncodeArray(body, 1);  // net.box unpacks the outer array as multi-return
     body.insert(body.end(), result_bytes.begin(), result_bytes.end());
 
-    return BuildOkFrame(sync, body.data(), body.size());
+    return tnt::BuildIprotoOkFrame(sync, kSchemaVersion, body.data(), body.size());
 }
 
 /// Zero-copy variant: return_values_data is already a msgpack-encoded array of
@@ -821,11 +592,11 @@ static std::vector<uint8_t> BuildResultFrameRaw(
     // body = fixmap(1) + {DATA: raw_return_values_array}
     std::vector<uint8_t> body;
     body.reserve(2 + return_values_len);
-    PushFixMap(body, 1);
+    tnt::EncodeFixMap(body, 1);
     body.push_back(static_cast<uint8_t>(Iproto::DATA));
     body.insert(
         body.end(), return_values_data, return_values_data + return_values_len);
-    return BuildOkFrame(sync, body.data(), body.size());
+    return tnt::BuildIprotoOkFrame(sync, kSchemaVersion, body.data(), body.size());
 }
 
 // ---------------------------------------------------------------------------
@@ -946,14 +717,16 @@ static void HandleConnection(engine::io::Socket sock,
                 // Both CALL (0x0A) and legacy CALL_16 (0x06) carry
                 // FUNCTION_NAME (0x22) + TUPLE (0x21) in the body.
                 if (!req.body_begin) {
-                    const auto resp = BuildErrorFrame(req.sync, "missing body");
+                    const auto resp = tnt::BuildIprotoErrorFrame(
+                        req.sync, kSchemaVersion, "missing body");
                     (void)sock.SendAll(resp.data(), resp.size(), engine::Deadline{});
                     continue;
                 }
 
                 const auto body = ParseCallBody(req.body_begin, req.body_len);
                 if (!body || !body->tuple_begin) {
-                    const auto resp = BuildErrorFrame(req.sync, "missing args");
+                    const auto resp = tnt::BuildIprotoErrorFrame(
+                        req.sync, kSchemaVersion, "missing args");
                     (void)sock.SendAll(resp.data(), resp.size(), engine::Deadline{});
                     continue;
                 }
@@ -981,7 +754,8 @@ static void HandleConnection(engine::io::Socket sock,
                     const auto key = ReadTupleFirstKey(
                         body->tuple_begin, body->tuple_len);
                     if (!key) {
-                        const auto resp = BuildErrorFrame(req.sync,
+                        const auto resp = tnt::BuildIprotoErrorFrame(req.sync,
+                            kSchemaVersion,
                             "bad bucket_id_mpcrc32 args: expected [key]");
                         (void)sock.SendAll(resp.data(), resp.size(), engine::Deadline{});
                         continue;
@@ -1003,8 +777,8 @@ static void HandleConnection(engine::io::Socket sock,
                 } else {
                     LOG_WARNING() << "iproto_server: unknown vshard function '"
                                   << body->func_name << "'";
-                    const auto resp = BuildErrorFrame(
-                        req.sync, "unsupported vshard function");
+                    const auto resp = tnt::BuildIprotoErrorFrame(
+                        req.sync, kSchemaVersion, "unsupported vshard function");
                     (void)sock.SendAll(resp.data(), resp.size(), engine::Deadline{});
                     continue;
                 }
@@ -1027,16 +801,16 @@ static void HandleConnection(engine::io::Socket sock,
                     }
                 }
                 if (!vargs) {
-                    const auto resp = BuildErrorFrame(
-                        req.sync, is_generic_call
+                    const auto resp = tnt::BuildIprotoErrorFrame(
+                        req.sync, kSchemaVersion, is_generic_call
                             ? "bad vshard.router.call args: expected [bucket_id, mode, func, args]"
                             : "bad vshard.router args: expected [bucket_id, func, args]");
                     (void)sock.SendAll(resp.data(), resp.size(), engine::Deadline{});
                     continue;
                 }
                 if (!vargs->opts_valid) {
-                    const auto resp = BuildErrorFrame(
-                        req.sync, is_generic_call
+                    const auto resp = tnt::BuildIprotoErrorFrame(
+                        req.sync, kSchemaVersion, is_generic_call
                             ? "Usage: call(bucket_id, mode, func, args, opts)"
                             : "Usage: call(bucket_id, func, args, opts)");
                     (void)sock.SendAll(resp.data(), resp.size(), engine::Deadline{});
@@ -1046,8 +820,9 @@ static void HandleConnection(engine::io::Socket sock,
                     vargs->timeout > 0.0 ? vargs->timeout : 0.5;
                 if (vargs->request_timeout > 0.0 &&
                     vargs->request_timeout > total_timeout) {
-                    const auto resp = BuildErrorFrame(
-                        req.sync, "request_timeout must be <= timeout");
+                    const auto resp = tnt::BuildIprotoErrorFrame(
+                        req.sync, kSchemaVersion,
+                        "request_timeout must be <= timeout");
                     (void)sock.SendAll(resp.data(), resp.size(), engine::Deadline{});
                     continue;
                 }
@@ -1092,14 +867,15 @@ static void HandleConnection(engine::io::Socket sock,
             } else {
                 LOG_WARNING() << "iproto_server: unsupported request type 0x"
                               << static_cast<unsigned>(req.type);
-                const auto resp = BuildErrorFrame(
-                    req.sync, "unsupported request type");
+                const auto resp = tnt::BuildIprotoErrorFrame(
+                    req.sync, kSchemaVersion, "unsupported request type");
                 (void)sock.SendAll(resp.data(), resp.size(), engine::Deadline{});
             }
         } catch (const std::exception& ex) {
             LOG_DEBUG() << "iproto_server: request error: " << ex.what();
             try {
-                const auto resp = BuildErrorFrame(req.sync, ex.what());
+                const auto resp = tnt::BuildIprotoErrorFrame(
+                    req.sync, kSchemaVersion, ex.what());
                 (void)sock.SendAll(resp.data(), resp.size(), engine::Deadline{});
             } catch (...) {
                 break;  // can't write back, drop connection

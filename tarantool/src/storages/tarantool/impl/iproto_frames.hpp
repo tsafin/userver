@@ -35,14 +35,19 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <string_view>
+#include <vector>
 
 #include <Client/IprotoConstants.hpp>
 
+#include <storages/tarantool/impl/msgpack.hpp>
 #include <storages/tarantool/impl/msgpack_constants.hpp>
 
 USERVER_NAMESPACE_BEGIN
 
 namespace storages::tarantool::impl {
+
+constexpr uint32_t kIprotoTypeError = 0x8000;
 
 /// Number of bytes in a serialised IPROTO PING frame.
 constexpr std::size_t kPingFrameSize = 18;
@@ -74,6 +79,77 @@ constexpr std::size_t kPingFrameSize = 18;
         static_cast<uint8_t>(sync_id >> 8),
         static_cast<uint8_t>(sync_id),
     }};
+}
+
+inline void AppendIprotoPreheader(
+    std::vector<uint8_t>& out, uint32_t body_len) {
+    out.push_back(mp::kUint32);
+    out.push_back(static_cast<uint8_t>(body_len >> 24));
+    out.push_back(static_cast<uint8_t>(body_len >> 16));
+    out.push_back(static_cast<uint8_t>(body_len >> 8));
+    out.push_back(static_cast<uint8_t>(body_len));
+}
+
+inline void AppendIprotoHeaderKv(
+    std::vector<uint8_t>& out, uint8_t key, uint32_t value) {
+    out.push_back(key);
+    EncodeUint(out, value);
+}
+
+inline void AppendIprotoHeaderKv(
+    std::vector<uint8_t>& out, uint8_t key, uint64_t value) {
+    out.push_back(key);
+    EncodeUint(out, value);
+}
+
+inline std::vector<uint8_t> BuildIprotoOkFrame(
+    uint64_t sync, uint32_t schema_version,
+    const uint8_t* body_data, std::size_t body_len) {
+    std::vector<uint8_t> hdr;
+    hdr.reserve(20);
+    EncodeFixMap(hdr, 3);
+    hdr.push_back(static_cast<uint8_t>(Iproto::REQUEST_TYPE));
+    hdr.push_back(0x00u);
+    AppendIprotoHeaderKv(hdr, static_cast<uint8_t>(Iproto::SYNC), sync);
+    AppendIprotoHeaderKv(
+        hdr, static_cast<uint8_t>(Iproto::SCHEMA_VERSION), schema_version);
+
+    const uint32_t total_body = static_cast<uint32_t>(hdr.size() + body_len);
+
+    std::vector<uint8_t> frame;
+    frame.reserve(5 + total_body);
+    AppendIprotoPreheader(frame, total_body);
+    frame.insert(frame.end(), hdr.begin(), hdr.end());
+    frame.insert(frame.end(), body_data, body_data + body_len);
+    return frame;
+}
+
+inline std::vector<uint8_t> BuildIprotoErrorFrame(
+    uint64_t sync, uint32_t schema_version, std::string_view msg,
+    uint32_t error_code = 1) {
+    std::vector<uint8_t> hdr;
+    hdr.reserve(24);
+    EncodeFixMap(hdr, 3);
+    hdr.push_back(static_cast<uint8_t>(Iproto::REQUEST_TYPE));
+    EncodeUint(hdr, kIprotoTypeError | error_code);
+    AppendIprotoHeaderKv(hdr, static_cast<uint8_t>(Iproto::SYNC), sync);
+    AppendIprotoHeaderKv(
+        hdr, static_cast<uint8_t>(Iproto::SCHEMA_VERSION), schema_version);
+
+    std::vector<uint8_t> body;
+    body.reserve(8 + msg.size());
+    EncodeFixMap(body, 1);
+    body.push_back(static_cast<uint8_t>(Iproto::ERROR_24));
+    EncodeStr(body, msg);
+
+    const uint32_t total_body = static_cast<uint32_t>(hdr.size() + body.size());
+
+    std::vector<uint8_t> frame;
+    frame.reserve(5 + total_body);
+    AppendIprotoPreheader(frame, total_body);
+    frame.insert(frame.end(), hdr.begin(), hdr.end());
+    frame.insert(frame.end(), body.begin(), body.end());
+    return frame;
 }
 
 // ── Zero-allocation IPROTO response scanner ──────────────────────────────────
@@ -122,6 +198,107 @@ inline std::pair<uint64_t, std::size_t> ReadUint(const uint8_t* p, std::size_t l
         return {v, pos + 9};
     }
     return {0, pos + 1};
+}
+
+inline std::size_t ReadArrayHeader(
+    const uint8_t* p, std::size_t len, std::size_t& pos
+) noexcept {
+    if (pos >= len) return 0;
+    const uint8_t ab = p[pos++];
+    if ((ab & 0xf0u) == mp::kFixArrayMin) return ab & 0x0fu;
+    if (ab == mp::kArray16 && pos + 2 <= len) {
+        auto n = (std::size_t)p[pos] << 8 | p[pos + 1];
+        pos += 2;
+        return n;
+    }
+    if (ab == mp::kArray32 && pos + 4 <= len) {
+        auto n = (std::size_t)p[pos] << 24 |
+                 (std::size_t)p[pos + 1] << 16 |
+                 (std::size_t)p[pos + 2] << 8 | p[pos + 3];
+        pos += 4;
+        return n;
+    }
+    return 0;
+}
+
+inline std::size_t ReadMapHeader(
+    const uint8_t* p, std::size_t len, std::size_t& pos
+) noexcept {
+    if (pos >= len) return 0;
+    const uint8_t mb = p[pos];
+    if ((mb & 0xf0u) == mp::kFixMapMin) {
+        ++pos;
+        return mb & 0x0fu;
+    }
+    if (mb == mp::kMap16 && pos + 3 <= len) {
+        ++pos;
+        auto n = (std::size_t)p[pos] << 8 | p[pos + 1];
+        pos += 2;
+        return n;
+    }
+    if (mb == mp::kMap32 && pos + 5 <= len) {
+        ++pos;
+        auto n = (std::size_t)p[pos] << 24 |
+                 (std::size_t)p[pos + 1] << 16 |
+                 (std::size_t)p[pos + 2] << 8 | p[pos + 3];
+        pos += 4;
+        return n;
+    }
+    return 0;
+}
+
+inline bool IsStr(
+    const uint8_t* p, std::size_t len, std::size_t pos
+) noexcept {
+    if (pos >= len) return false;
+    const uint8_t b = p[pos];
+    return (b & 0xe0u) == mp::kFixStrMin || b == mp::kStr8 ||
+           b == mp::kStr16 || b == mp::kStr32;
+}
+
+inline bool IsMap(
+    const uint8_t* p, std::size_t len, std::size_t pos
+) noexcept {
+    if (pos >= len) return false;
+    const uint8_t b = p[pos];
+    return (b & 0xf0u) == mp::kFixMapMin || b == mp::kMap16 ||
+           b == mp::kMap32;
+}
+
+inline bool IsNumber(
+    const uint8_t* p, std::size_t len, std::size_t pos
+) noexcept {
+    if (pos >= len) return false;
+    const uint8_t b = p[pos];
+    return b <= 0x7f || b == mp::kUint8 || b == mp::kUint16 ||
+           b == mp::kUint32 || b == mp::kUint64 || b == mp::kFloat32 ||
+           b == mp::kFloat64;
+}
+
+inline double ReadNumberAsDouble(
+    const uint8_t* p, std::size_t len, std::size_t& pos
+) noexcept {
+    if (pos >= len) return 0.0;
+    const uint8_t b = p[pos];
+    if (b == mp::kFloat64 && pos + 9 <= len) {
+        ++pos;
+        uint64_t bits = 0;
+        for (int i = 0; i < 8; ++i) bits = (bits << 8) | p[pos++];
+        double v;
+        std::memcpy(&v, &bits, sizeof(v));
+        return v;
+    }
+    if (b == mp::kFloat32 && pos + 5 <= len) {
+        ++pos;
+        uint32_t bits = 0;
+        for (int i = 0; i < 4; ++i) bits = (bits << 8) | p[pos++];
+        float v;
+        std::memcpy(&v, &bits, sizeof(v));
+        return static_cast<double>(v);
+    }
+    auto [val, np] = ReadUint(p, len, pos);
+    pos = np;
+    return static_cast<double>(val);
 }
 
 /// Skip one msgpack value at p[pos], returning the position after it.
