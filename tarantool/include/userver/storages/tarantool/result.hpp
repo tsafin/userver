@@ -63,7 +63,7 @@ class ExecutionResult final {
   template <typename T>
   T As() const {
     AssertOk();
-    return data_.As<T>();
+    return GetData().As<T>();
   }
 
  private:
