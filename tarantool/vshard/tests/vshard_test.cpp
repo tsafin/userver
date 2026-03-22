@@ -343,4 +343,254 @@ TEST(ParseVshardCallHeader, BucketIdOutOfRange) {
     EXPECT_FALSE(info.has_value());
 }
 
+// ---------------------------------------------------------------------------
+// VshardError — extended parsing tests
+// ---------------------------------------------------------------------------
+
+TEST(VshardError, BucketIsLockedParsed) {
+    formats::msgpack::ValueBuilder vb;
+    vb["code"] = formats::msgpack::ValueBuilder{
+        static_cast<uint32_t>(VshardErrorType::kBucketIsLocked)};
+    vb["message"] = formats::msgpack::ValueBuilder{
+        std::string{"bucket 42 is locked"}};
+    vb["destination"] = formats::msgpack::ValueBuilder{
+        std::string{"rs-003"}};
+    const auto bytes = vb.ToBytes();
+    const auto val = formats::msgpack::Value::FromBytes(
+        bytes.data(), bytes.size());
+
+    const auto err = ParseVshardError(val);
+    EXPECT_FALSE(err.IsNull());
+    EXPECT_TRUE(err.IsBucketIsLocked());
+    EXPECT_TRUE(err.IsBucketRetryable());
+    EXPECT_FALSE(err.IsWrongBucket());
+    EXPECT_FALSE(err.IsTransfer());
+    ASSERT_TRUE(err.destination_uuid.has_value());
+    EXPECT_EQ(*err.destination_uuid, "rs-003");
+}
+
+TEST(VshardError, NoRoutesetParsed) {
+    formats::msgpack::ValueBuilder vb;
+    vb["code"] = formats::msgpack::ValueBuilder{
+        static_cast<uint32_t>(VshardErrorType::kNoRouteset)};
+    vb["message"] = formats::msgpack::ValueBuilder{
+        std::string{"no route to bucket"}};
+    const auto bytes = vb.ToBytes();
+    const auto val = formats::msgpack::Value::FromBytes(
+        bytes.data(), bytes.size());
+
+    const auto err = ParseVshardError(val);
+    EXPECT_FALSE(err.IsNull());
+    EXPECT_EQ(err.type, VshardErrorType::kNoRouteset);
+    EXPECT_FALSE(err.IsWrongBucket());
+    EXPECT_FALSE(err.IsTransfer());
+    EXPECT_FALSE(err.destination_uuid.has_value());
+}
+
+TEST(VshardError, NameFallbackWrongBucket) {
+    // Error with unknown numeric code but known name
+    formats::msgpack::ValueBuilder vb;
+    vb["code"] = formats::msgpack::ValueBuilder{999u};  // unknown code
+    vb["name"] = formats::msgpack::ValueBuilder{
+        std::string{"WRONG_BUCKET"}};
+    vb["message"] = formats::msgpack::ValueBuilder{
+        std::string{"wrong bucket by name"}};
+    const auto bytes = vb.ToBytes();
+    const auto val = formats::msgpack::Value::FromBytes(
+        bytes.data(), bytes.size());
+
+    const auto err = ParseVshardError(val);
+    EXPECT_FALSE(err.IsNull());
+    EXPECT_TRUE(err.IsWrongBucket());
+    EXPECT_EQ(err.code, 999u);
+}
+
+TEST(VshardError, NameFallbackNonMaster) {
+    formats::msgpack::ValueBuilder vb;
+    vb["code"] = formats::msgpack::ValueBuilder{888u};
+    vb["name"] = formats::msgpack::ValueBuilder{std::string{"NON_MASTER"}};
+    vb["message"] = formats::msgpack::ValueBuilder{std::string{"not master"}};
+    const auto bytes = vb.ToBytes();
+    const auto val = formats::msgpack::Value::FromBytes(
+        bytes.data(), bytes.size());
+
+    const auto err = ParseVshardError(val);
+    EXPECT_TRUE(err.IsNonMaster());
+}
+
+TEST(VshardError, NameFallbackTransfer) {
+    formats::msgpack::ValueBuilder vb;
+    vb["code"] = formats::msgpack::ValueBuilder{777u};
+    vb["name"] = formats::msgpack::ValueBuilder{
+        std::string{"TRANSFER_IS_IN_PROGRESS"}};
+    vb["message"] = formats::msgpack::ValueBuilder{
+        std::string{"transferring"}};
+    const auto bytes = vb.ToBytes();
+    const auto val = formats::msgpack::Value::FromBytes(
+        bytes.data(), bytes.size());
+
+    const auto err = ParseVshardError(val);
+    EXPECT_TRUE(err.IsTransfer());
+}
+
+TEST(VshardError, NameFallbackBucketIsLocked) {
+    formats::msgpack::ValueBuilder vb;
+    vb["code"] = formats::msgpack::ValueBuilder{666u};
+    vb["name"] = formats::msgpack::ValueBuilder{
+        std::string{"BUCKET_IS_LOCKED"}};
+    vb["message"] = formats::msgpack::ValueBuilder{std::string{"locked"}};
+    const auto bytes = vb.ToBytes();
+    const auto val = formats::msgpack::Value::FromBytes(
+        bytes.data(), bytes.size());
+
+    const auto err = ParseVshardError(val);
+    EXPECT_TRUE(err.IsBucketIsLocked());
+    EXPECT_TRUE(err.IsBucketRetryable());
+}
+
+TEST(VshardError, UnknownCodeAndNameIsUnknown) {
+    formats::msgpack::ValueBuilder vb;
+    vb["code"] = formats::msgpack::ValueBuilder{12345u};
+    vb["name"] = formats::msgpack::ValueBuilder{
+        std::string{"SOME_FUTURE_ERROR"}};
+    vb["message"] = formats::msgpack::ValueBuilder{
+        std::string{"future error"}};
+    const auto bytes = vb.ToBytes();
+    const auto val = formats::msgpack::Value::FromBytes(
+        bytes.data(), bytes.size());
+
+    const auto err = ParseVshardError(val);
+    EXPECT_FALSE(err.IsNull());
+    EXPECT_EQ(err.type, VshardErrorType::kUnknown);
+    EXPECT_FALSE(err.IsWrongBucket());
+    EXPECT_FALSE(err.IsNonMaster());
+    EXPECT_FALSE(err.IsTransfer());
+    EXPECT_FALSE(err.IsBucketIsLocked());
+    EXPECT_FALSE(err.IsBucketRetryable());
+}
+
+TEST(VshardError, MissingCodeField) {
+    // Error with only message — no code, no name
+    formats::msgpack::ValueBuilder vb;
+    vb["message"] = formats::msgpack::ValueBuilder{
+        std::string{"some error without code"}};
+    const auto bytes = vb.ToBytes();
+    const auto val = formats::msgpack::Value::FromBytes(
+        bytes.data(), bytes.size());
+
+    const auto err = ParseVshardError(val);
+    EXPECT_FALSE(err.IsNull());
+    EXPECT_EQ(err.type, VshardErrorType::kUnknown);
+    EXPECT_EQ(err.message, "some error without code");
+}
+
+TEST(VshardError, WrongBucketWithNoDestination) {
+    formats::msgpack::ValueBuilder vb;
+    vb["code"] = formats::msgpack::ValueBuilder{
+        static_cast<uint32_t>(VshardErrorType::kWrongBucket)};
+    vb["message"] = formats::msgpack::ValueBuilder{
+        std::string{"bucket is nowhere"}};
+    const auto bytes = vb.ToBytes();
+    const auto val = formats::msgpack::Value::FromBytes(
+        bytes.data(), bytes.size());
+
+    const auto err = ParseVshardError(val);
+    EXPECT_TRUE(err.IsWrongBucket());
+    EXPECT_FALSE(err.destination_uuid.has_value());
+}
+
+TEST(VshardError, CodeTakesPrecedenceOverName) {
+    // Code says WRONG_BUCKET, name says NON_MASTER — code wins
+    formats::msgpack::ValueBuilder vb;
+    vb["code"] = formats::msgpack::ValueBuilder{
+        static_cast<uint32_t>(VshardErrorType::kWrongBucket)};
+    vb["name"] = formats::msgpack::ValueBuilder{
+        std::string{"NON_MASTER"}};
+    vb["message"] = formats::msgpack::ValueBuilder{
+        std::string{"conflicting"}};
+    const auto bytes = vb.ToBytes();
+    const auto val = formats::msgpack::Value::FromBytes(
+        bytes.data(), bytes.size());
+
+    const auto err = ParseVshardError(val);
+    EXPECT_TRUE(err.IsWrongBucket());
+    EXPECT_FALSE(err.IsNonMaster());
+}
+
+// ---------------------------------------------------------------------------
+// BucketCalculator — additional edge cases
+// ---------------------------------------------------------------------------
+
+TEST(BucketCalculator, BucketCount32768AllTypes) {
+    BucketCalculator calc{32768};
+    for (int i = -100; i < 100; ++i) {
+        const auto bid = calc.BucketIdMpcrc32(static_cast<int64_t>(i));
+        EXPECT_GE(bid, 1u);
+        EXPECT_LE(bid, 32768u);
+    }
+}
+
+TEST(BucketCalculator, BucketCount1) {
+    BucketCalculator calc{1};
+    EXPECT_EQ(calc.BucketIdMpcrc32("anything"), 1u);
+    EXPECT_EQ(calc.BucketIdMpcrc32(static_cast<int64_t>(42)), 1u);
+}
+
+TEST(BucketCalculator, Mpcrc32ConsistentAcrossTypes) {
+    // Int key 100 and string key "100" should produce DIFFERENT buckets
+    // because msgpack encodes them differently
+    BucketCalculator calc{3000};
+    const auto bid_int = calc.BucketIdMpcrc32(static_cast<int64_t>(100));
+    const auto bid_str = calc.BucketIdMpcrc32("100");
+    // They should both be valid
+    EXPECT_GE(bid_int, 1u);
+    EXPECT_LE(bid_int, 3000u);
+    EXPECT_GE(bid_str, 1u);
+    EXPECT_LE(bid_str, 3000u);
+    // But different (extremely unlikely to collide with crc32)
+    EXPECT_NE(bid_int, bid_str);
+}
+
+// ---------------------------------------------------------------------------
+// RoutingTable — additional tests
+// ---------------------------------------------------------------------------
+
+TEST(RoutingTable, PatchBucketOwnerAndReRead) {
+    auto t = MakeTestTable();
+    // Bucket 2 starts at RS 1
+    EXPECT_EQ(t->bucket_to_rs[1], 1u);
+    // Move to RS 2
+    EXPECT_TRUE(t->UpdateBucketOwner(2, 2));
+    EXPECT_EQ(t->bucket_to_rs[1], 2u);
+    // Clear (unknown)
+    EXPECT_TRUE(t->UpdateBucketOwner(2, 0));
+    EXPECT_EQ(t->bucket_to_rs[1], 0u);
+    EXPECT_EQ(t->FindReplicaset(2), nullptr);
+}
+
+TEST(RoutingTable, AllBucketsCanBeAssigned) {
+    auto t = MakeTestTable();
+    // Assign all 6 buckets to RS 2
+    for (uint32_t b = 1; b <= 6; ++b) {
+        EXPECT_TRUE(t->UpdateBucketOwner(b, 2));
+    }
+    for (uint32_t b = 1; b <= 6; ++b) {
+        EXPECT_EQ(t->bucket_to_rs[b - 1], 2u);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// VshardExceptions — additional tests
+// ---------------------------------------------------------------------------
+
+TEST(VshardExceptions, TransferErrorMessage) {
+    TransferError e{"bucket 42 is being transferred"};
+    EXPECT_NE(std::string{e.what()}.find("transferred"), std::string::npos);
+}
+
+TEST(VshardExceptions, VshardStorageErrorFields) {
+    VshardStorageError e{1, "WRONG_BUCKET", "bucket moved to rs-002"};
+    EXPECT_NE(std::string{e.what()}.find("bucket moved"), std::string::npos);
+}
+
 USERVER_NAMESPACE_END
