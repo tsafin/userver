@@ -5,6 +5,7 @@ Each test also runs the same operation through the Lua vshard router
 and compares results (lock-step differential testing).
 """
 import pytest
+import tarantool
 
 
 class TestCallRW:
@@ -299,6 +300,54 @@ class TestBucketId:
             )
             assert cpp_bid.data == lua_bid.data, \
                 f"Mismatch for key='{key}': cpp={cpp_bid.data} lua={lua_bid.data}"
+
+    def test_bucket_id_strcrc32_string(self, lua_conn, cpp_conn):
+        """bucket_id_strcrc32 for string keys should match."""
+        for key in ['hello', 'world', '', 'test123', 'user@example.com']:
+            lua_bid = lua_conn.call(
+                'vshard.router.bucket_id_strcrc32', [key],
+            )
+            cpp_bid = cpp_conn.call(
+                'vshard.router.bucket_id_strcrc32', [key],
+            )
+            assert cpp_bid.data == lua_bid.data, \
+                f"Mismatch for key='{key}': cpp={cpp_bid.data} lua={lua_bid.data}"
+
+
+def _bucket_owner_uuid(vshard_cluster, bucket_id):
+    ports = vshard_cluster['ports']
+    for rs_name, rs_uuid in (
+        ('rs1_master', 'cbf06940-0790-498b-948d-042b62cf3d29'),
+        ('rs2_master', 'ac522f65-aa94-4134-9f64-51ee384f1a54'),
+    ):
+        conn = tarantool.connect(
+            '127.0.0.1', ports[rs_name], user='storage', password='storage',
+        )
+        try:
+            result = conn.call('vshard.storage.bucket_stat', [bucket_id])
+            if (
+                result.data and len(result.data) >= 2 and
+                result.data[0] is not None and result.data[1] is None
+            ):
+                return rs_uuid
+        except Exception:
+            pass
+        finally:
+            conn.close()
+    raise AssertionError(f'No storage owns bucket {bucket_id}')
+
+
+class TestRoute:
+    """vshard.router.route — resolve bucket owner."""
+
+    def test_route_returns_owner_uuid(self, cpp_conn, vshard_cluster):
+        for bucket_id in [1, 2, 17, 101]:
+            cpp_result = cpp_conn.call('vshard.router.route', [bucket_id])
+            assert cpp_result.data is not None
+            route_info = cpp_result.data[0]
+            assert route_info['uuid'] == _bucket_owner_uuid(
+                vshard_cluster, bucket_id
+            )
 
 
 class TestRouteAll:

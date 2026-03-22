@@ -861,6 +861,29 @@ uint32_t VshardProxy::GetBucketCount() const noexcept {
     return calculator_.GetBucketCount();
 }
 
+std::string VshardProxy::Route(BucketId bucket_id) {
+    if (bucket_id < 1 || bucket_id > calculator_.GetBucketCount()) {
+        throw NoReplicasetError{bucket_id};
+    }
+
+    const auto discovery = fetcher_->DiscoverBucket(bucket_id);
+    if (discovery.HasOwner()) {
+        routing_table_.PatchBucketOwnerByIndex(bucket_id, discovery.rs_idx);
+        auto snapshot = routing_table_.Read();
+        auto* rs = snapshot->FindReplicaset(bucket_id);
+        if (!rs) throw NoReplicasetError{bucket_id};
+        return rs->GetUuid();
+    }
+    if (discovery.HasUnreachableReplicaset()) {
+        throw UnreachableReplicasetError{
+            discovery.unreachable_replicaset_id, bucket_id};
+    }
+    if (discovery.HasOtherError()) {
+        throw VshardException{discovery.error_message};
+    }
+    throw NoRouteToBucketError{bucket_id};
+}
+
 std::vector<std::string> VshardProxy::GetReplicasetUUIDs() const {
     auto snapshot = routing_table_.Read();
     std::vector<std::string> uuids;

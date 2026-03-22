@@ -480,6 +480,23 @@ static std::vector<uint8_t> BuildRouteAllResultFrame(
     return tnt::BuildIprotoOkFrame(sync, kSchemaVersion, body.data(), body.size());
 }
 
+static std::vector<uint8_t> BuildRouteResultFrame(
+    uint64_t sync, std::string_view uuid) {
+    std::vector<uint8_t> inner;
+    inner.reserve(uuid.size() + 16);
+    tnt::EncodeFixMap(inner, 1);
+    tnt::EncodeStr(inner, "uuid");
+    tnt::EncodeStr(inner, uuid);
+
+    std::vector<uint8_t> body;
+    body.reserve(3 + inner.size());
+    tnt::EncodeFixMap(body, 1);
+    body.push_back(static_cast<uint8_t>(Iproto::DATA));
+    tnt::EncodeArray(body, 1);
+    body.insert(body.end(), inner.begin(), inner.end());
+    return tnt::BuildIprotoOkFrame(sync, kSchemaVersion, body.data(), body.size());
+}
+
 static bool IsConnectivityErrorMessage(std::string_view message) {
     return message.find("Error while establishing connection") !=
                std::string_view::npos ||
@@ -764,6 +781,37 @@ static void HandleConnection(engine::io::Socket sock,
                         ? proxy.ComputeBucketId(key->str_val)
                         : proxy.ComputeBucketId(key->int_val);
                     const auto resp = BuildUint32ResultFrame(req.sync, bid);
+                    (void)sock.SendAll(resp.data(), resp.size(), engine::Deadline{});
+                    continue;
+
+                } else if (body->func_name == "vshard.router.bucket_id_strcrc32") {
+                    const auto key = ReadTupleFirstKey(
+                        body->tuple_begin, body->tuple_len);
+                    if (!key || !key->is_string) {
+                        const auto resp = tnt::BuildIprotoErrorFrame(
+                            req.sync, kSchemaVersion,
+                            "bad bucket_id_strcrc32 args: expected [string_key]");
+                        (void)sock.SendAll(resp.data(), resp.size(), engine::Deadline{});
+                        continue;
+                    }
+                    const uint32_t bid = proxy.ComputeBucketId(key->str_val);
+                    const auto resp = BuildUint32ResultFrame(req.sync, bid);
+                    (void)sock.SendAll(resp.data(), resp.size(), engine::Deadline{});
+                    continue;
+
+                } else if (body->func_name == "vshard.router.route") {
+                    const auto key = ReadTupleFirstKey(
+                        body->tuple_begin, body->tuple_len);
+                    if (!key || key->is_string || key->int_val < 1) {
+                        const auto resp = tnt::BuildIprotoErrorFrame(
+                            req.sync, kSchemaVersion,
+                            "bad route args: expected [bucket_id]");
+                        (void)sock.SendAll(resp.data(), resp.size(), engine::Deadline{});
+                        continue;
+                    }
+                    const auto uuid = proxy.Route(
+                        static_cast<BucketId>(key->int_val));
+                    const auto resp = BuildRouteResultFrame(req.sync, uuid);
                     (void)sock.SendAll(resp.data(), resp.size(), engine::Deadline{});
                     continue;
 

@@ -168,6 +168,9 @@ class VshardProxy final {
 
     uint32_t GetBucketCount() const noexcept;
 
+    /// Resolve a bucket to its current replicaset UUID.
+    std::string Route(BucketId bucket_id);
+
     /// Return the UUIDs of all known replicasets from the current routing table.
     /// Used by vshard.router.routeall handler.
     std::vector<std::string> GetReplicasetUUIDs() const;
