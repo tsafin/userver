@@ -544,22 +544,124 @@ std::vector<formats::msgpack::Value> VshardProxy::MapCallRW(
     storages::tarantool::OptionalCommandControl cc) {
 
     auto snapshot = routing_table_.Read();
-    std::vector<engine::TaskWithResult<formats::msgpack::Value>> tasks;
-    tasks.reserve(snapshot->replicasets.size());
+    const auto& replicasets = snapshot->replicasets;
+    const auto num_rs = replicasets.size();
+    if (num_rs == 0) {
+        throw VshardException{"MapCallRW: no replicasets available"};
+    }
 
-    // Serialize args once; each task will reconstruct from raw bytes.
-    auto args_bytes = std::move(args).ToBytes();
+    // Build deadline (Lua default: CALL_TIMEOUT_MIN = 0.5s)
+    const auto timeout_ms = cc ? cc->execute : std::chrono::milliseconds{500};
+    const auto deadline = engine::Deadline::FromDuration(timeout_ms);
+
+    // Allocate a unique ref ID for this map-reduce operation
+    const uint64_t rid = ref_id_.fetch_add(1, std::memory_order_relaxed);
+
+    // Serialize user args once for sharing across tasks
+    auto user_args_bytes = std::move(args).ToBytes();
     const std::string func_str{func};
 
-    for (const auto& rs_ptr : snapshot->replicasets) {
+    // Helper: build unref query and send to all RS (best-effort)
+    auto unref_all = [&replicasets, rid, &cc]() {
+        auto ua = formats::msgpack::ValueBuilder::Array();
+        ua.PushBack(formats::msgpack::ValueBuilder{"storage_unref"});
+        ua.PushBack(formats::msgpack::ValueBuilder{static_cast<int64_t>(rid)});
+        auto unref_q = storages::tarantool::Query::WithRawArgs(
+            storages::tarantool::Query::Type::kCall,
+            "vshard.storage._call",
+            std::move(ua).ToBytes());
+        for (const auto& rs_ptr : replicasets) {
+            try {
+                rs_ptr->Execute(impl::CallMode::kReadWrite, unref_q, cc);
+            } catch (...) {}
+        }
+    };
+
+    // --- Ref stage: acquire refs on all RS masters ---
+    // Calls vshard.storage._call('storage_ref', rid, timeout) on each RS.
+    // This blocks the rebalancer from moving buckets during the map phase.
+    {
+        const double timeout_secs =
+            std::chrono::duration<double>(deadline.TimeLeft()).count();
+
+        auto ra = formats::msgpack::ValueBuilder::Array();
+        ra.PushBack(formats::msgpack::ValueBuilder{"storage_ref"});
+        ra.PushBack(formats::msgpack::ValueBuilder{static_cast<int64_t>(rid)});
+        ra.PushBack(formats::msgpack::ValueBuilder{timeout_secs});
+        auto ref_query = storages::tarantool::Query::WithRawArgs(
+            storages::tarantool::Query::Type::kCall,
+            "vshard.storage._call",
+            std::move(ra).ToBytes());
+
+        std::vector<engine::TaskWithResult<void>> ref_tasks;
+        ref_tasks.reserve(num_rs);
+        for (const auto& rs_ptr : replicasets) {
+            auto* rs = rs_ptr.get();
+            ref_tasks.emplace_back(utils::Async(
+                "vshard_ref",
+                [rs, &ref_query, &cc]() {
+                    rs->Execute(impl::CallMode::kReadWrite, ref_query, cc);
+                }));
+        }
+
+        try {
+            for (auto& t : ref_tasks) {
+                t.Get();
+            }
+        } catch (...) {
+            unref_all();
+            throw;
+        }
+    }
+
+    // --- Map stage: execute user function on all RS ---
+    // Calls vshard.storage._call('storage_map', rid, func, args) on each RS.
+    // Build raw msgpack: fixarray(4) + 'storage_map' + rid + func + user_args
+    std::vector<uint8_t> map_query_bytes;
+    {
+        using namespace storages::tarantool::impl::msgpack_scan;
+        // array header (4 elements)
+        map_query_bytes.push_back(mp::kFixArrayMin | 4);
+        // 'storage_map' (11 chars)
+        map_query_bytes.push_back(mp::kFixStrMin | 11);
+        const char* sm = "storage_map";
+        map_query_bytes.insert(map_query_bytes.end(), sm, sm + 11);
+        // rid as uint64
+        map_query_bytes.push_back(mp::kUint64);
+        for (int i = 7; i >= 0; --i)
+            map_query_bytes.push_back(static_cast<uint8_t>(rid >> (i * 8)));
+        // func name
+        const auto flen = func_str.size();
+        if (flen <= 31) {
+            map_query_bytes.push_back(
+                static_cast<uint8_t>(mp::kFixStrMin | flen));
+        } else {
+            map_query_bytes.push_back(mp::kStr16);
+            map_query_bytes.push_back(static_cast<uint8_t>(flen >> 8));
+            map_query_bytes.push_back(static_cast<uint8_t>(flen));
+        }
+        map_query_bytes.insert(map_query_bytes.end(),
+                               func_str.data(), func_str.data() + flen);
+        // user args: already a valid msgpack value, embed verbatim
+        map_query_bytes.insert(map_query_bytes.end(),
+                               user_args_bytes.begin(), user_args_bytes.end());
+    }
+
+    std::vector<engine::TaskWithResult<formats::msgpack::Value>> map_tasks;
+    map_tasks.reserve(num_rs);
+
+    for (const auto& rs_ptr : replicasets) {
         auto* rs = rs_ptr.get();
-        tasks.emplace_back(utils::Async(
+        map_tasks.emplace_back(utils::Async(
             "vshard_map_call",
-            [rs, &func_str, &args_bytes, &cc]() -> formats::msgpack::Value {
+            [rs, &map_query_bytes, &cc]()
+                -> formats::msgpack::Value {
                 auto q = storages::tarantool::Query::WithRawArgs(
                     storages::tarantool::Query::Type::kCall,
-                    func_str, args_bytes);
-                const auto raw = rs->Execute(impl::CallMode::kReadWrite, q, cc);
+                    "vshard.storage._call",
+                    map_query_bytes);
+                const auto raw =
+                    rs->Execute(impl::CallMode::kReadWrite, q, cc);
                 const auto env = impl::DecodeEnvelope(raw);
                 if (!env.vshard_error.IsNull()) {
                     throw VshardStorageError{
@@ -571,10 +673,23 @@ std::vector<formats::msgpack::Value> VshardProxy::MapCallRW(
             }));
     }
 
+    // Collect map results
     std::vector<formats::msgpack::Value> results;
-    results.reserve(tasks.size());
-    for (auto& t : tasks) {
-        results.push_back(t.Get());
+    results.reserve(num_rs);
+    std::exception_ptr map_error;
+    for (auto& t : map_tasks) {
+        try {
+            results.push_back(t.Get());
+        } catch (...) {
+            if (!map_error) map_error = std::current_exception();
+        }
+    }
+
+    // --- Unref stage: release refs on all RS (always, even on error) ---
+    unref_all();
+
+    if (map_error) {
+        std::rethrow_exception(map_error);
     }
     return results;
 }

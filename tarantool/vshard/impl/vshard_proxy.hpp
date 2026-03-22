@@ -231,6 +231,7 @@ class VshardProxy final {
 
     utils::PeriodicTask refresh_task_;
     std::chrono::steady_clock::time_point last_moved_refresh_{};
+    std::atomic<uint64_t> ref_id_{1};  ///< monotonic ref ID for map-reduce protocol
 };
 
 }  // namespace storages::tarantool::vshard
