@@ -240,6 +240,12 @@ Connection::Connection(clients::dns::Resolver& resolver,
 
     DoAuth(auth, connect_deadline, salt_b64);
 
+    // Pre-reserve the pending map to the expected steady-state concurrency.
+    // This avoids rehashing under load when many requests are in-flight at
+    // once.  128 covers typical pool-size × pipeline-depth without wasting
+    // significant memory.
+    pending_.reserve(128);
+
     // Start flush + reader background tasks – must be last (after auth).
     flush_task_ = engine::AsyncNoSpan([this] { FlushLoop(); });
     reader_task_ = engine::AsyncNoSpan([this] { ReaderLoop(); });
@@ -446,6 +452,12 @@ void Connection::FlushLoop() {
                 std::lock_guard lock(staging_mutex_);
                 if (staging_buf_.empty()) break;
                 to_send = std::move(staging_buf_);
+                // Reclaim capacity so the next batch of senders does not
+                // trigger a reallocation when appending into the now-empty
+                // staging_buf_.  The reserve is intentionally inside the lock
+                // so no sender observes zero capacity between the move and the
+                // reserve, which would force it to allocate independently.
+                staging_buf_.reserve(to_send.capacity());
             }
 
             if (broken_.load(std::memory_order_acquire)) {
