@@ -75,7 +75,7 @@ class Connection final {
   ~Connection();
 
   /// Synchronous execute: sends the request AND waits for the response.
-  /// Convenience wrapper around ExecuteAsync().
+  /// Uses the SyncPendingEntry path — no Future/Promise allocation.
   ExecutionResult Execute(engine::Deadline deadline, const Query& query);
 
   /// Asynchronous execute: sends the request and returns a Future that
@@ -109,6 +109,39 @@ class Connection final {
     return broken_.load(std::memory_order_acquire);
   }
 
+  // ---- Sync pipelining API -------------------------------------------------
+  //
+  // Each Sync* method registers a SyncPendingEntry, stages the encoded frame,
+  // and returns the entry handle immediately.  The caller releases its pool
+  // slot *before* calling CollectSyncEntry(), so the connection remains
+  // available for other concurrent coroutines while waiting for the response
+  // (pipelining preserved, Future/Promise allocation eliminated).
+  //
+  // Typical Pool usage:
+  //
+  //   auto entry = conn->SyncExecute(deadline, query);
+  //   conn_ptr.reset();   // release pool slot → other fibers can reuse conn
+  //   return Connection::CollectSyncEntry(std::move(entry), deadline);
+
+  std::shared_ptr<SyncPendingEntry> SyncExecute(
+      engine::Deadline deadline, const Query& query);
+
+  std::shared_ptr<SyncPendingEntry> SyncForwardStorageCall(
+      const CallRouteInfo& info, engine::Deadline deadline);
+
+  std::shared_ptr<SyncPendingEntry> SyncForwardVshardCall(
+      uint32_t bucket_id, uint8_t mode,
+      const uint8_t* body, std::size_t body_len,
+      engine::Deadline deadline);
+
+  std::shared_ptr<SyncPendingEntry> SyncPing(engine::Deadline deadline);
+
+  /// Wait for a previously registered SyncPendingEntry to be delivered.
+  /// Safe to call after the pool slot has been released.  On timeout sets
+  /// entry->abandoned so a late ReaderLoop delivery is safely discarded.
+  static ExecutionResult CollectSyncEntry(std::shared_ptr<SyncPendingEntry> entry,
+                                          engine::Deadline deadline);
+
  private:
   void DoAuth(const AuthSettings& auth, engine::Deadline deadline,
               const std::string& salt_b64);
@@ -117,12 +150,26 @@ class Connection final {
   uint32_t ResolveSpaceId(const std::string& space_name,
                           engine::Deadline deadline);
 
+  /// Shared body-building logic for ExecuteAsync and SyncExecute.
+  /// Resolves the space ID if needed, builds the msgpack body, and returns
+  /// (request_type, body).
+  std::pair<uint32_t, std::vector<uint8_t>> BuildQueryBody(
+      engine::Deadline deadline, const Query& query);
+
   /// Core async pipelining primitive: registers an AsyncPendingEntry, stages
   /// the encoded frame into staging_buf_, and signals the flush coroutine.
   /// The returned Future resolves once the reader task delivers the response.
   engine::Future<ExecutionResult> SendAndRegister(engine::Deadline deadline,
                                                   uint32_t request_type,
                                                   std::vector<uint8_t> body);
+
+  /// Core sync pipelining primitive: registers a SyncPendingEntry, stages the
+  /// encoded frame, and signals the flush coroutine.  Returns an alias
+  /// shared_ptr<SyncPendingEntry> sharing ownership with the pending_ map
+  /// entry.  The caller must call CollectSyncEntry() to wait for the result.
+  std::shared_ptr<SyncPendingEntry> StageSyncRequest(engine::Deadline deadline,
+                                                      uint32_t request_type,
+                                                      std::vector<uint8_t> body);
 
   void FlushLoop();
 

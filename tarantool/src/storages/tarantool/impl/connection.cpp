@@ -18,6 +18,7 @@
 #include <userver/engine/io/sockaddr.hpp>
 #include <userver/engine/io/socket.hpp>
 #include <userver/engine/sleep.hpp>
+#include <userver/engine/task/cancel.hpp>
 #include <userver/formats/msgpack/value.hpp>
 #include <userver/logging/log.hpp>
 #include <userver/tracing/span.hpp>
@@ -671,9 +672,9 @@ uint32_t Connection::ResolveSpaceId(const std::string& space_name,
     return space_id;
 }
 
-// ---- ExecuteAsync ----
+// ---- Query body builder (shared by ExecuteAsync and SyncExecute) ----
 
-engine::Future<ExecutionResult> Connection::ExecuteAsync(
+std::pair<uint32_t, std::vector<uint8_t>> Connection::BuildQueryBody(
         engine::Deadline deadline, const Query& query) {
     uint32_t space_id = 0;
     if (query.GetType() != Query::Type::kCall) {
@@ -748,7 +749,14 @@ engine::Future<ExecutionResult> Connection::ExecuteAsync(
             break;
         }
     }
+    return {request_type, std::move(body)};
+}
 
+// ---- ExecuteAsync ----
+
+engine::Future<ExecutionResult> Connection::ExecuteAsync(
+        engine::Deadline deadline, const Query& query) {
+    auto [request_type, body] = BuildQueryBody(deadline, query);
     return SendAndRegister(deadline, request_type, std::move(body));
 }
 
@@ -756,14 +764,7 @@ engine::Future<ExecutionResult> Connection::ExecuteAsync(
 
 ExecutionResult Connection::Execute(engine::Deadline deadline,
                                     const Query& query) {
-    auto future = ExecuteAsync(deadline, query);
-    const auto status = future.wait_until(deadline);
-    if (status == engine::FutureStatus::kTimeout)
-        throw TarantoolException{"execute deadline expired"};
-    if (status == engine::FutureStatus::kCancelled)
-        throw engine::TaskCancelledException{
-            engine::TaskCancellationReason::kUserRequest};
-    return future.get();
+    return CollectSyncEntry(SyncExecute(deadline, query), deadline);
 }
 
 // ---- Ping ----
@@ -799,17 +800,185 @@ engine::Future<ExecutionResult> Connection::PingAsync(engine::Deadline deadline)
 }
 
 void Connection::Ping(engine::Deadline deadline) {
-    auto future = PingAsync(deadline);
-    const auto status = future.wait_until(deadline);
-    if (status != engine::FutureStatus::kReady) {
-        broken_.store(true, std::memory_order_release);
-        throw TarantoolException{"ping timeout or cancelled"};
-    }
-    auto result = future.get();
+    auto result = CollectSyncEntry(SyncPing(deadline), deadline);
     if (!result.IsOk()) {
         broken_.store(true, std::memory_order_release);
         throw TarantoolException{"ping returned error"};
     }
+}
+
+// ---- Sync pipelining primitives (Phase 3) ----------------------------------
+
+// StageSyncRequest — allocates a SyncPendingEntry via make_shared<PendingEntry>,
+// registers it in pending_, stages the encoded frame into staging_buf_, and
+// signals the flush coroutine.  Returns an alias shared_ptr<SyncPendingEntry>
+// that shares ownership with the pending_ map entry via the aliasing constructor.
+//
+// Ownership at return:
+//   - pending_[sync_id]  → shared_ptr<PendingEntry>  (ref count 2)
+//   - returned handle    → shared_ptr<SyncPendingEntry> (same ctrl block, ref count 2)
+// When the caller calls CollectSyncEntry() the entry is moved out of pending_
+// by ReaderLoop, dropping that reference.  The caller's handle is the last ref
+// and the object is destroyed when CollectSyncEntry() returns.
+std::shared_ptr<SyncPendingEntry> Connection::StageSyncRequest(
+        engine::Deadline deadline,
+        uint32_t request_type,
+        std::vector<uint8_t> body) {
+    if (deadline.IsReached()) {
+        throw TarantoolException{"Request deadline exceeded before send"};
+    }
+
+    // Construct the variant in-place (SyncPendingEntry is not movable).
+    auto owner = std::make_shared<PendingEntry>(
+        std::in_place_type<SyncPendingEntry>);
+    auto* raw = std::get_if<SyncPendingEntry>(owner.get());
+    // Aliasing constructor: shares owner's ref count, points to the sub-object.
+    std::shared_ptr<SyncPendingEntry> handle{owner, raw};
+
+    const uint64_t sync_id = ++sync_counter_;
+    {
+        std::lock_guard lock(pending_mutex_);
+        pending_.emplace(sync_id, std::move(owner));
+    }
+
+    {
+        std::lock_guard lock(staging_mutex_);
+        const auto prehdr_pos = staging_buf_.size();
+        staging_buf_.resize(prehdr_pos + 5);
+        BuildHeader(staging_buf_, request_type, sync_id);
+        staging_buf_.insert(staging_buf_.end(), body.begin(), body.end());
+        const uint32_t len =
+            static_cast<uint32_t>(staging_buf_.size() - prehdr_pos - 5);
+        staging_buf_[prehdr_pos]     = 0xce;
+        staging_buf_[prehdr_pos + 1] = static_cast<uint8_t>(len >> 24);
+        staging_buf_[prehdr_pos + 2] = static_cast<uint8_t>(len >> 16);
+        staging_buf_[prehdr_pos + 3] = static_cast<uint8_t>(len >> 8);
+        staging_buf_[prehdr_pos + 4] = static_cast<uint8_t>(len);
+    }
+    flush_event_.Send();
+
+    return handle;
+}
+
+std::shared_ptr<SyncPendingEntry> Connection::SyncExecute(
+        engine::Deadline deadline, const Query& query) {
+    auto [request_type, body] = BuildQueryBody(deadline, query);
+    return StageSyncRequest(deadline, request_type, std::move(body));
+}
+
+std::shared_ptr<SyncPendingEntry> Connection::SyncForwardStorageCall(
+        const CallRouteInfo& info, engine::Deadline deadline) {
+    const std::size_t tuple_size =
+        static_cast<std::size_t>(info.tuple_end - info.tuple_begin);
+    std::vector<uint8_t> body;
+    body.reserve(sizeof(kStorageCallBodyPrefix) + tuple_size);
+    body.insert(body.end(),
+                kStorageCallBodyPrefix,
+                kStorageCallBodyPrefix + sizeof(kStorageCallBodyPrefix));
+    body.insert(body.end(), info.tuple_begin, info.tuple_end);
+    return StageSyncRequest(deadline, kIprotoCall, std::move(body));
+}
+
+// SyncForwardVshardCall stages directly into staging_buf_ — no intermediate
+// body vector — matching the zero-allocation property of ForwardVshardCallAsync.
+std::shared_ptr<SyncPendingEntry> Connection::SyncForwardVshardCall(
+        uint32_t bucket_id, uint8_t mode,
+        const uint8_t* body, std::size_t body_len,
+        engine::Deadline deadline) {
+    if (broken_.load(std::memory_order_acquire)) {
+        throw TarantoolException{"connection is broken"};
+    }
+    if (deadline.IsReached()) {
+        throw TarantoolException{"Request deadline exceeded before send"};
+    }
+
+    auto owner = std::make_shared<PendingEntry>(
+        std::in_place_type<SyncPendingEntry>);
+    auto* raw = std::get_if<SyncPendingEntry>(owner.get());
+    std::shared_ptr<SyncPendingEntry> handle{owner, raw};
+
+    const uint64_t sync_id = ++sync_counter_;
+    {
+        std::lock_guard lock(pending_mutex_);
+        pending_.emplace(sync_id, std::move(owner));
+    }
+
+    {
+        std::lock_guard lock(staging_mutex_);
+        const auto prehdr_pos = staging_buf_.size();
+        staging_buf_.resize(prehdr_pos + 5);
+
+        EncodeFixMap(staging_buf_, 4);
+        EncodeUint(staging_buf_, kKeyCode);           EncodeUint(staging_buf_, kIprotoVshardCall);
+        EncodeUint(staging_buf_, kKeySync);           EncodeUint(staging_buf_, sync_id);
+        EncodeUint(staging_buf_, kKeyVshardBucketId); EncodeUint(staging_buf_, uint64_t{bucket_id});
+        EncodeUint(staging_buf_, kKeyVshardMode);     EncodeUint(staging_buf_, uint64_t{mode});
+
+        staging_buf_.insert(staging_buf_.end(), body, body + body_len);
+
+        const uint32_t len =
+            static_cast<uint32_t>(staging_buf_.size() - prehdr_pos - 5);
+        staging_buf_[prehdr_pos]     = 0xce;
+        staging_buf_[prehdr_pos + 1] = static_cast<uint8_t>(len >> 24);
+        staging_buf_[prehdr_pos + 2] = static_cast<uint8_t>(len >> 16);
+        staging_buf_[prehdr_pos + 3] = static_cast<uint8_t>(len >> 8);
+        staging_buf_[prehdr_pos + 4] = static_cast<uint8_t>(len);
+    }
+    flush_event_.Send();
+
+    return handle;
+}
+
+std::shared_ptr<SyncPendingEntry> Connection::SyncPing(
+        engine::Deadline deadline) {
+    if (deadline.IsReached()) {
+        throw TarantoolException{"Request deadline exceeded before send"};
+    }
+
+    auto owner = std::make_shared<PendingEntry>(
+        std::in_place_type<SyncPendingEntry>);
+    auto* raw = std::get_if<SyncPendingEntry>(owner.get());
+    std::shared_ptr<SyncPendingEntry> handle{owner, raw};
+
+    const uint64_t sync_id = ++sync_counter_;
+    {
+        std::lock_guard lock(pending_mutex_);
+        pending_.emplace(sync_id, std::move(owner));
+    }
+
+    // PING frames are fixed-size — stage pre-built bytes directly.
+    const auto frame = BuildPingFrame(sync_id);
+    {
+        std::lock_guard lock(staging_mutex_);
+        staging_buf_.insert(staging_buf_.end(), frame.begin(), frame.end());
+        staging_buf_.reserve(staging_buf_.capacity());  // no-op; keeps capacity
+    }
+    flush_event_.Send();
+
+    return handle;
+}
+
+// CollectSyncEntry — waits on the SyncPendingEntry event and returns the
+// result, or throws on timeout/cancellation.  Does NOT require a Connection
+// reference; safe to call after the pool slot has been released.
+//
+// Timeout handling: sets abandoned=true so a late ReaderLoop delivery is
+// silently discarded.  The pending_ map entry is cleaned up by ReaderLoop
+// when the response eventually arrives (or by WakeAllPending on conn break).
+// static
+ExecutionResult Connection::CollectSyncEntry(
+        std::shared_ptr<SyncPendingEntry> entry,
+        engine::Deadline deadline) {
+    const bool signalled = entry->ready.WaitForEventUntil(deadline);
+    if (!signalled) {
+        entry->abandoned.store(true, std::memory_order_release);
+        // CancellationPoint() throws TaskCancelledException if the task was
+        // cancelled; if it returns, the failure was a genuine deadline expiry.
+        engine::current_task::CancellationPoint();
+        throw TarantoolException{"sync request deadline expired"};
+    }
+    if (entry->exc) std::rethrow_exception(entry->exc);
+    return std::move(entry->result);
 }
 
 }  // namespace storages::tarantool::impl
