@@ -390,19 +390,24 @@ void Connection::ReaderLoop() {
                                    std::move(error_info)};
 
             // Dispatch to the waiting coroutine
-            engine::Promise<ExecutionResult> promise;
-            bool found = false;
+            std::shared_ptr<PendingEntry> entry;
             {
                 std::lock_guard lock(pending_mutex_);
                 auto it = pending_.find(sync_id);
                 if (it != pending_.end()) {
-                    promise = std::move(it->second);
+                    entry = std::move(it->second);
                     pending_.erase(it);
-                    found = true;
                 }
             }
-            if (found) {
-                promise.set_value(std::move(result));
+            if (entry) {
+                if (auto* a = std::get_if<AsyncPendingEntry>(entry.get())) {
+                    a->promise.set_value(std::move(result));
+                } else if (auto* s = std::get_if<SyncPendingEntry>(entry.get())) {
+                    if (!s->abandoned.load(std::memory_order_acquire)) {
+                        s->result = std::move(result);
+                        s->ready.Send();
+                    }
+                }
             }
         }
     } catch (const engine::io::IoCancelled&) {
@@ -418,14 +423,21 @@ void Connection::ReaderLoop() {
 }
 
 void Connection::WakeAllPending(std::exception_ptr ex) {
-    std::unordered_map<uint64_t, engine::Promise<ExecutionResult>> pending;
+    std::unordered_map<uint64_t, std::shared_ptr<PendingEntry>> pending;
     {
         std::lock_guard lock(pending_mutex_);
         pending = std::move(pending_);
     }
-    for (auto& [id, p] : pending) {
+    for (auto& [id, entry] : pending) {
         try {
-            p.set_exception(ex);
+            if (auto* a = std::get_if<AsyncPendingEntry>(entry.get())) {
+                a->promise.set_exception(ex);
+            } else if (auto* s = std::get_if<SyncPendingEntry>(entry.get())) {
+                if (!s->abandoned.load(std::memory_order_acquire)) {
+                    s->exc = ex;
+                    s->ready.Send();
+                }
+            }
         } catch (...) {}
     }
 }
@@ -507,7 +519,8 @@ engine::Future<ExecutionResult> Connection::SendAndRegister(
     const uint64_t sync_id = ++sync_counter_;
     {
         std::lock_guard lock(pending_mutex_);
-        pending_.emplace(sync_id, std::move(promise));
+        pending_.emplace(sync_id, std::make_shared<PendingEntry>(
+            AsyncPendingEntry{std::move(promise)}));
     }
 
     // Build the IPROTO frame directly into staging_buf_ — two-phase approach:
@@ -576,7 +589,8 @@ engine::Future<ExecutionResult> Connection::ForwardVshardCallAsync(
     const uint64_t sync_id = ++sync_counter_;
     {
         std::lock_guard lock(pending_mutex_);
-        pending_.emplace(sync_id, std::move(promise));
+        pending_.emplace(sync_id, std::make_shared<PendingEntry>(
+            AsyncPendingEntry{std::move(promise)}));
     }
 
     // IPROTO_VSHARD_CALL frame: preheader(5) + header(fixmap(4) ~21 bytes) + body.
@@ -767,7 +781,8 @@ engine::Future<ExecutionResult> Connection::PingAsync(engine::Deadline deadline)
     const uint64_t sync_id = ++sync_counter_;
     {
         std::lock_guard lock(pending_mutex_);
-        pending_.emplace(sync_id, std::move(promise));
+        pending_.emplace(sync_id, std::make_shared<PendingEntry>(
+            AsyncPendingEntry{std::move(promise)}));
     }
 
     // PING frames are always 18 bytes (fixed layout: see iproto_frames.hpp).

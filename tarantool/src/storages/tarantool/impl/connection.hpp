@@ -4,6 +4,7 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <variant>
 #include <vector>
 
 #include <userver/clients/dns/resolver_fwd.hpp>
@@ -24,6 +25,40 @@
 USERVER_NAMESPACE_BEGIN
 
 namespace storages::tarantool::impl {
+
+// ---- Pending-request entry types ----------------------------------------
+//
+// Each in-flight IPROTO request registers one PendingEntry in pending_.
+// Phase 2 introduces two completion modes:
+//
+//   AsyncPendingEntry — used by ExecuteAsync / ForwardVshardCallAsync.
+//     The reader task calls promise.set_value() or set_exception() to wake
+//     the waiting coroutine via its Future.
+//
+//   SyncPendingEntry — used by SendAndWait (Phase 3+).
+//     The reader task writes directly into result/exc and fires a
+//     SingleConsumerEvent.  No heap-allocated future state is involved.
+//     Lifetime is managed by shared_ptr so late responses from the reader
+//     are safe even after the caller has timed out.
+
+struct AsyncPendingEntry {
+    engine::Promise<ExecutionResult> promise;
+};
+
+struct SyncPendingEntry {
+    ExecutionResult result;
+    std::exception_ptr exc;
+    engine::SingleConsumerEvent ready;
+    /// Set by the caller on timeout/cancellation to tell the reader to
+    /// discard any late delivery rather than touching the freed result.
+    std::atomic<bool> abandoned{false};
+
+    SyncPendingEntry() = default;
+    SyncPendingEntry(const SyncPendingEntry&) = delete;
+    SyncPendingEntry& operator=(const SyncPendingEntry&) = delete;
+};
+
+using PendingEntry = std::variant<AsyncPendingEntry, SyncPendingEntry>;
 
 /// @brief Owns an engine::io::Socket with full IPROTO pipelining support.
 ///
@@ -82,10 +117,9 @@ class Connection final {
   uint32_t ResolveSpaceId(const std::string& space_name,
                           engine::Deadline deadline);
 
-  /// Core pipelining primitive: registers a pending entry, stages the encoded
-  /// frame, and either flushes it immediately (if this coroutine wins the CAS
-  /// for the flush role) or lets a concurrent flusher carry it along.  The
-  /// returned Future resolves once the reader task delivers the response.
+  /// Core async pipelining primitive: registers an AsyncPendingEntry, stages
+  /// the encoded frame into staging_buf_, and signals the flush coroutine.
+  /// The returned Future resolves once the reader task delivers the response.
   engine::Future<ExecutionResult> SendAndRegister(engine::Deadline deadline,
                                                   uint32_t request_type,
                                                   std::vector<uint8_t> body);
@@ -114,8 +148,8 @@ class Connection final {
 
   /// Guards the pending_ map.
   engine::Mutex pending_mutex_;
-  /// In-flight requests: sync_id → promise waiting for the response.
-  std::unordered_map<uint64_t, engine::Promise<ExecutionResult>> pending_;
+  /// In-flight requests: sync_id → shared pending entry (async or sync waiter).
+  std::unordered_map<uint64_t, std::shared_ptr<PendingEntry>> pending_;
 
   /// Background flush task: drains staging_buf_ and sends to socket.
   /// Declared before reader_task_ so it is SyncCancel'd first in ~Connection.
