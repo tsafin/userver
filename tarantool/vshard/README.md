@@ -367,20 +367,22 @@ Environment variables:
 ### Benchmark results (WSL2, loopback, 100k ops)
 
 See [`bench/benchmark_results.md`](bench/benchmark_results.md) for full history.
-Full scalability sweep (Round 6, 2026-03-22):
+Full scalability sweep (2026-03-25, after hot-path optimizations):
 
-| Fibers | Lua router (ops/sec) | C++ proxy (ops/sec) | vs Lua | C++ in-process (ops/sec) |
-|-------:|---------------------:|--------------------:|-------:|-------------------------:|
-| 10 | 8,680 | 10,150 | **+17%** | 22,410 |
-| 20 | 13,879 | 16,744 | **+21%** | 39,816 |
-| 50 | 24,771 | 27,187 | **+10%** | 80,094 |
-| 100 | 31,283 | 34,654 | **+11%** | 123,174 |
-| 150 | 33,232 | 36,125 | **+9%** | 153,113 |
+| Fibers | Lua router (ops/sec) | C++ proxy (ops/sec) | vs Lua |
+|-------:|---------------------:|--------------------:|-------:|
+| 10 | 9,409 | 11,117 | **+18%** |
+| 20 | 15,375 | 18,313 | **+19%** |
+| 50 | 24,355 | 29,064 | **+19%** |
+| 100 | 33,938 | 35,734 | **+5%** |
+| 150 | 37,338 | 42,588 | **+14%** |
+
+C++ in-process (embedded library, 150 fibers): **185,375 op/s RW / 175,486 op/s RO** — **3.7× faster** than the Lua router.
 
 Key observations:
-- The **C++ proxy** is consistently **9–21% faster** than the Lua vshard router at all concurrency levels.
-- Both the Lua router and the C++ proxy saturate at ~33–36k op/s above 100 fibers — the **Tarantool storage RTT is the bottleneck**, not the router.
-- The **C++ in-process library** (no proxy hop, no extra loopback) keeps scaling linearly, reaching **153k op/s** at 150 fibers — **3–4.6× faster** than the Lua router.
+- The **C++ proxy** is consistently **14–19% faster** than the Lua vshard router at all concurrency levels.
+- Both the Lua router and the C++ proxy saturate at ~33–42k op/s above 100 fibers — the **Tarantool storage RTT is the bottleneck**, not the router.
+- The **C++ in-process library** (no proxy hop, no extra loopback) reaches **185k op/s** at 150 fibers — **~3.7× faster** than the Lua router.
 
 ### Option C — Automated benchmark via CMake target
 
