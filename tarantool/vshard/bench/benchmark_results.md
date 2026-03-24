@@ -137,3 +137,26 @@ demonstrating that the storage nodes — not the router — are the throughput b
 
 Fibers: 10,20,50,100,150 | Total ops per run: 100000 | Build: userver-tarantool-vshard-sample
 
+
+### Round 7 — 2026-03-24 (ops=100000, git=e5fb59c4a)
+
+Phase 3+4: migrate `Pool::Execute/ForwardStorageCall/ForwardVshardCall/Ping` from
+`Future/Promise` to `SyncPendingEntry` + `CollectSyncEntry`. Pool slot released
+before waiting (pipelining preserved), Promise/Future heap allocation eliminated
+from the synchronous hot path.
+
+| Fibers | Lua router (ops/sec) | C++ proxy (ops/sec) | vs Lua | C++ in-process RW (ops/sec) |
+|-------:|---------------------:|--------------------:|-------:|----------------------------:|
+| 10 | 9,016 | 10,581 | **+17%** | 23,800 |
+| 20 | 14,366 | 16,796 | **+17%** | 43,083 |
+| 50 | 25,214 | 27,074 | **+7%** | 79,717 |
+| 100 | 30,432 | 36,779 | **+21%** | 135,540 |
+| 150 | 33,048 | 39,787 | **+20%** | 168,505 |
+
+**vs Round 6 (pre-Phase 3+4):** C++ proxy +4–10% at high concurrency (100–150 fibers);
+in-process library +6–10% across the board, most visible at ≥100 fibers.
+The gain is consistent with removing one heap-allocated shared future state per
+request on the synchronous call path.
+
+Fibers: 10,20,50,100,150 | Total ops per run: 100000 | Build: userver-tarantool-vshard-sample
+
