@@ -2,8 +2,6 @@
 
 #include <userver/clients/dns/resolver.hpp>
 #include <userver/engine/deadline.hpp>
-#include <userver/engine/future_status.hpp>
-#include <userver/engine/task/cancel.hpp>
 #include <userver/tracing/span.hpp>
 #include <userver/tracing/tags.hpp>
 
@@ -57,37 +55,21 @@ ExecutionResult Pool::Execute(OptionalCommandControl cc, const Query& query) {
                               : impl_->GetStatistics().crud;
     ++req_stats.total;
 
-    // Phase 1: Acquire the pool slot, send the request, then immediately
-    // release the pool slot (pipelining). Releasing before wait_until allows
-    // the same connection to carry multiple in-flight requests concurrently:
-    // the reader task demultiplexes responses by sync_id, so each Future is
-    // resolved independently. bounded_push always succeeds here because the
-    // total in-pool + given-away count never exceeds max_pool_size.
-    engine::Future<ExecutionResult> fut;
+    // Stage the request and release the pool slot before waiting (pipelining):
+    // the reader task demultiplexes responses by sync_id, so the connection can
+    // carry many in-flight requests concurrently without Future/Promise overhead.
+    std::shared_ptr<SyncPendingEntry> entry;
     try {
         auto conn_ptr = std::make_unique<ConnectionPtr>(impl_->Acquire(deadline));
-        fut = (*conn_ptr)->ExecuteAsync(deadline, query);
+        entry = (*conn_ptr)->SyncExecute(deadline, query);
         conn_ptr.reset();  // return connection to pool immediately (pipelining)
     } catch (...) {
         ++req_stats.error;
         throw;
     }
 
-    // Phase 2: Wait for response. The pool slot is already free; other
-    // coroutines can reuse the same connection while we wait.
-    const auto status = fut.wait_until(deadline);
-    if (status == engine::FutureStatus::kTimeout) {
-        ++req_stats.error;
-        throw TarantoolException{"execute deadline expired"};
-    }
-    if (status != engine::FutureStatus::kReady) {
-        ++req_stats.error;
-        engine::current_task::CancellationPoint();
-        throw TarantoolException{"execute cancelled"};
-    }
-
     try {
-        auto result = fut.get();
+        auto result = Connection::CollectSyncEntry(std::move(entry), deadline);
         if (!result.IsOk()) ++req_stats.error;
         return result;
     } catch (...) {
@@ -134,29 +116,18 @@ ExecutionResult Pool::ForwardStorageCall(const CallRouteInfo& info,
     auto& req_stats = impl_->GetStatistics().calls;
     ++req_stats.total;
 
-    engine::Future<ExecutionResult> fut;
+    std::shared_ptr<SyncPendingEntry> entry;
     try {
         auto conn_ptr = std::make_unique<ConnectionPtr>(impl_->Acquire(deadline));
-        fut = (*conn_ptr)->ForwardStorageCallAsync(info, deadline);
+        entry = (*conn_ptr)->SyncForwardStorageCall(info, deadline);
         conn_ptr.reset();  // release pool slot immediately (pipelining)
     } catch (...) {
         ++req_stats.error;
         throw;
     }
 
-    const auto status = fut.wait_until(deadline);
-    if (status == engine::FutureStatus::kTimeout) {
-        ++req_stats.error;
-        throw TarantoolException{"forward deadline expired"};
-    }
-    if (status != engine::FutureStatus::kReady) {
-        ++req_stats.error;
-        engine::current_task::CancellationPoint();
-        throw TarantoolException{"forward cancelled"};
-    }
-
     try {
-        auto result = fut.get();
+        auto result = Connection::CollectSyncEntry(std::move(entry), deadline);
         if (!result.IsOk()) ++req_stats.error;
         return result;
     } catch (...) {
@@ -180,30 +151,19 @@ ExecutionResult Pool::ForwardVshardCall(uint32_t bucket_id, uint8_t mode,
     auto& req_stats = impl_->GetStatistics().calls;
     ++req_stats.total;
 
-    engine::Future<ExecutionResult> fut;
+    std::shared_ptr<SyncPendingEntry> entry;
     try {
         auto conn_ptr = std::make_unique<ConnectionPtr>(impl_->Acquire(deadline));
-        fut = (*conn_ptr)->ForwardVshardCallAsync(bucket_id, mode, body, body_len,
-                                                  deadline);
+        entry = (*conn_ptr)->SyncForwardVshardCall(bucket_id, mode, body, body_len,
+                                                   deadline);
         conn_ptr.reset();  // release pool slot immediately (pipelining)
     } catch (...) {
         ++req_stats.error;
         throw;
     }
 
-    const auto status = fut.wait_until(deadline);
-    if (status == engine::FutureStatus::kTimeout) {
-        ++req_stats.error;
-        throw TarantoolException{"vshard_call forward deadline expired"};
-    }
-    if (status != engine::FutureStatus::kReady) {
-        ++req_stats.error;
-        engine::current_task::CancellationPoint();
-        throw TarantoolException{"vshard_call forward cancelled"};
-    }
-
     try {
-        auto result = fut.get();
+        auto result = Connection::CollectSyncEntry(std::move(entry), deadline);
         if (!result.IsOk()) ++req_stats.error;
         return result;
     } catch (...) {
@@ -217,22 +177,14 @@ void Pool::Ping(OptionalCommandControl cc) {
         cc ? engine::Deadline::FromDuration(cc->execute)
            : engine::Deadline::FromDuration(impl_->GetSettings().queue_timeout);
 
-    // Same pipelining pattern as Execute(): release the pool slot before
-    // waiting for the response so many pings can be in-flight simultaneously.
-    engine::Future<ExecutionResult> fut;
+    // Release the pool slot before waiting so many pings can be in-flight.
+    std::shared_ptr<SyncPendingEntry> entry;
     {
         auto conn_ptr = std::make_unique<ConnectionPtr>(impl_->Acquire(deadline));
-        fut = (*conn_ptr)->PingAsync(deadline);
+        entry = (*conn_ptr)->SyncPing(deadline);
     }  // conn_ptr destroyed here → pool slot released (pipelining)
 
-    const auto status = fut.wait_until(deadline);
-    if (status == engine::FutureStatus::kTimeout)
-        throw TarantoolException{"ping deadline expired"};
-    if (status != engine::FutureStatus::kReady) {
-        engine::current_task::CancellationPoint();
-        throw TarantoolException{"ping cancelled"};
-    }
-    auto result = fut.get();
+    auto result = Connection::CollectSyncEntry(std::move(entry), deadline);
     if (!result.IsOk())
         throw TarantoolException{"ping returned error"};
 }

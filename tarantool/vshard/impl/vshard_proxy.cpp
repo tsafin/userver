@@ -1232,7 +1232,7 @@ VshardProxy::SyncResult VshardProxy::Sync(double timeout_seconds) {
             }
             throw;
         } catch (const storages::tarantool::TarantoolException& ex) {
-            if (std::string_view{ex.what()}.find("execute deadline expired") !=
+            if (std::string_view{ex.what()}.find("deadline expired") !=
                 std::string_view::npos) {
                 return SyncResult{false, true, rs->GetUuid()};
             }
