@@ -1314,6 +1314,21 @@ static void HandleConnection(engine::io::Socket sock,
                     result_bytes = BuildRouterShardingErrorReturn(
                         9, "NO_ROUTE_TO_BUCKET", ex.what(),
                         std::nullopt, ex.GetBucketId());
+                } catch (const storages::tarantool::vshard::MovedError& ex) {
+                    // Retries exhausted after MOVED redirect: return as vshard
+                    // DATA so the caller sees [nil, {code=1, name='WRONG_BUCKET'}]
+                    // just like the Lua router does, rather than an IPROTO error.
+                    const auto& dest = ex.GetDestinationUuid();
+                    result_bytes = BuildRouterShardingErrorReturn(
+                        1, "WRONG_BUCKET", ex.what(),
+                        dest.empty() ? std::optional<std::string_view>{}
+                                     : std::optional<std::string_view>{dest},
+                        ex.GetBucketId());
+                } catch (const storages::tarantool::vshard::TransferError& ex) {
+                    // Bucket transfer still in progress after retries exhausted.
+                    result_bytes = BuildRouterShardingErrorReturn(
+                        32, "TRANSFER_IS_IN_PROGRESS", ex.what(),
+                        std::nullopt, std::nullopt);
                 } catch (const std::exception& ex) {
                     if (IsConnectivityErrorMessage(ex.what())) {
                         result_bytes = BuildNetboxClientErrorReturn(ex.what());
