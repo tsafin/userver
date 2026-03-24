@@ -27,6 +27,32 @@ ConnectionPtr Pool::Acquire(engine::Deadline deadline) {
     return impl_->Acquire(deadline);
 }
 
+ExecutionResult Pool::ExecuteDirect(engine::Deadline deadline,
+                                     const Query& query) {
+    const bool is_call = (query.GetType() == Query::Type::kCall);
+    auto& req_stats = is_call ? impl_->GetStatistics().calls
+                              : impl_->GetStatistics().crud;
+    ++req_stats.total;
+
+    std::shared_ptr<SyncPendingEntry> entry;
+    try {
+        auto conn_ptr = std::make_unique<ConnectionPtr>(impl_->Acquire(deadline));
+        entry = (*conn_ptr)->SyncExecute(deadline, query);
+        conn_ptr.reset();
+    } catch (...) {
+        ++req_stats.error;
+        throw;
+    }
+    try {
+        auto result = Connection::CollectSyncEntry(std::move(entry), deadline);
+        if (!result.IsOk()) ++req_stats.error;
+        return result;
+    } catch (...) {
+        ++req_stats.error;
+        throw;
+    }
+}
+
 ExecutionResult Pool::Execute(OptionalCommandControl cc, const Query& query) {
     const engine::Deadline deadline =
         cc ? engine::Deadline::FromDuration(cc->execute)
@@ -50,32 +76,7 @@ ExecutionResult Pool::Execute(OptionalCommandControl cc, const Query& query) {
     span.AddTag(tracing::kDatabaseInstance, impl_->GetHostName());
     query.FillSpanTags(span);
 
-    const bool is_call = (query.GetType() == Query::Type::kCall);
-    auto& req_stats = is_call ? impl_->GetStatistics().calls
-                              : impl_->GetStatistics().crud;
-    ++req_stats.total;
-
-    // Stage the request and release the pool slot before waiting (pipelining):
-    // the reader task demultiplexes responses by sync_id, so the connection can
-    // carry many in-flight requests concurrently without Future/Promise overhead.
-    std::shared_ptr<SyncPendingEntry> entry;
-    try {
-        auto conn_ptr = std::make_unique<ConnectionPtr>(impl_->Acquire(deadline));
-        entry = (*conn_ptr)->SyncExecute(deadline, query);
-        conn_ptr.reset();  // return connection to pool immediately (pipelining)
-    } catch (...) {
-        ++req_stats.error;
-        throw;
-    }
-
-    try {
-        auto result = Connection::CollectSyncEntry(std::move(entry), deadline);
-        if (!result.IsOk()) ++req_stats.error;
-        return result;
-    } catch (...) {
-        ++req_stats.error;
-        throw;
-    }
+    return ExecuteDirect(deadline, query);
 }
 
 engine::Future<ExecutionResult> Pool::ExecuteAsync(
@@ -103,6 +104,30 @@ engine::Future<ExecutionResult> Pool::ExecuteAsync(
     }
 }
 
+ExecutionResult Pool::ForwardStorageCallDirect(const CallRouteInfo& info,
+                                               engine::Deadline deadline) {
+    auto& req_stats = impl_->GetStatistics().calls;
+    ++req_stats.total;
+
+    std::shared_ptr<SyncPendingEntry> entry;
+    try {
+        auto conn_ptr = std::make_unique<ConnectionPtr>(impl_->Acquire(deadline));
+        entry = (*conn_ptr)->SyncForwardStorageCall(info, deadline);
+        conn_ptr.reset();
+    } catch (...) {
+        ++req_stats.error;
+        throw;
+    }
+    try {
+        auto result = Connection::CollectSyncEntry(std::move(entry), deadline);
+        if (!result.IsOk()) ++req_stats.error;
+        return result;
+    } catch (...) {
+        ++req_stats.error;
+        throw;
+    }
+}
+
 ExecutionResult Pool::ForwardStorageCall(const CallRouteInfo& info,
                                           OptionalCommandControl cc) {
     const engine::Deadline deadline =
@@ -113,19 +138,26 @@ ExecutionResult Pool::ForwardStorageCall(const CallRouteInfo& info,
     span.AddTag(tracing::kDatabaseType, "tarantool");
     span.AddTag(tracing::kDatabaseInstance, impl_->GetHostName());
 
+    return ForwardStorageCallDirect(info, deadline);
+}
+
+ExecutionResult Pool::ForwardVshardCallDirect(uint32_t bucket_id, uint8_t mode,
+                                               const uint8_t* body,
+                                               std::size_t body_len,
+                                               engine::Deadline deadline) {
     auto& req_stats = impl_->GetStatistics().calls;
     ++req_stats.total;
 
     std::shared_ptr<SyncPendingEntry> entry;
     try {
         auto conn_ptr = std::make_unique<ConnectionPtr>(impl_->Acquire(deadline));
-        entry = (*conn_ptr)->SyncForwardStorageCall(info, deadline);
-        conn_ptr.reset();  // release pool slot immediately (pipelining)
+        entry = (*conn_ptr)->SyncForwardVshardCall(bucket_id, mode, body, body_len,
+                                                   deadline);
+        conn_ptr.reset();
     } catch (...) {
         ++req_stats.error;
         throw;
     }
-
     try {
         auto result = Connection::CollectSyncEntry(std::move(entry), deadline);
         if (!result.IsOk()) ++req_stats.error;
@@ -148,28 +180,7 @@ ExecutionResult Pool::ForwardVshardCall(uint32_t bucket_id, uint8_t mode,
     span.AddTag(tracing::kDatabaseType, "tarantool");
     span.AddTag(tracing::kDatabaseInstance, impl_->GetHostName());
 
-    auto& req_stats = impl_->GetStatistics().calls;
-    ++req_stats.total;
-
-    std::shared_ptr<SyncPendingEntry> entry;
-    try {
-        auto conn_ptr = std::make_unique<ConnectionPtr>(impl_->Acquire(deadline));
-        entry = (*conn_ptr)->SyncForwardVshardCall(bucket_id, mode, body, body_len,
-                                                   deadline);
-        conn_ptr.reset();  // release pool slot immediately (pipelining)
-    } catch (...) {
-        ++req_stats.error;
-        throw;
-    }
-
-    try {
-        auto result = Connection::CollectSyncEntry(std::move(entry), deadline);
-        if (!result.IsOk()) ++req_stats.error;
-        return result;
-    } catch (...) {
-        ++req_stats.error;
-        throw;
-    }
+    return ForwardVshardCallDirect(bucket_id, mode, body, body_len, deadline);
 }
 
 void Pool::Ping(OptionalCommandControl cc) {

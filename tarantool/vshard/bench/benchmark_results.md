@@ -160,3 +160,18 @@ request on the synchronous call path.
 
 Fibers: 10,20,50,100,150 | Total ops per run: 100000 | Build: userver-tarantool-vshard-sample
 
+
+### Round 20260325 — 2026-03-25 (ops=100000, git=ebfeaf02d)
+
+Fiber counts tested: 10,20,50,100,150
+
+| Fibers | Lua router (ops/sec) | C++ proxy (ops/sec) | vs Lua |
+|-------:|---------------------:|--------------------:|-------:|
+| 10 | 9,409 | 11,117 | **+18%** |
+| 20 | 15,375 | 18,313 | **+19%** |
+| 50 | 24,355 | 29,064 | **+19%** |
+| 100 | 33,938 | 35,734 | **+5%** |
+| 150 | 37,338 | 42,588 | **+14%** |
+
+Fibers: 10,20,50,100,150 | Total ops per run: 100000 | Build: userver-tarantool-vshard-sample
+

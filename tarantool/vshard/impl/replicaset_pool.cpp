@@ -158,6 +158,86 @@ storages::tarantool::ExecutionResult ReplicasetPool::ForwardVshardCall(
                                       body, body_len, cc);
 }
 
+storages::tarantool::ExecutionResult ReplicasetPool::ExecuteDirect(
+    CallMode mode,
+    const storages::tarantool::Query& query,
+    engine::Deadline deadline) {
+
+    switch (mode) {
+        case CallMode::kReadWrite:
+            return master_->ExecuteDirect(deadline, query);
+
+        case CallMode::kReadOnly:
+        case CallMode::kBestReadOnly:
+            if (replicas_.empty()) {
+                return master_->ExecuteDirect(deadline, query);
+            }
+            return SelectReplica().ExecuteDirect(deadline, query);
+
+        case CallMode::kBestReadOnlyError:
+            if (replicas_.empty() || !replicas_.front()->IsAvailable()) {
+                throw ReplicaUnavailableError{uuid_};
+            }
+            return SelectReplica().ExecuteDirect(deadline, query);
+    }
+    return master_->ExecuteDirect(deadline, query);
+}
+
+storages::tarantool::ExecutionResult ReplicasetPool::ForwardStorageCallDirect(
+    CallMode mode,
+    const storages::tarantool::impl::CallRouteInfo& info,
+    engine::Deadline deadline) {
+
+    switch (mode) {
+        case CallMode::kReadWrite:
+            return master_->ForwardStorageCallDirect(info, deadline);
+
+        case CallMode::kReadOnly:
+        case CallMode::kBestReadOnly:
+            if (replicas_.empty()) {
+                return master_->ForwardStorageCallDirect(info, deadline);
+            }
+            return SelectReplica().ForwardStorageCallDirect(info, deadline);
+
+        case CallMode::kBestReadOnlyError:
+            if (replicas_.empty() || !replicas_.front()->IsAvailable()) {
+                throw ReplicaUnavailableError{uuid_};
+            }
+            return SelectReplica().ForwardStorageCallDirect(info, deadline);
+    }
+    return master_->ForwardStorageCallDirect(info, deadline);
+}
+
+storages::tarantool::ExecutionResult ReplicasetPool::ForwardVshardCallDirect(
+    const VshardCallInfo& info,
+    const uint8_t* body, std::size_t body_len,
+    engine::Deadline deadline) {
+
+    const CallMode mode = (info.mode == 0) ? CallMode::kReadOnly
+                                           : CallMode::kReadWrite;
+    switch (mode) {
+        case CallMode::kReadWrite:
+            return master_->ForwardVshardCallDirect(info.bucket_id, info.mode,
+                                                    body, body_len, deadline);
+        case CallMode::kReadOnly:
+        case CallMode::kBestReadOnly:
+            if (replicas_.empty()) {
+                return master_->ForwardVshardCallDirect(info.bucket_id, info.mode,
+                                                        body, body_len, deadline);
+            }
+            return SelectReplica().ForwardVshardCallDirect(info.bucket_id, info.mode,
+                                                           body, body_len, deadline);
+        case CallMode::kBestReadOnlyError:
+            if (replicas_.empty() || !replicas_.front()->IsAvailable()) {
+                throw ReplicaUnavailableError{uuid_};
+            }
+            return SelectReplica().ForwardVshardCallDirect(info.bucket_id, info.mode,
+                                                           body, body_len, deadline);
+    }
+    return master_->ForwardVshardCallDirect(info.bucket_id, info.mode,
+                                            body, body_len, deadline);
+}
+
 bool ReplicasetPool::IsAvailable() const {
     if (master_ && master_->IsAvailable()) return true;
     for (const auto& r : replicas_) {

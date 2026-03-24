@@ -241,12 +241,6 @@ Connection::Connection(clients::dns::Resolver& resolver,
 
     DoAuth(auth, connect_deadline, salt_b64);
 
-    // Pre-reserve the pending map to the expected steady-state concurrency.
-    // This avoids rehashing under load when many requests are in-flight at
-    // once.  128 covers typical pool-size × pipeline-depth without wasting
-    // significant memory.
-    pending_.reserve(128);
-
     // Start flush + reader background tasks – must be last (after auth).
     flush_task_ = engine::AsyncNoSpan([this] { FlushLoop(); });
     reader_task_ = engine::AsyncNoSpan([this] { ReaderLoop(); });
@@ -394,10 +388,11 @@ void Connection::ReaderLoop() {
             std::shared_ptr<PendingEntry> entry;
             {
                 std::lock_guard lock(pending_mutex_);
-                auto it = pending_.find(sync_id);
-                if (it != pending_.end()) {
-                    entry = std::move(it->second);
-                    pending_.erase(it);
+                const std::size_t slot_idx = sync_id & (kPendingSlotCount - 1);
+                auto& slot = pending_slots_[slot_idx];
+                if (slot.sync_id == sync_id) {
+                    entry = std::move(slot.entry);
+                    slot.sync_id = 0;
                 }
             }
             if (entry) {
@@ -424,12 +419,18 @@ void Connection::ReaderLoop() {
 }
 
 void Connection::WakeAllPending(std::exception_ptr ex) {
-    std::unordered_map<uint64_t, std::shared_ptr<PendingEntry>> pending;
+    // Collect occupied slots under the lock, then wake outside it.
+    std::vector<std::shared_ptr<PendingEntry>> to_wake;
     {
         std::lock_guard lock(pending_mutex_);
-        pending = std::move(pending_);
+        for (auto& slot : pending_slots_) {
+            if (slot.sync_id != 0 && slot.entry) {
+                to_wake.push_back(std::move(slot.entry));
+                slot.sync_id = 0;
+            }
+        }
     }
-    for (auto& [id, entry] : pending) {
+    for (auto& entry : to_wake) {
         try {
             if (auto* a = std::get_if<AsyncPendingEntry>(entry.get())) {
                 a->promise.set_exception(ex);
@@ -518,10 +519,14 @@ engine::Future<ExecutionResult> Connection::SendAndRegister(
     }
 
     const uint64_t sync_id = ++sync_counter_;
+    const std::size_t slot_idx = sync_id & (kPendingSlotCount - 1);
     {
         std::lock_guard lock(pending_mutex_);
-        pending_.emplace(sync_id, std::make_shared<PendingEntry>(
-            AsyncPendingEntry{std::move(promise)}));
+        UASSERT_MSG(pending_slots_[slot_idx].sync_id == 0,
+                    "pending slot collision — max_in_flight exceeded kPendingSlotCount");
+        pending_slots_[slot_idx].entry = std::make_shared<PendingEntry>(
+            AsyncPendingEntry{std::move(promise)});
+        pending_slots_[slot_idx].sync_id = sync_id;
     }
 
     // Build the IPROTO frame directly into staging_buf_ — two-phase approach:
@@ -588,10 +593,14 @@ engine::Future<ExecutionResult> Connection::ForwardVshardCallAsync(
     }
 
     const uint64_t sync_id = ++sync_counter_;
+    const std::size_t slot_idx = sync_id & (kPendingSlotCount - 1);
     {
         std::lock_guard lock(pending_mutex_);
-        pending_.emplace(sync_id, std::make_shared<PendingEntry>(
-            AsyncPendingEntry{std::move(promise)}));
+        UASSERT_MSG(pending_slots_[slot_idx].sync_id == 0,
+                    "pending slot collision — max_in_flight exceeded kPendingSlotCount");
+        pending_slots_[slot_idx].entry = std::make_shared<PendingEntry>(
+            AsyncPendingEntry{std::move(promise)});
+        pending_slots_[slot_idx].sync_id = sync_id;
     }
 
     // IPROTO_VSHARD_CALL frame: preheader(5) + header(fixmap(4) ~21 bytes) + body.
@@ -780,10 +789,14 @@ engine::Future<ExecutionResult> Connection::PingAsync(engine::Deadline deadline)
     }
 
     const uint64_t sync_id = ++sync_counter_;
+    const std::size_t slot_idx = sync_id & (kPendingSlotCount - 1);
     {
         std::lock_guard lock(pending_mutex_);
-        pending_.emplace(sync_id, std::make_shared<PendingEntry>(
-            AsyncPendingEntry{std::move(promise)}));
+        UASSERT_MSG(pending_slots_[slot_idx].sync_id == 0,
+                    "pending slot collision — max_in_flight exceeded kPendingSlotCount");
+        pending_slots_[slot_idx].entry = std::make_shared<PendingEntry>(
+            AsyncPendingEntry{std::move(promise)});
+        pending_slots_[slot_idx].sync_id = sync_id;
     }
 
     // PING frames are always 18 bytes (fixed layout: see iproto_frames.hpp).
@@ -836,9 +849,13 @@ std::shared_ptr<SyncPendingEntry> Connection::StageSyncRequest(
     std::shared_ptr<SyncPendingEntry> handle{owner, raw};
 
     const uint64_t sync_id = ++sync_counter_;
+    const std::size_t slot_idx = sync_id & (kPendingSlotCount - 1);
     {
         std::lock_guard lock(pending_mutex_);
-        pending_.emplace(sync_id, std::move(owner));
+        UASSERT_MSG(pending_slots_[slot_idx].sync_id == 0,
+                    "pending slot collision — max_in_flight exceeded kPendingSlotCount");
+        pending_slots_[slot_idx].entry = std::move(owner);
+        pending_slots_[slot_idx].sync_id = sync_id;
     }
 
     {
@@ -898,9 +915,13 @@ std::shared_ptr<SyncPendingEntry> Connection::SyncForwardVshardCall(
     std::shared_ptr<SyncPendingEntry> handle{owner, raw};
 
     const uint64_t sync_id = ++sync_counter_;
+    const std::size_t slot_idx = sync_id & (kPendingSlotCount - 1);
     {
         std::lock_guard lock(pending_mutex_);
-        pending_.emplace(sync_id, std::move(owner));
+        UASSERT_MSG(pending_slots_[slot_idx].sync_id == 0,
+                    "pending slot collision — max_in_flight exceeded kPendingSlotCount");
+        pending_slots_[slot_idx].entry = std::move(owner);
+        pending_slots_[slot_idx].sync_id = sync_id;
     }
 
     {
@@ -941,9 +962,13 @@ std::shared_ptr<SyncPendingEntry> Connection::SyncPing(
     std::shared_ptr<SyncPendingEntry> handle{owner, raw};
 
     const uint64_t sync_id = ++sync_counter_;
+    const std::size_t slot_idx = sync_id & (kPendingSlotCount - 1);
     {
         std::lock_guard lock(pending_mutex_);
-        pending_.emplace(sync_id, std::move(owner));
+        UASSERT_MSG(pending_slots_[slot_idx].sync_id == 0,
+                    "pending slot collision — max_in_flight exceeded kPendingSlotCount");
+        pending_slots_[slot_idx].entry = std::move(owner);
+        pending_slots_[slot_idx].sync_id = sync_id;
     }
 
     // PING frames are fixed-size — stage pre-built bytes directly.

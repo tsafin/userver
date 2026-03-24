@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <memory>
 #include <string>
@@ -193,10 +194,24 @@ class Connection final {
   std::vector<uint8_t> staging_buf_;
   engine::SingleConsumerEvent flush_event_;
 
-  /// Guards the pending_ map.
+  // ---- Flat pending-request slot array -------------------------------------
+  // Replaces std::unordered_map to eliminate per-request hash-node allocation
+  // and hash computation.  sync_id is monotonically increasing; slot index =
+  // sync_id & (kPendingSlotCount - 1) cycles through slots without collision
+  // as long as max_in_flight < kPendingSlotCount.  At pool_size=16 with
+  // pipelining-depth ≤ 16 the max per-connection in-flight count is well
+  // below 256.
+
+  static constexpr std::size_t kPendingSlotCount = 256;  // must be power of 2
+
+  struct PendingSlot {
+    std::shared_ptr<PendingEntry> entry;
+    std::uint64_t                 sync_id{0};  // 0 = slot is free
+  };
+
+  /// Guards the pending_slots_ array.
   engine::Mutex pending_mutex_;
-  /// In-flight requests: sync_id → shared pending entry (async or sync waiter).
-  std::unordered_map<uint64_t, std::shared_ptr<PendingEntry>> pending_;
+  std::array<PendingSlot, kPendingSlotCount> pending_slots_{};
 
   /// Background flush task: drains staging_buf_ and sends to socket.
   /// Declared before reader_task_ so it is SyncCancel'd first in ~Connection.

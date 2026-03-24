@@ -688,7 +688,7 @@ formats::msgpack::Value VshardProxy::DoCallWithQuery(
         }
         storages::tarantool::ExecutionResult raw;
         try {
-            raw = rs->Execute(mode, query, cc);
+            raw = rs->ExecuteDirect(mode, query, deadline);
         } catch (const engine::io::IoException& ex) {
             RethrowDirectCallNetworkError(*rs, bucket_id, ex);
         } catch (const storages::tarantool::TarantoolException& ex) {
@@ -750,7 +750,7 @@ std::vector<uint8_t> VshardProxy::DoCallRawBytes(
         }
         storages::tarantool::ExecutionResult raw;
         try {
-            raw = rs->Execute(mode, query, cc);
+            raw = rs->ExecuteDirect(mode, query, deadline);
         } catch (const storages::tarantool::CommandException& ex) {
             return BuildStorageCallErrorReturn(ex.what());
         } catch (const engine::io::IoException& ex) {
@@ -875,7 +875,7 @@ formats::msgpack::Value VshardProxy::ForwardCall(
         }
         storages::tarantool::ExecutionResult raw;
         try {
-            raw = rs->ForwardStorageCall(mode, *route, cc);
+            raw = rs->ForwardStorageCallDirect(mode, *route, deadline);
         } catch (const engine::io::IoException& ex) {
             RethrowDirectCallNetworkError(*rs, bucket_id, ex);
         } catch (const storages::tarantool::TarantoolException& ex) {
@@ -942,7 +942,7 @@ formats::msgpack::Value VshardProxy::ForwardVshardCall(
         }
         storages::tarantool::ExecutionResult raw;
         try {
-            raw = rs->ForwardVshardCall(*info, body, body_len, cc);
+            raw = rs->ForwardVshardCallDirect(*info, body, body_len, deadline);
         } catch (const engine::io::IoException& ex) {
             RethrowDirectCallNetworkError(*rs, bucket_id, ex);
         } catch (const storages::tarantool::TarantoolException& ex) {

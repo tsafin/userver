@@ -86,6 +86,25 @@ class ReplicasetPool final {
         const uint8_t* body, std::size_t body_len,
         storages::tarantool::OptionalCommandControl cc = {});
 
+    // ---- No-span direct variants -------------------------------------------
+    // Skip tracing::Span creation; take an absolute deadline directly.
+    // Used by VshardProxy hot-path to avoid per-request span-ID generation.
+
+    storages::tarantool::ExecutionResult ExecuteDirect(
+        CallMode mode,
+        const storages::tarantool::Query& query,
+        engine::Deadline deadline);
+
+    storages::tarantool::ExecutionResult ForwardStorageCallDirect(
+        CallMode mode,
+        const storages::tarantool::impl::CallRouteInfo& info,
+        engine::Deadline deadline);
+
+    storages::tarantool::ExecutionResult ForwardVshardCallDirect(
+        const VshardCallInfo& info,
+        const uint8_t* body, std::size_t body_len,
+        engine::Deadline deadline);
+
     bool IsAvailable() const;
     bool IsMasterAvailable() const;
     bool HasReplica() const;

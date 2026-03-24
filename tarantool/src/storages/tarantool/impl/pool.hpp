@@ -52,6 +52,23 @@ class Pool final {
     /// Useful for latency/throughput benchmarking without any server-side work.
     void Ping(OptionalCommandControl cc = std::nullopt);
 
+    // ---- No-span direct variants -------------------------------------------
+    // These skip tracing::Span creation (no random span-ID generation) for
+    // high-throughput internal callers such as the vshard proxy that manage
+    // tracing at a higher level.  The caller is responsible for computing the
+    // deadline before calling.
+
+    ExecutionResult ExecuteDirect(engine::Deadline deadline,
+                                  const Query& query);
+
+    ExecutionResult ForwardStorageCallDirect(const CallRouteInfo& info,
+                                             engine::Deadline deadline);
+
+    ExecutionResult ForwardVshardCallDirect(uint32_t bucket_id, uint8_t mode,
+                                            const uint8_t* body,
+                                            std::size_t body_len,
+                                            engine::Deadline deadline);
+
     void WriteStatistics(utils::statistics::Writer& writer) const;
 
     bool IsAvailable() const;
