@@ -1,5 +1,14 @@
 # Tarantool MessagePack Extension Types — Implementation Plan
 
+**Status: Fully implemented (verified 2026-03-25)**
+
+All five Tarantool ext types are handled. Types live in
+`universal/include/userver/formats/msgpack/tarantool_types.hpp` and are
+exposed via `Value::As<T>()`, `ValueBuilder(T)`, and ADL hooks.
+The phased plan below is preserved for historical reference.
+
+---
+
 ## Background
 
 Tarantool defines five MessagePack extension types beyond the standard msgpack
@@ -118,16 +127,15 @@ using TimestampWithoutTz = utils::StrongTypedef<
 
 | Ext | Name            | Wire format      | Current status                       |
 |-----|-----------------|------------------|--------------------------------------|
-|  1  | `MP_DECIMAL`    | `ext8/16/32`     | ❌ silently → nil                    |
-|  2  | `MP_UUID`       | `fixext16` (18B) | ✅ `TntUuid` in msgpack.hpp (eager)  |
-|  3  | `MP_ERROR`      | `ext8/16/32` map | ⚠️ only legacy `IPROTO_ERROR_24` string read |
-|  4  | `MP_DATETIME`   | `fixext8/16`     | ✅ `TntDatetime` in msgpack.hpp (eager) |
-|  6  | `MP_INTERVAL`   | `ext8/16/32`     | ❌ silently → nil                    |
+|  1  | `MP_DECIMAL`    | `ext8/16/32`     | ✅ `Value::AsDecimalString()`, `As<std::string>` |
+|  2  | `MP_UUID`       | `fixext16` (18B) | ✅ `TntUuid` in `tarantool_types.hpp`, `As<TntUuid>()`, `ValueBuilder(TntUuid)` |
+|  3  | `MP_ERROR`      | `ext8/16/32` map | ✅ `TntErrorInfo`/`TntErrorFrame` in `error_info.hpp`, wired into `CommandException` |
+|  4  | `MP_DATETIME`   | `fixext8/16`     | ✅ `DatetimeTz`, `DatetimeWithoutTz`, `TimestampTz`, `TimestampWithoutTz` in `tarantool_types.hpp` |
+|  6  | `MP_INTERVAL`   | `ext8/16/32`     | ✅ `TntInterval` in `tarantool_types.hpp`, `As<TntInterval>()`, `ValueBuilder(TntInterval)` |
 
-Additional issue: `TntUuid` and `TntDatetime` live in `tarantool/src/…/impl/msgpack.hpp`
-(private connector internals), not in `universal/` where `formats::msgpack::Value` lives.
-For `AsUuid()` / `AsDatetime()` to be methods on the public `Value` class they must be
-moved there.
+All types moved to `universal/include/userver/formats/msgpack/tarantool_types.hpp`
+and exposed via the public `Value`/`ValueBuilder` API with ADL hooks in
+`serialize_tarantool.hpp`.
 
 ---
 
