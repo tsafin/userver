@@ -1,0 +1,25 @@
+{
+  "tarantool_vshard_settings": {
+    "tarantool-vshard": {
+      "bucket_count": 3000,
+      "user": "storage",
+      "password": "storage",
+      "replicasets": [
+        {
+          "uuid": "cbf06940-0790-498b-948d-042b62cf3d29",
+          "nodes": [
+            {"host": "127.0.0.1", "port": 3301, "is_master": true},
+            {"host": "127.0.0.1", "port": 3302}
+          ]
+        },
+        {
+          "uuid": "ac522f65-aa94-4134-9f64-51ee384f1a54",
+          "nodes": [
+            {"host": "127.0.0.1", "port": 3303, "is_master": true},
+            {"host": "127.0.0.1", "port": 3304}
+          ]
+        }
+      ]
+    }
+  }
+}

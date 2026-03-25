@@ -1,9 +1,11 @@
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <variant>
 #include <vector>
 
 #include <userver/clients/dns/resolver_fwd.hpp>
@@ -18,11 +20,46 @@
 #include <userver/storages/tarantool/query.hpp>
 #include <userver/storages/tarantool/result.hpp>
 
+#include <storages/tarantool/impl/iproto_frames.hpp>
 #include <storages/tarantool/impl/settings.hpp>
 
 USERVER_NAMESPACE_BEGIN
 
 namespace storages::tarantool::impl {
+
+// ---- Pending-request entry types ----------------------------------------
+//
+// Each in-flight IPROTO request registers one PendingEntry in pending_.
+// Phase 2 introduces two completion modes:
+//
+//   AsyncPendingEntry — used by ExecuteAsync / ForwardVshardCallAsync.
+//     The reader task calls promise.set_value() or set_exception() to wake
+//     the waiting coroutine via its Future.
+//
+//   SyncPendingEntry — used by SendAndWait (Phase 3+).
+//     The reader task writes directly into result/exc and fires a
+//     SingleConsumerEvent.  No heap-allocated future state is involved.
+//     Lifetime is managed by shared_ptr so late responses from the reader
+//     are safe even after the caller has timed out.
+
+struct AsyncPendingEntry {
+    engine::Promise<ExecutionResult> promise;
+};
+
+struct SyncPendingEntry {
+    ExecutionResult result;
+    std::exception_ptr exc;
+    engine::SingleConsumerEvent ready;
+    /// Set by the caller on timeout/cancellation to tell the reader to
+    /// discard any late delivery rather than touching the freed result.
+    std::atomic<bool> abandoned{false};
+
+    SyncPendingEntry() = default;
+    SyncPendingEntry(const SyncPendingEntry&) = delete;
+    SyncPendingEntry& operator=(const SyncPendingEntry&) = delete;
+};
+
+using PendingEntry = std::variant<AsyncPendingEntry, SyncPendingEntry>;
 
 /// @brief Owns an engine::io::Socket with full IPROTO pipelining support.
 ///
@@ -39,7 +76,7 @@ class Connection final {
   ~Connection();
 
   /// Synchronous execute: sends the request AND waits for the response.
-  /// Convenience wrapper around ExecuteAsync().
+  /// Uses the SyncPendingEntry path — no Future/Promise allocation.
   ExecutionResult Execute(engine::Deadline deadline, const Query& query);
 
   /// Asynchronous execute: sends the request and returns a Future that
@@ -55,9 +92,56 @@ class Connection final {
 
   void Ping(engine::Deadline deadline);
 
+  /// Asynchronous zero-copy storage call: builds the vshard.storage.call body
+  /// from kStorageCallBodyPrefix + raw TUPLE bytes (one memcpy, no msgpack
+  /// re-encoding), registers the request and returns a Future.
+  engine::Future<ExecutionResult> ForwardStorageCallAsync(
+      const CallRouteInfo& info, engine::Deadline deadline);
+
+  /// Asynchronous IPROTO_VSHARD_CALL forward: builds a 4-entry header map
+  /// (REQUEST_TYPE=0x50, SYNC, VSHARD_BUCKET_ID, VSHARD_MODE) + body bytes
+  /// (one memcpy).  Used by VshardProxy::ForwardVshardCall().
+  engine::Future<ExecutionResult> ForwardVshardCallAsync(
+      uint32_t bucket_id, uint8_t mode,
+      const uint8_t* body, std::size_t body_len,
+      engine::Deadline deadline);
+
   bool IsBroken() const noexcept {
     return broken_.load(std::memory_order_acquire);
   }
+
+  // ---- Sync pipelining API -------------------------------------------------
+  //
+  // Each Sync* method registers a SyncPendingEntry, stages the encoded frame,
+  // and returns the entry handle immediately.  The caller releases its pool
+  // slot *before* calling CollectSyncEntry(), so the connection remains
+  // available for other concurrent coroutines while waiting for the response
+  // (pipelining preserved, Future/Promise allocation eliminated).
+  //
+  // Typical Pool usage:
+  //
+  //   auto entry = conn->SyncExecute(deadline, query);
+  //   conn_ptr.reset();   // release pool slot → other fibers can reuse conn
+  //   return Connection::CollectSyncEntry(std::move(entry), deadline);
+
+  std::shared_ptr<SyncPendingEntry> SyncExecute(
+      engine::Deadline deadline, const Query& query);
+
+  std::shared_ptr<SyncPendingEntry> SyncForwardStorageCall(
+      const CallRouteInfo& info, engine::Deadline deadline);
+
+  std::shared_ptr<SyncPendingEntry> SyncForwardVshardCall(
+      uint32_t bucket_id, uint8_t mode,
+      const uint8_t* body, std::size_t body_len,
+      engine::Deadline deadline);
+
+  std::shared_ptr<SyncPendingEntry> SyncPing(engine::Deadline deadline);
+
+  /// Wait for a previously registered SyncPendingEntry to be delivered.
+  /// Safe to call after the pool slot has been released.  On timeout sets
+  /// entry->abandoned so a late ReaderLoop delivery is safely discarded.
+  static ExecutionResult CollectSyncEntry(std::shared_ptr<SyncPendingEntry> entry,
+                                          engine::Deadline deadline);
 
  private:
   void DoAuth(const AuthSettings& auth, engine::Deadline deadline,
@@ -67,13 +151,26 @@ class Connection final {
   uint32_t ResolveSpaceId(const std::string& space_name,
                           engine::Deadline deadline);
 
-  /// Core pipelining primitive: registers a pending entry, stages the encoded
-  /// frame, and either flushes it immediately (if this coroutine wins the CAS
-  /// for the flush role) or lets a concurrent flusher carry it along.  The
-  /// returned Future resolves once the reader task delivers the response.
+  /// Shared body-building logic for ExecuteAsync and SyncExecute.
+  /// Resolves the space ID if needed, builds the msgpack body, and returns
+  /// (request_type, body).
+  std::pair<uint32_t, std::vector<uint8_t>> BuildQueryBody(
+      engine::Deadline deadline, const Query& query);
+
+  /// Core async pipelining primitive: registers an AsyncPendingEntry, stages
+  /// the encoded frame into staging_buf_, and signals the flush coroutine.
+  /// The returned Future resolves once the reader task delivers the response.
   engine::Future<ExecutionResult> SendAndRegister(engine::Deadline deadline,
                                                   uint32_t request_type,
                                                   std::vector<uint8_t> body);
+
+  /// Core sync pipelining primitive: registers a SyncPendingEntry, stages the
+  /// encoded frame, and signals the flush coroutine.  Returns an alias
+  /// shared_ptr<SyncPendingEntry> sharing ownership with the pending_ map
+  /// entry.  The caller must call CollectSyncEntry() to wait for the result.
+  std::shared_ptr<SyncPendingEntry> StageSyncRequest(engine::Deadline deadline,
+                                                      uint32_t request_type,
+                                                      std::vector<uint8_t> body);
 
   void FlushLoop();
 
@@ -97,10 +194,24 @@ class Connection final {
   std::vector<uint8_t> staging_buf_;
   engine::SingleConsumerEvent flush_event_;
 
-  /// Guards the pending_ map.
+  // ---- Flat pending-request slot array -------------------------------------
+  // Replaces std::unordered_map to eliminate per-request hash-node allocation
+  // and hash computation.  sync_id is monotonically increasing; slot index =
+  // sync_id & (kPendingSlotCount - 1) cycles through slots without collision
+  // as long as max_in_flight < kPendingSlotCount.  At pool_size=16 with
+  // pipelining-depth ≤ 16 the max per-connection in-flight count is well
+  // below 256.
+
+  static constexpr std::size_t kPendingSlotCount = 256;  // must be power of 2
+
+  struct PendingSlot {
+    std::shared_ptr<PendingEntry> entry;
+    std::uint64_t                 sync_id{0};  // 0 = slot is free
+  };
+
+  /// Guards the pending_slots_ array.
   engine::Mutex pending_mutex_;
-  /// In-flight requests: sync_id → promise waiting for the response.
-  std::unordered_map<uint64_t, engine::Promise<ExecutionResult>> pending_;
+  std::array<PendingSlot, kPendingSlotCount> pending_slots_{};
 
   /// Background flush task: drains staging_buf_ and sends to socket.
   /// Declared before reader_task_ so it is SyncCancel'd first in ~Connection.
