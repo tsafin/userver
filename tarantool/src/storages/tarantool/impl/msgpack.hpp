@@ -74,6 +74,10 @@ inline void EncodeStr(std::vector<uint8_t>& out, std::string_view s) {
     out.insert(out.end(), s.begin(), s.end());
 }
 
+inline void EncodeNil(std::vector<uint8_t>& out) {
+    out.push_back(mp::kNil);
+}
+
 inline void EncodeFixMap(std::vector<uint8_t>& out, uint8_t count) {
     out.push_back(static_cast<uint8_t>(mp::kFixMapMin | count));
 }

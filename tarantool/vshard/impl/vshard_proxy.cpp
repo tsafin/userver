@@ -37,7 +37,7 @@ std::vector<uint8_t> BuildStorageCallErrorReturn(std::string_view message) {
     buf.reserve(96 + message.size());
 
     tnt::EncodeArray(buf, 2);
-    buf.push_back(mp::kNil);
+    tnt::EncodeNil(buf);
 
     tnt::EncodeFixMap(buf, 4);
     tnt::EncodeStr(buf, "base_type");
@@ -91,7 +91,7 @@ std::vector<uint8_t> BuildNetboxClientErrorReturn(std::string_view message) {
     buf.reserve(128 + normalized.size());
 
     tnt::EncodeArray(buf, 2);
-    buf.push_back(mp::kNil);
+    tnt::EncodeNil(buf);
 
     tnt::EncodeFixMap(buf, 5);
     tnt::EncodeStr(buf, "code");
@@ -122,7 +122,7 @@ std::vector<uint8_t> BuildNonEmptyBootstrapErrorReturn() {
     payload.reserve(96);
 
     tnt::EncodeArray(payload, 2);
-    payload.push_back(mp::kNil);
+    tnt::EncodeNil(payload);
     tnt::EncodeFixMap(payload, 4);
     tnt::EncodeStr(payload, "message");
     tnt::EncodeStr(payload, "Cluster is already bootstrapped");
@@ -140,7 +140,7 @@ std::vector<uint8_t> BuildTimeoutClientErrorReturn() {
     buf.reserve(96);
 
     tnt::EncodeArray(buf, 2);
-    buf.push_back(mp::kNil);
+    tnt::EncodeNil(buf);
     tnt::EncodeFixMap(buf, 5);
     tnt::EncodeStr(buf, "code");
     tnt::EncodeUint(buf, 78);
@@ -172,7 +172,7 @@ std::vector<uint8_t> BuildVshardStorageErrorReturn(
     buf.reserve(160);
 
     tnt::EncodeArray(buf, 2);
-    buf.push_back(mp::kNil);
+    tnt::EncodeNil(buf);
     if (field_count <= 15) {
         tnt::EncodeFixMap(buf, static_cast<uint8_t>(field_count));
     } else {
@@ -215,7 +215,7 @@ std::vector<uint8_t> BuildVshardErrorReturn(const impl::VshardError& err) {
     buf.reserve(160);
 
     tnt::EncodeArray(buf, 2);
-    buf.push_back(mp::kNil);
+    tnt::EncodeNil(buf);
     tnt::EncodeFixMap(buf, static_cast<uint8_t>(field_count));
     tnt::EncodeStr(buf, "code");
     tnt::EncodeUint(buf, err.code);
@@ -460,47 +460,12 @@ storages::tarantool::Query VshardProxy::BuildStorageCallQueryRawWithModeString(
     // manually, copying args_data verbatim — no Value tree constructed.
 
     std::vector<uint8_t> buf;
-    buf.reserve(1 + 5 + 1 + mode_string.size() + 1 + func.size() + args_len);
+    buf.reserve(6 + mode_string.size() + func.size() + args_len);
 
-    // fixarray(4)
-    buf.push_back(static_cast<uint8_t>(mp::kFixArrayMin | 4));
-
-    // [0] bucket_id as uint32
-    buf.push_back(mp::kUint32);
-    buf.push_back(static_cast<uint8_t>(bucket_id >> 24));
-    buf.push_back(static_cast<uint8_t>(bucket_id >> 16));
-    buf.push_back(static_cast<uint8_t>(bucket_id >>  8));
-    buf.push_back(static_cast<uint8_t>(bucket_id));
-
-    // Encode a string as fixstr / str8 / str16 / str32.
-    const auto encode_str = [&buf](std::string_view s) {
-        const auto n = s.size();
-        if (n <= 31) {
-            buf.push_back(static_cast<uint8_t>(mp::kFixStrMin | n));
-        } else if (n <= 0xffu) {
-            buf.push_back(mp::kStr8);
-            buf.push_back(static_cast<uint8_t>(n));
-        } else if (n <= 0xffffu) {
-            buf.push_back(mp::kStr16);
-            buf.push_back(static_cast<uint8_t>(n >> 8));
-            buf.push_back(static_cast<uint8_t>(n));
-        } else {
-            buf.push_back(mp::kStr32);
-            buf.push_back(static_cast<uint8_t>(n >> 24));
-            buf.push_back(static_cast<uint8_t>(n >> 16));
-            buf.push_back(static_cast<uint8_t>(n >>  8));
-            buf.push_back(static_cast<uint8_t>(n));
-        }
-        buf.insert(buf.end(),
-                   reinterpret_cast<const uint8_t*>(s.data()),
-                   reinterpret_cast<const uint8_t*>(s.data()) + n);
-    };
-
-    // [1] mode string ("read" / "write" — always short, but use generic encoder)
-    encode_str(mode_string);
-
-    // [2] func name
-    encode_str(func);
+    tnt::EncodeArray(buf, 4);           // [bucket_id, mode_str, func_name, args]
+    tnt::EncodeUint(buf, bucket_id);    // [0]
+    tnt::EncodeStr(buf, mode_string);   // [1]
+    tnt::EncodeStr(buf, func);          // [2]
 
     // [3] args: already msgpack-encoded value, copy verbatim
     buf.insert(buf.end(), args_data, args_data + args_len);
