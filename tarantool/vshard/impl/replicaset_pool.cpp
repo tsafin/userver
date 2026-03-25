@@ -65,7 +65,7 @@ storages::tarantool::ExecutionResult ReplicasetPool::Execute(
             return SelectReplica().Execute(cc, query);
 
         case CallMode::kBestReadOnlyError:
-            if (replicas_.empty() || !replicas_.front()->IsAvailable()) {
+            if (!IsReplicaAvailable()) {
                 throw ReplicaUnavailableError{uuid_};
             }
             return SelectReplica().Execute(cc, query);
@@ -90,7 +90,7 @@ engine::Future<storages::tarantool::ExecutionResult> ReplicasetPool::ExecuteAsyn
             return SelectReplica().ExecuteAsync(cc, query);
 
         case CallMode::kBestReadOnlyError:
-            if (replicas_.empty() || !replicas_.front()->IsAvailable()) {
+            if (!IsReplicaAvailable()) {
                 throw ReplicaUnavailableError{uuid_};
             }
             return SelectReplica().ExecuteAsync(cc, query);
@@ -119,7 +119,7 @@ storages::tarantool::ExecutionResult ReplicasetPool::ForwardStorageCall(
             return SelectReplica().ForwardStorageCall(info, cc);
 
         case CallMode::kBestReadOnlyError:
-            if (replicas_.empty() || !replicas_.front()->IsAvailable()) {
+            if (!IsReplicaAvailable()) {
                 throw ReplicaUnavailableError{uuid_};
             }
             return SelectReplica().ForwardStorageCall(info, cc);
@@ -148,7 +148,7 @@ storages::tarantool::ExecutionResult ReplicasetPool::ForwardVshardCall(
             return SelectReplica().ForwardVshardCall(info.bucket_id, info.mode,
                                                      body, body_len, cc);
         case CallMode::kBestReadOnlyError:
-            if (replicas_.empty() || !replicas_.front()->IsAvailable()) {
+            if (!IsReplicaAvailable()) {
                 throw ReplicaUnavailableError{uuid_};
             }
             return SelectReplica().ForwardVshardCall(info.bucket_id, info.mode,
@@ -175,7 +175,7 @@ storages::tarantool::ExecutionResult ReplicasetPool::ExecuteDirect(
             return SelectReplica().ExecuteDirect(deadline, query);
 
         case CallMode::kBestReadOnlyError:
-            if (replicas_.empty() || !replicas_.front()->IsAvailable()) {
+            if (!IsReplicaAvailable()) {
                 throw ReplicaUnavailableError{uuid_};
             }
             return SelectReplica().ExecuteDirect(deadline, query);
@@ -200,7 +200,7 @@ storages::tarantool::ExecutionResult ReplicasetPool::ForwardStorageCallDirect(
             return SelectReplica().ForwardStorageCallDirect(info, deadline);
 
         case CallMode::kBestReadOnlyError:
-            if (replicas_.empty() || !replicas_.front()->IsAvailable()) {
+            if (!IsReplicaAvailable()) {
                 throw ReplicaUnavailableError{uuid_};
             }
             return SelectReplica().ForwardStorageCallDirect(info, deadline);
@@ -228,7 +228,7 @@ storages::tarantool::ExecutionResult ReplicasetPool::ForwardVshardCallDirect(
             return SelectReplica().ForwardVshardCallDirect(info.bucket_id, info.mode,
                                                            body, body_len, deadline);
         case CallMode::kBestReadOnlyError:
-            if (replicas_.empty() || !replicas_.front()->IsAvailable()) {
+            if (!IsReplicaAvailable()) {
                 throw ReplicaUnavailableError{uuid_};
             }
             return SelectReplica().ForwardVshardCallDirect(info.bucket_id, info.mode,
@@ -255,8 +255,10 @@ bool ReplicasetPool::HasReplica() const {
 }
 
 bool ReplicasetPool::IsReplicaAvailable() const {
-    if (replicas_.empty()) return false;
-    return replicas_.front() && replicas_.front()->IsAvailable();
+    for (const auto& r : replicas_) {
+        if (r && r->IsAvailable()) return true;
+    }
+    return false;
 }
 
 void ReplicasetPool::WriteStatistics(utils::statistics::Writer& writer) const {

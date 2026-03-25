@@ -63,7 +63,6 @@ TopologyFetcher::~TopologyFetcher() = default;
 void TopologyFetcher::BuildPools() {
     pools_.reserve(config_.replicasets.size());
 
-    const storages::tarantool::impl::AuthSettings auth{};
     // We rely on pool_config_ for timeout/pool-size defaults.
 
     for (const auto& rs_cfg : config_.replicasets) {
@@ -118,6 +117,11 @@ void TopologyFetcher::BuildPools() {
             storages::tarantool::impl::PoolSettings ps{pool_config_, ep, node_auth};
             master_pool = std::make_shared<storages::tarantool::impl::Pool>(
                 resolver_, std::move(ps));
+
+            master_meta.host = rs_cfg.nodes[0].host;
+            master_meta.port = rs_cfg.nodes[0].port;
+            master_meta.uuid = rs_cfg.nodes[0].uuid;
+            master_meta.name = rs_cfg.nodes[0].name;
         }
 
         auto rs_pool = std::make_shared<ReplicasetPool>(
@@ -311,7 +315,7 @@ RoutingTable TopologyFetcher::RefreshFull() {
         return BuildFromConfig();
     }
 
-    // Fill gaps for any undiscovered buckets using static config distribution.
+    // Count undiscovered buckets (in transit); leave them unmapped (id=0).
     // This handles buckets in SENDING/RECEIVING state that aren't reported by
     // buckets_discovery.
     uint32_t gaps = 0;

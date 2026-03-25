@@ -13,7 +13,7 @@
           ]
         },
         {
-          "uuid": "ac522f65-a15e-4b1b-af2b-3a0a67d36fef",
+          "uuid": "ac522f65-aa94-4134-9f64-51ee384f1a54",
           "nodes": [
             {"host": "127.0.0.1", "port": 3303, "is_master": true},
             {"host": "127.0.0.1", "port": 3304}

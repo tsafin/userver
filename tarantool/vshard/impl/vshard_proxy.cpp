@@ -472,25 +472,35 @@ storages::tarantool::Query VshardProxy::BuildStorageCallQueryRawWithModeString(
     buf.push_back(static_cast<uint8_t>(bucket_id >>  8));
     buf.push_back(static_cast<uint8_t>(bucket_id));
 
-    // [1] mode string
-    if (mode_string.size() <= 31) {
-        buf.push_back(static_cast<uint8_t>(mp::kFixStrMin | mode_string.size()));
-    } else {
-        buf.push_back(mp::kStr8);
-        buf.push_back(static_cast<uint8_t>(mode_string.size()));
-    }
-    buf.insert(buf.end(), mode_string.begin(), mode_string.end());
+    // Encode a string as fixstr / str8 / str16 / str32.
+    const auto encode_str = [&buf](std::string_view s) {
+        const auto n = s.size();
+        if (n <= 31) {
+            buf.push_back(static_cast<uint8_t>(mp::kFixStrMin | n));
+        } else if (n <= 0xffu) {
+            buf.push_back(mp::kStr8);
+            buf.push_back(static_cast<uint8_t>(n));
+        } else if (n <= 0xffffu) {
+            buf.push_back(mp::kStr16);
+            buf.push_back(static_cast<uint8_t>(n >> 8));
+            buf.push_back(static_cast<uint8_t>(n));
+        } else {
+            buf.push_back(mp::kStr32);
+            buf.push_back(static_cast<uint8_t>(n >> 24));
+            buf.push_back(static_cast<uint8_t>(n >> 16));
+            buf.push_back(static_cast<uint8_t>(n >>  8));
+            buf.push_back(static_cast<uint8_t>(n));
+        }
+        buf.insert(buf.end(),
+                   reinterpret_cast<const uint8_t*>(s.data()),
+                   reinterpret_cast<const uint8_t*>(s.data()) + n);
+    };
 
-    // [2] func name (fixstr or str8)
-    if (func.size() <= 31) {
-        buf.push_back(static_cast<uint8_t>(mp::kFixStrMin | func.size()));
-    } else {
-        buf.push_back(mp::kStr8);
-        buf.push_back(static_cast<uint8_t>(func.size()));
-    }
-    buf.insert(buf.end(),
-               reinterpret_cast<const uint8_t*>(func.data()),
-               reinterpret_cast<const uint8_t*>(func.data()) + func.size());
+    // [1] mode string ("read" / "write" — always short, but use generic encoder)
+    encode_str(mode_string);
+
+    // [2] func name
+    encode_str(func);
 
     // [3] args: already msgpack-encoded value, copy verbatim
     buf.insert(buf.end(), args_data, args_data + args_len);

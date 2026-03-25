@@ -54,7 +54,7 @@ inline constexpr uint32_t kIprotoVshardModeKey = 0x5f;
 /// All pointers into the original buffer; buffer must outlive this struct.
 struct VshardCallInfo {
     uint64_t sync;       ///< original SYNC from the incoming request
-    uint32_t bucket_id;  ///< vshard bucket id (1-based, 1..65535)
+    uint32_t bucket_id;  ///< vshard bucket id (1-based)
     uint8_t  mode;       ///< 0 = read-only, 1 = read-write
 };
 
@@ -116,7 +116,7 @@ ParseVshardCallHeader(const uint8_t* p, std::size_t len) noexcept {
     }
 
     if (!is_vshard_call || !sync || !bucket_id || !mode) return std::nullopt;
-    if (*bucket_id == 0 || *bucket_id > 65535u) return std::nullopt;
+    if (*bucket_id == 0) return std::nullopt;  // out-of-range checked by VshardProxy
 
     return VshardCallInfo{*sync, *bucket_id, *mode};
 }

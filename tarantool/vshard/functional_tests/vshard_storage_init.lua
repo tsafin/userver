@@ -35,7 +35,7 @@ local rs2_replica_port = tonumber(os.getenv('TARANTOOL_RS2_REPLICA_PORT')) or 33
 
 -- Fixed UUIDs for reproducible tests.
 local RS1_UUID = 'cbf06940-0790-498b-948d-042b62cf3d29'
-local RS2_UUID = 'ac522f65-a15e-4b1b-af2b-3a0a67d36fef'
+local RS2_UUID = 'ac522f65-aa94-4134-9f64-51ee384f1a54'
 
 local INSTANCE_UUIDS = {
     ['rs1_master']  = '8a274925-a26d-47fc-9e1b-af88ce939412',
