@@ -782,6 +782,125 @@ std::vector<uint8_t> VshardProxy::DoCallRawBytes(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Phase 2 hot path: single-copy forwarding through SyncForwardStorageCall
+// ---------------------------------------------------------------------------
+
+std::vector<uint8_t> VshardProxy::CallForwardBytes(
+    BucketId bucket_id, impl::CallMode mode, std::string_view mode_string,
+    std::string_view func, const uint8_t* args_data, std::size_t args_len,
+    storages::tarantool::OptionalCommandControl cc) {
+    if (bucket_id < 1 || bucket_id > calculator_.GetBucketCount()) {
+        throw NoReplicasetError{bucket_id};
+    }
+    return DoCallForwardBytes(bucket_id, mode, mode_string, func, args_data,
+                              args_len, std::move(cc));
+}
+
+std::vector<uint8_t> VshardProxy::DoCallForwardBytes(
+    BucketId bucket_id, impl::CallMode mode, std::string_view mode_string,
+    std::string_view func, const uint8_t* args_data, std::size_t args_len,
+    storages::tarantool::OptionalCommandControl cc) {
+    auto snapshot = routing_table_.Read();
+    impl::ReplicasetPool* rs = ResolveReplicaset(bucket_id, snapshot);
+    if (!rs) throw NoReplicasetError{bucket_id};
+
+    // Build deadline from cc (Lua default: CALL_TIMEOUT_MIN = 0.5s)
+    const auto deadline = cc
+        ? engine::Deadline::FromDuration(cc->execute)
+        : engine::Deadline::FromDuration(std::chrono::milliseconds{500});
+
+    // Encode the vshard.storage.call TUPLE once:
+    //   [bucket_id, mode_str, func_name, args]
+    // args are copied verbatim.  This is the only payload copy on the
+    // forward path — the connection stages prefix + tuple directly.
+    std::vector<uint8_t> tuple;
+    tuple.reserve(6 + mode_string.size() + func.size() + args_len);
+    tnt::EncodeArray(tuple, 4);
+    tnt::EncodeUint(tuple, bucket_id);
+    tnt::EncodeStr(tuple, mode_string);
+    tnt::EncodeStr(tuple, func);
+    tuple.insert(tuple.end(), args_data, args_data + args_len);
+
+    storages::tarantool::impl::CallRouteInfo info{};
+    info.bucket_id = bucket_id;
+    info.tuple_begin = tuple.data();
+    info.tuple_end = tuple.data() + tuple.size();
+
+    uint32_t attempt = 0;
+    bool waiting_on_locked_bucket = false;
+    std::optional<impl::VshardError> last_locked_error;
+    while (true) {
+        if (deadline.IsReachable()) {
+            const auto left = deadline.TimeLeft();
+            if (left <= engine::Deadline::Duration::zero()) {
+                if (last_locked_error) {
+                    return BuildVshardErrorReturn(*last_locked_error);
+                }
+                throw VshardException{"vshard.router.call timeout exceeded"};
+            }
+            cc = storages::tarantool::CommandControl{
+                std::chrono::duration_cast<std::chrono::milliseconds>(left)};
+        }
+        storages::tarantool::ExecutionResult raw;
+        try {
+            raw = rs->ForwardStorageCallDirect(mode, info, deadline);
+        } catch (const storages::tarantool::CommandException& ex) {
+            return BuildStorageCallErrorReturn(ex.what());
+        } catch (const engine::io::IoException& ex) {
+            return BuildNetboxClientErrorReturn(ex.what());
+        } catch (const storages::tarantool::TarantoolException& ex) {
+            if (
+                last_locked_error &&
+                (std::string_view{ex.what()}.find("deadline exceeded") !=
+                     std::string_view::npos ||
+                 std::string_view{ex.what()}.find("deadline expired") !=
+                     std::string_view::npos)
+            ) {
+                return BuildTimeoutClientErrorReturn();
+            }
+            if (IsConnectivityErrorMessage(ex.what())) {
+                return BuildNetboxClientErrorReturn(ex.what());
+            }
+            throw;
+        } catch (const std::exception& ex) {
+            if (IsConnectivityErrorMessage(ex.what())) {
+                return BuildNetboxClientErrorReturn(ex.what());
+            }
+            throw;
+        }
+
+        // Zero-copy decode: scan raw bytes, no Value tree on success path
+        impl::RawEnvelopeResult env;
+        try {
+            env = impl::DecodeEnvelopeRaw(raw);
+        } catch (const storages::tarantool::CommandException& ex) {
+            return BuildStorageCallErrorReturn(ex.what());
+        }
+
+        if (env.status != impl::RawEnvelopeStatus::kVshardError) {
+            return std::move(env.return_values_bytes);
+        }
+        waiting_on_locked_bucket = env.vshard_error.IsBucketIsLocked();
+        if (waiting_on_locked_bucket) {
+            last_locked_error = env.vshard_error;
+        }
+
+        try {
+            HandleVshardError(
+                env.vshard_error, bucket_id, attempt, snapshot, rs, deadline);
+        } catch (const VshardStorageError& ex) {
+            return BuildVshardStorageErrorReturn(ex);
+        } catch (const VshardException& ex) {
+            if (std::string_view{ex.what()} ==
+                "vshard.router.call timeout exceeded") {
+                return BuildTimeoutClientErrorReturn();
+            }
+            throw;
+        }
+    }
+}
+
 void VshardProxy::DoCallAsync(
     BucketId bucket_id, impl::CallMode mode,
     const storages::tarantool::Query& query,

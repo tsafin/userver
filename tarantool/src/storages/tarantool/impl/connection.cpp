@@ -397,7 +397,10 @@ void Connection::ReaderLoop() {
             }
             if (entry) {
                 if (auto* a = std::get_if<AsyncPendingEntry>(entry.get())) {
-                    a->promise.set_value(std::move(result));
+                    try {
+                        a->promise.set_value(std::move(result));
+                    } catch (const std::exception&) {
+                    }
                 } else if (auto* s = std::get_if<SyncPendingEntry>(entry.get())) {
                     if (!s->abandoned.load(std::memory_order_acquire)) {
                         s->result = std::move(result);
@@ -520,13 +523,29 @@ engine::Future<ExecutionResult> Connection::SendAndRegister(
 
     const uint64_t sync_id = ++sync_counter_;
     const std::size_t slot_idx = sync_id & (kPendingSlotCount - 1);
+    std::shared_ptr<PendingEntry> stale_entry;
     {
         std::lock_guard lock(pending_mutex_);
-        UASSERT_MSG(pending_slots_[slot_idx].sync_id == 0,
-                    "pending slot collision — max_in_flight exceeded kPendingSlotCount");
-        pending_slots_[slot_idx].entry = std::make_shared<PendingEntry>(
+        auto& slot = pending_slots_[slot_idx];
+        if (slot.sync_id != 0) {
+            // A still-registered entry in the target slot means the slot
+            // ring wrapped while an old request is unanswered (e.g. its
+            // response was lost).  Silently overwriting it strands the old
+            // waiter forever; move it out and fail it explicitly below so
+            // callers observe a real error instead of a hang.
+            stale_entry = std::move(slot.entry);
+        }
+        slot.entry = std::make_shared<PendingEntry>(
             AsyncPendingEntry{std::move(promise)});
-        pending_slots_[slot_idx].sync_id = sync_id;
+        slot.sync_id = sync_id;
+    }
+    if (stale_entry) {
+        if (auto* a = std::get_if<AsyncPendingEntry>(stale_entry.get())) {
+            a->promise.set_exception(std::make_exception_ptr(
+                TarantoolException{"pending slot overflow: unanswered request "
+                                   "evicted after kPendingSlotCount newer "
+                                   "requests"}));
+        }
     }
 
     // Build the IPROTO frame directly into staging_buf_ — two-phase approach:

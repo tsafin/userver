@@ -344,3 +344,42 @@ Findings:
 3. Next ceiling per Little's law is the storage path itself; router-side,
    the remaining cost is the per-request task spawn + arg copy (Phases 2-3)
    and pool acquire churn (Phase 5).
+
+### Round 20261023 — Phase 2 single-copy forwarding + connector hardening (git=d5e49cb1d + Phase 2)
+
+Changes:
+
+- **Phase 2**: `VshardProxy::CallForwardBytes` — the router CALL hot path now
+  encodes the vshard.storage.call tuple once and forwards it via
+  `ReplicasetPool::ForwardStorageCallDirect` →
+  `Connection::SyncForwardStorageCall` (raw bytes, no `Query`, no
+  `BuildQueryBody`, no pool acquire/release per request). Same MOVED/locked
+  retry semantics as `DoCallRawBytes`, which is kept as a fallback.
+- **Connector hardening**: `SendAndRegister` no longer silently overwrites a
+  still-occupied pending slot (release builds compile UASSERT out) — the
+  stale waiter now gets an explicit "pending slot overflow" error instead of
+  hanging forever.
+- **New tool in use:** pipelined loadgen (16 conns × 100 depth).
+
+| Stand (idle box) | ops/s |
+|---|---:|
+| Phase 2 proxy, 16×100 (3 runs) | 84.8k / 84.5k / 83.2k |
+| Phase 2 proxy, 8×100 | 75.3k |
+| Phase 2 proxy, 4×100 | 65.8k |
+| Phase 1c proxy, 16×100 (reference) | 88.1k |
+| net.box sanity @100 fibers | 30.7k (single-proc, client-limited) |
+
+Phase 2 is within run-to-run noise on this stand: with ~100k-class storage
+RTT dominating, removing 2 copies + 2 allocs + pool churn per request does
+not move aggregate throughput — it lowers proxy CPU per request, which will
+matter once the stand has enough storage masters for the router to become
+the bottleneck.
+
+**Known issue found (connector, client-side, predates Phase 2):** under
+deep pipelining (>~120 in-flight per connection) a request's response is
+rarely lost; the unanswered entry stays registered, the slot ring wraps
+after kPendingSlotCount=256 newer requests and the stale waiter used to get
+a silent "Broken promise" (now: explicit "pending slot overflow" error).
+Reproduced with the loadgen against the Lua router too — not related to the
+proxy changes. Workaround until root-caused: keep loadgen depth ≤ 100 per
+connection (16×100 = 1600 in-flight is enough to saturate this stand).

@@ -117,6 +117,17 @@ class VshardProxy final {
         BucketId bucket_id, impl::CallMode mode, std::string_view mode_string,
         std::string_view func, const uint8_t* args_data, std::size_t args_len,
         storages::tarantool::OptionalCommandControl = {});
+
+    /// Phase 2 hot path: same contract as CallRawBytesWithModeString() but
+    /// forwards through Connection::SyncForwardStorageCall — the storage-call
+    /// tuple is encoded once and handed to the connection as raw bytes
+    /// (CallRouteInfo), skipping Query construction, BuildQueryBody and the
+    /// pool acquire/release.
+    std::vector<uint8_t> CallForwardBytes(
+        BucketId bucket_id, impl::CallMode mode, std::string_view mode_string,
+        std::string_view func, const uint8_t* args_data, std::size_t args_len,
+        storages::tarantool::OptionalCommandControl = {});
+
     void CallAsyncWithModeString(
         BucketId bucket_id, impl::CallMode mode, std::string_view mode_string,
         std::string_view func, const uint8_t* args_data, std::size_t args_len,
@@ -242,6 +253,15 @@ class VshardProxy final {
     std::vector<uint8_t> DoCallRawBytes(
         BucketId bucket_id, impl::CallMode mode,
         const storages::tarantool::Query& query,
+        storages::tarantool::OptionalCommandControl cc);
+
+    /// Retry loop for CallForwardBytes — same semantics as DoCallRawBytes,
+    /// but each attempt forwards the prebuilt tuple via the connection's
+    /// zero-copy storage-call path.
+    std::vector<uint8_t> DoCallForwardBytes(
+        BucketId bucket_id, impl::CallMode mode,
+        std::string_view mode_string, std::string_view func,
+        const uint8_t* args_data, std::size_t args_len,
         storages::tarantool::OptionalCommandControl cc);
     void DoCallAsync(
         BucketId bucket_id, impl::CallMode mode,

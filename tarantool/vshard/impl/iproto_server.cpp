@@ -1457,13 +1457,15 @@ static void HandleConnection(engine::io::Socket sock,
                                     args.data(), args.size(), cc);
                                 result_bytes = BuildAsyncFuturePlaceholderReturn();
                             } else if (is_generic_call) {
-                                result_bytes = proxy.CallRawBytesWithModeString(
+                                result_bytes = proxy.CallForwardBytes(
                                     bucket_id, mode, storage_mode, func,
                                     args.data(), args.size(), cc);
                             } else {
-                                result_bytes = proxy.CallRawBytes(
-                                    bucket_id, mode, func, args.data(),
-                                    args.size(), cc);
+                                result_bytes = proxy.CallForwardBytes(
+                                    bucket_id, mode,
+                                    mode == CallMode::kReadWrite ? "write"
+                                                                 : "read",
+                                    func, args.data(), args.size(), cc);
                             }
                         } catch (const storages::tarantool::vshard::
                                      UnreachableReplicasetError& ex) {
