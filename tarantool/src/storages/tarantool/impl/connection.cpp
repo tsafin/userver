@@ -384,7 +384,7 @@ void Connection::ReaderLoop() {
                                    std::move(data_buf),
                                    std::move(error_info)};
 
-            // Dispatch to the waiting coroutine
+                        // Dispatch to the waiting coroutine
             std::shared_ptr<PendingEntry> entry;
             {
                 std::lock_guard lock(pending_mutex_);

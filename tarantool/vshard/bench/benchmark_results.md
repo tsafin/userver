@@ -383,3 +383,43 @@ a silent "Broken promise" (now: explicit "pending slot overflow" error).
 Reproduced with the loadgen against the Lua router too — not related to the
 proxy changes. Workaround until root-caused: keep loadgen depth ≤ 100 per
 connection (16×100 = 1600 in-flight is enough to saturate this stand).
+
+### Round 20261023b — 8 storage masters (Phase 0) + kPendingSlotCount 4096 (git=67a29b559 + slot fix)
+
+Stand changes:
+
+- vshard/example cluster extended from 2 to **8 replicasets**: RS3-RS8 added
+  as master-only instances on 127.0.0.1:3311-3316 (storage_3.lua..storage_8.lua,
+  localcfg.lua sharding, router replicasets, Makefile). 3000 buckets
+  auto-rebalanced by vshard: 8 x 375, all available.
+- Proxy secdist updated to 8 masters (run_benchmarks.sh template still
+  generates 2 RS — update before next sweep).
+- **Connector: kPendingSlotCount 256 -> 4096.** Root cause study of the
+  "lost response" symptom showed nothing is ever lost at the byte level:
+  all requests are flushed (staged == flushed bytes) and all responses are
+  dispatched — but under deep pipelines (>~120 in-flight/conn) a small
+  percentage of responses straggle behind 250+ later ones (tail latency on
+  a saturated box / rebalancer activity). The 256-slot ring then wraps and
+  evicts the still-registered straggler ("pending slot overflow" / formerly
+  silent Broken promise). 4096 slots give ample span headroom
+  (~64 KiB per connection). Task on file: characterize the straggler source.
+
+| Stand (proxy + 13 tarantool instances + loadgen, 8 WSL2 cores, load ~7) | ops/s |
+|---|---:|
+| proxy, 16x100 | 87.6k / 88.1k |
+| proxy, 16x200 | **101.7k** |
+| proxy, 4x1000 | **105.1k** |
+| proxy, 8x300 | 98.4k |
+| proxy, 32x100 | 95.3k |
+| Lua router, 16x200 (same client) | 76.3k |
+
+Progression of proxy-path throughput over the quest: 43.3k (Round 7,
+client-limited) -> 59.8k (multi-proc Lua) -> 88.1k (Phase 1c, 2 masters)
+-> **105.1k (Phase 0+1c+2, 8 masters)**. Proxy vs Lua router: +33% at equal
+load. Zero errors in all runs.
+
+The box is now CPU-saturated (load avg ~7/8; proxy at ~1.2 cores, 13
+tarantool processes): ~105k is the practical ceiling of this WSL2 stand,
+not of the software. Reaching 1M needs the remaining Phase 0 item —
+bare-metal / more cores / more masters — the router is no longer the
+nearest bottleneck.

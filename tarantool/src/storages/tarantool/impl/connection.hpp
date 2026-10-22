@@ -202,7 +202,13 @@ class Connection final {
   // pipelining-depth ≤ 16 the max per-connection in-flight count is well
   // below 256.
 
-  static constexpr std::size_t kPendingSlotCount = 256;  // must be power of 2
+  // Room for the in-flight window plus tail-latency stragglers: the slot
+  // ring wraps every kPendingSlotCount sync ids, so outstanding + straggler
+  // span must stay below it or the oldest waiter gets evicted (it is failed
+  // explicitly with "pending slot overflow").  256 was easily exhausted by
+  // ~200-deep pipelines under tail latency; 4096 gives ample headroom
+  // (4096 * sizeof(PendingSlot) ~= 64 KiB per connection).
+  static constexpr std::size_t kPendingSlotCount = 4096;  // must be power of 2
 
   struct PendingSlot {
     std::shared_ptr<PendingEntry> entry;
