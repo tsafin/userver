@@ -450,3 +450,43 @@ instances + loadgen): ~150k is the stand's hardware ceiling. Remaining
 levers toward 1M: bare metal with more cores, more masters, and the
 code-side Phases 3-5 (per-request allocations, wakeups, pool bypass)
 to cut router CPU per request.
+
+### Round 20261023d — proxy CPU per request: 4.84 -> 4.26 cpu-ms/1000 ops (-12%) (git=979262836 + CPU optimizations)
+
+Changes (plan Phases 3b/4, applied where the profile pointed):
+
+- Profile (perf, 16x200 load): proxy CPU is almost entirely userver
+  scheduler machinery — TaskContext::DoStep + jump_fcontext (~15%),
+  WaitListLight/MutexImpl/Awaiting bookkeeping, moodycamel queue ops,
+  DetachedTasksSyncBlock::Dispose. Parsing/encoding are single digits.
+- **Wakeup elision (Phase 4)**: `flush_event_` (Connection) and `out_event_`
+  (ServerConn) are now signalled only while the flush task is actually
+  parked (`flush_sleeping_`/`out_sleeping_` atomic flags, park-check-sleep
+  ordering); producers skip the event entirely otherwise.
+- **Spinlocks (Phase 3b)**: `pending_mutex_`, `staging_mutex_` (Connection)
+  and `out_mutex_` (ServerConn) — critical sections are a couple of pointer
+  stores — replaced futex-parked `engine::Mutex` with a 64-byte-aligned
+  `SpinLock` (`storages/tarantool/impl/spinlock.hpp`).
+- **Direct staging**: `SyncForwardStorageCall` now appends prefix + tuple
+  straight into `staging_buf_` — one memcpy of the tuple instead of two
+  copies via an intermediate body vector.
+
+Measurement methodology: proxy CPU time (utime+stime from /proc) over a
+fixed 200k-op run at moderate load (8 conns x 50 depth — box not saturated,
+so proxy CPU/op is pure software cost), min of 3 runs per binary:
+
+| binary | cpu-ms per 1000 ops |
+|---|---:|
+| before (979262836) | 4.84 |
+| **after** | **4.26 (-12%)** |
+
+At saturated load (~140k ops/s) aggregate throughput stays within the
+box's noise band (133-148k) — the stand is CPU-starved overall, so proxy
+savings shift CPU to tarantool rather than raising throughput. Sanity:
+raw CALL ok, net.box 35.1k @100 fibers (single-proc, client-limited),
+169 unit tests green, 0 errors.
+
+Remaining proxy-CPU levers (plan Phase 3a/D): per-request detached handler
+tasks are the biggest scheduler cost (task alloc + DetachedTasksSyncBlock +
+queue ops); a persistent handler-coroutine pool per connection would remove
+them, plus inline pending entries (make_shared per request).

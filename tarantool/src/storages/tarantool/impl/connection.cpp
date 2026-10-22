@@ -250,7 +250,7 @@ Connection::~Connection() {
     broken_.store(true, std::memory_order_release);
     // Wake the flush task in case it is sleeping in WaitForEvent(), so it
     // can notice cancellation promptly rather than waiting for the next Send().
-    flush_event_.Send();
+    NotifyFlush();
     // SyncCancel requests cancellation and blocks until the task finishes.
     flush_task_.SyncCancel();
     // reader_task_ RecvSome() will throw engine::io::IoCancelled, which
@@ -449,20 +449,16 @@ void Connection::WakeAllPending(std::exception_ptr ex) {
 
 // ---- Flush coroutine ----
 
-void Connection::FlushLoop() {
-    // WaitForEvent() returns false when the task is cancelled (normal shutdown).
-    while (flush_event_.WaitForEvent()) {
-        // Yield once: all concurrent senders that have already staged their frame
-        // and called flush_event_.Send() will continue executing (they return the
-        // future and then yield at wait_until()).  By the time we resume, every
-        // same-scheduler-slice sender has its frame in staging_buf_, so the
-        // subsequent SendAll coalesces the entire batch into one syscall —
-        // the same "batch-everything-then-flush" model as Tarantool net.box.
-        engine::Yield();
+void Connection::NotifyFlush() {
+    if (flush_sleeping_.load(std::memory_order_acquire)) {
+        flush_event_.Send();
+    }
+}
 
-        // Inner drain loop: keep sending until staging_buf_ is empty.
-        // New frames arriving during SendAll call flush_event_.Send() again;
-        // those will be picked up by the next outer-loop iteration.
+void Connection::FlushLoop() {
+    // Drain: keep sending until staging_buf_ is empty.  New frames arriving
+    // during SendAll are picked up by the next outer-loop iteration.
+    auto drain = [this]() {
         for (;;) {
             std::vector<uint8_t> to_send;
             {
@@ -496,6 +492,28 @@ void Connection::FlushLoop() {
                 return;
             }
         }
+    };
+
+    // Wakeup elision (plan Phase 4): producers check flush_sleeping_ and only
+    // call flush_event_.Send() while this task is parked.  The flag flips in
+    // the order "park-check-sleep" so a producer that staged between the
+    // staging-empty check and the sleep is guaranteed to see sleeping==true
+    // and signal the event.
+    for (;;) {
+        drain();
+        flush_sleeping_.store(true, std::memory_order_release);
+        {
+            std::lock_guard<SpinLock> lock(staging_mutex_);
+            if (!staging_buf_.empty()) {
+                flush_sleeping_.store(false, std::memory_order_relaxed);
+                continue;
+            }
+        }
+        if (!flush_event_.WaitForEvent()) break;  // cancelled (shutdown)
+        flush_sleeping_.store(false, std::memory_order_release);
+        // Yield once so concurrent same-slice senders finish staging, then
+        // drain their frames as one batch.
+        engine::Yield();
     }
     // Task was cancelled (normal shutdown path).
 }
@@ -570,7 +588,7 @@ engine::Future<ExecutionResult> Connection::SendAndRegister(
         staging_buf_[prehdr_pos + 3] = static_cast<uint8_t>(len >> 8);
         staging_buf_[prehdr_pos + 4] = static_cast<uint8_t>(len);
     }
-    flush_event_.Send();  // Signal the flush coroutine (non-blocking, multi-producer safe)
+    NotifyFlush();  // signal the flush coroutine only if it is parked
 
     return future;
 }
@@ -646,7 +664,7 @@ engine::Future<ExecutionResult> Connection::ForwardVshardCallAsync(
         staging_buf_[prehdr_pos + 3] = static_cast<uint8_t>(len >>  8);
         staging_buf_[prehdr_pos + 4] = static_cast<uint8_t>(len);
     }
-    flush_event_.Send();
+    NotifyFlush();
     return future;
 }
 
@@ -826,7 +844,7 @@ engine::Future<ExecutionResult> Connection::PingAsync(engine::Deadline deadline)
         std::lock_guard lock(staging_mutex_);
         staging_buf_.insert(staging_buf_.end(), frame.begin(), frame.end());
     }
-    flush_event_.Send();
+    NotifyFlush();
 
     return future;
 }
@@ -891,7 +909,7 @@ std::shared_ptr<SyncPendingEntry> Connection::StageSyncRequest(
         staging_buf_[prehdr_pos + 3] = static_cast<uint8_t>(len >> 8);
         staging_buf_[prehdr_pos + 4] = static_cast<uint8_t>(len);
     }
-    flush_event_.Send();
+    NotifyFlush();
 
     return handle;
 }
@@ -904,15 +922,55 @@ std::shared_ptr<SyncPendingEntry> Connection::SyncExecute(
 
 std::shared_ptr<SyncPendingEntry> Connection::SyncForwardStorageCall(
         const CallRouteInfo& info, engine::Deadline deadline) {
+    if (broken_.load(std::memory_order_acquire)) {
+        throw TarantoolException{"connection is broken"};
+    }
+    if (deadline.IsReached()) {
+        throw TarantoolException{"Request deadline exceeded before send"};
+    }
+
     const std::size_t tuple_size =
         static_cast<std::size_t>(info.tuple_end - info.tuple_begin);
-    std::vector<uint8_t> body;
-    body.reserve(sizeof(kStorageCallBodyPrefix) + tuple_size);
-    body.insert(body.end(),
-                kStorageCallBodyPrefix,
-                kStorageCallBodyPrefix + sizeof(kStorageCallBodyPrefix));
-    body.insert(body.end(), info.tuple_begin, info.tuple_end);
-    return StageSyncRequest(deadline, kIprotoCall, std::move(body));
+
+    // Construct the variant in-place (SyncPendingEntry is not movable).
+    auto owner = std::make_shared<PendingEntry>(
+        std::in_place_type<SyncPendingEntry>);
+    auto* raw = std::get_if<SyncPendingEntry>(owner.get());
+    // Aliasing constructor: shares owner's ref count, points to the sub-object.
+    std::shared_ptr<SyncPendingEntry> handle{owner, raw};
+
+    const uint64_t sync_id = ++sync_counter_;
+    const std::size_t slot_idx = sync_id & (kPendingSlotCount - 1);
+    {
+        std::lock_guard lock(pending_mutex_);
+        UASSERT_MSG(pending_slots_[slot_idx].sync_id == 0,
+                    "pending slot collision — max_in_flight exceeded kPendingSlotCount");
+        pending_slots_[slot_idx].entry = std::move(owner);
+        pending_slots_[slot_idx].sync_id = sync_id;
+    }
+
+    // Stage prefix + tuple directly into staging_buf_ — no intermediate
+    // body vector (one memcpy of the tuple instead of two copies).
+    {
+        std::lock_guard lock(staging_mutex_);
+        const auto prehdr_pos = staging_buf_.size();
+        staging_buf_.resize(prehdr_pos + 5);
+        BuildHeader(staging_buf_, kIprotoCall, sync_id);
+        staging_buf_.insert(staging_buf_.end(),
+                            kStorageCallBodyPrefix,
+                            kStorageCallBodyPrefix + sizeof(kStorageCallBodyPrefix));
+        staging_buf_.insert(staging_buf_.end(), info.tuple_begin, info.tuple_end);
+        const uint32_t len =
+            static_cast<uint32_t>(staging_buf_.size() - prehdr_pos - 5);
+        staging_buf_[prehdr_pos]     = 0xce;
+        staging_buf_[prehdr_pos + 1] = static_cast<uint8_t>(len >> 24);
+        staging_buf_[prehdr_pos + 2] = static_cast<uint8_t>(len >> 16);
+        staging_buf_[prehdr_pos + 3] = static_cast<uint8_t>(len >> 8);
+        staging_buf_[prehdr_pos + 4] = static_cast<uint8_t>(len);
+    }
+    NotifyFlush();
+
+    return handle;
 }
 
 // SyncForwardVshardCall stages directly into staging_buf_ — no intermediate
@@ -964,7 +1022,7 @@ std::shared_ptr<SyncPendingEntry> Connection::SyncForwardVshardCall(
         staging_buf_[prehdr_pos + 3] = static_cast<uint8_t>(len >> 8);
         staging_buf_[prehdr_pos + 4] = static_cast<uint8_t>(len);
     }
-    flush_event_.Send();
+    NotifyFlush();
 
     return handle;
 }
@@ -997,7 +1055,7 @@ std::shared_ptr<SyncPendingEntry> Connection::SyncPing(
         staging_buf_.insert(staging_buf_.end(), frame.begin(), frame.end());
         staging_buf_.reserve(staging_buf_.capacity());  // no-op; keeps capacity
     }
-    flush_event_.Send();
+    NotifyFlush();
 
     return handle;
 }

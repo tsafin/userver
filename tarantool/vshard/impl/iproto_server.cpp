@@ -49,6 +49,7 @@
 
 // Shared IPROTO frame utilities: ParseIprotoRequest, msgpack_scan::*, mp::k*
 #include <storages/tarantool/impl/iproto_frames.hpp>
+#include <storages/tarantool/impl/spinlock.hpp>
 #include <storages/tarantool/impl/msgpack.hpp>
 
 // For VshardProxyComponent lookup
@@ -999,24 +1000,35 @@ class ServerConn {
 
     // ---- Send side (thread-safe: reader + request-handler coroutines) ----
 
-    /// Stage an outgoing reply and wake the flush task.
+    /// Stage an outgoing reply and wake the flush task (only if parked).
     void Send(const uint8_t* p, std::size_t n) {
         {
             std::lock_guard lock(out_mutex_);
             out_buf_.insert(out_buf_.end(), p, p + n);
         }
-        out_event_.Send();
+        if (out_sleeping_.load(std::memory_order_acquire)) {
+            out_event_.Send();
+        }
     }
 
     /// Flush task body: drains out_buf_ until the connection is closing.
     void FlushLoop() {
-            for (;;) {
+        for (;;) {
+            DrainOut();
+            out_sleeping_.store(true, std::memory_order_release);
+            {
+                std::lock_guard lock(out_mutex_);
+                if (!out_buf_.empty()) {
+                    out_sleeping_.store(false, std::memory_order_relaxed);
+                    continue;
+                }
+            }
             if (!out_event_.WaitForEvent()) break;  // cancelled
+            out_sleeping_.store(false, std::memory_order_release);
+            if (closing_.load(std::memory_order_acquire)) break;
             // Yield so that other handlers staging in this scheduler slice
             // land in the same batch.
             engine::Yield();
-            DrainOut();
-            if (closing_.load(std::memory_order_acquire)) break;
         }
         DrainOut();
     }
@@ -1057,8 +1069,9 @@ class ServerConn {
     std::size_t consumed_{0};         // ring bytes consumed since last dropFront
 
     // Send side
-    engine::Mutex out_mutex_;
+    storages::tarantool::impl::SpinLock out_mutex_;
     engine::SingleConsumerEvent out_event_;
+    std::atomic<bool> out_sleeping_{false};
     std::vector<uint8_t> out_buf_;    // staged replies (under out_mutex_)
     std::atomic<bool> closing_{false};
 };

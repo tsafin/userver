@@ -22,6 +22,7 @@
 
 #include <storages/tarantool/impl/iproto_frames.hpp>
 #include <storages/tarantool/impl/settings.hpp>
+#include <storages/tarantool/impl/spinlock.hpp>
 
 USERVER_NAMESPACE_BEGIN
 
@@ -174,6 +175,9 @@ class Connection final {
 
   void FlushLoop();
 
+  /// Signal the flush task only when it is parked in WaitForEvent().
+  void NotifyFlush();
+
   /// Background loop – runs for the lifetime of the connection and dispatches
   /// every incoming IPROTO frame to the waiting coroutine via its Promise.
   void ReaderLoop();
@@ -190,9 +194,12 @@ class Connection final {
   // finish staging their frames, then drains the entire buffer and sends it in
   // a single SendAll call.  This coalesces N concurrent sends into ~1 syscall
   // (same "batch everything then send" model as Tarantool net.box).
-  engine::Mutex staging_mutex_;
+  SpinLock staging_mutex_;
   std::vector<uint8_t> staging_buf_;
   engine::SingleConsumerEvent flush_event_;
+  /// Set while the flush task is parked in WaitForEvent(); producers signal
+  /// flush_event_ only in that case (wakeup elision, plan Phase 4).
+  std::atomic<bool> flush_sleeping_{false};
 
   // ---- Flat pending-request slot array -------------------------------------
   // Replaces std::unordered_map to eliminate per-request hash-node allocation
@@ -215,8 +222,9 @@ class Connection final {
     std::uint64_t                 sync_id{0};  // 0 = slot is free
   };
 
-  /// Guards the pending_slots_ array.
-  engine::Mutex pending_mutex_;
+  /// Guards the pending_slots_ array (critical section is a couple of
+  /// pointer stores — a spinlock beats a futex-parked engine::Mutex here).
+  SpinLock pending_mutex_;
   std::array<PendingSlot, kPendingSlotCount> pending_slots_{};
 
   /// Background flush task: drains staging_buf_ and sends to socket.
