@@ -517,3 +517,28 @@ cross-thread; three small copies (func, mode, args ≈ 100 B) are cheaper.
 
 Sanity: byte-identical responses, 169 unit tests, 0 errors across 300k-op
 pipelined runs and net.box bench (35.5k @100 fibers, client-limited).
+
+### Round 20261023f — CPU-experiment sweep: no further in-framework gains (git=2966...296ed9df1)
+
+Systematic evaluation of every remaining CPU lever (full spec:
+`docs/cpu-experiments.md`; per-experiment specs + code in worktrees
+`exp/e1-spinning`, `exp/e2-inline-slots`, `exp/e3-handler-pool`):
+
+- E1 `spinning-iterations` (100..4000) + `worker_threads` (2..6): medians
+  overlap, no effect.
+- E2 inline pending entries: projected 2-4% — below the stand's noise
+  floor; deferred.
+- E3 persistent handler-coroutine pool: **fully implemented and
+  validated** (169 tests, 0 errors, 148-149k ops/s) — proxy CPU medians
+  identical to baseline (416-433 vs 420-439 ticks). The CV park/wake
+  cycle costs the same as the per-request task spawn it replaces.
+  **Rejected** to preserve simplicity.
+- E4 execution-model alternatives (C++20 stackless, callbacks,
+  thread-per-core + io_uring, AF_XDP): analysed, out of scope for this
+  framework; documented with cost estimates.
+
+**Decision: the proxy stays at HEAD. In-framework levers are exhausted;
+proxy CPU per request is framework-intrinsic. The path to 1M ops/s is
+hardware (10-12 masters on bare metal ≈ 80-100k each) — or a future
+standalone thread-per-core/io_uring proxy, for which the protocol layer
+(iproto_server.cpp + Connection) is already portable.**
