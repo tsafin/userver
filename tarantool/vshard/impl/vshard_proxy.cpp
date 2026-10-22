@@ -12,6 +12,9 @@
 #include <userver/engine/io/exception.hpp>
 #include <userver/engine/sleep.hpp>
 #include <userver/formats/msgpack/value_builder.hpp>
+#include <array>
+#include <cstring>
+
 #include <userver/logging/log.hpp>
 #include <userver/storages/tarantool/query.hpp>
 #include <userver/utils/async.hpp>
@@ -813,19 +816,56 @@ std::vector<uint8_t> VshardProxy::DoCallForwardBytes(
     // Encode the vshard.storage.call TUPLE once:
     //   [bucket_id, mode_str, func_name, args]
     // args are copied verbatim.  This is the only payload copy on the
-    // forward path — the connection stages prefix + tuple directly.
-    std::vector<uint8_t> tuple;
-    tuple.reserve(6 + mode_string.size() + func.size() + args_len);
-    tnt::EncodeArray(tuple, 4);
-    tnt::EncodeUint(tuple, bucket_id);
-    tnt::EncodeStr(tuple, mode_string);
-    tnt::EncodeStr(tuple, func);
-    tuple.insert(tuple.end(), args_data, args_data + args_len);
+    // forward path — the connection stages prefix + tuple directly (the
+    // staging happens before this function returns, so a stack buffer is
+    // safe).  Typical calls fit in 1 KiB — no heap allocation at all.
+    const std::size_t tuple_need =
+        6 + mode_string.size() + func.size() + args_len;
+    std::vector<uint8_t> tuple_heap;
+    std::array<uint8_t, 1024> tuple_stack;  // uninitialized, filled below
+    uint8_t* tp;
+    if (tuple_need <= tuple_stack.size()) {
+        tp = tuple_stack.data();
+    } else {
+        tuple_heap.resize(tuple_need);
+        tp = tuple_heap.data();
+    }
+    std::size_t tn = 0;
+    tp[tn++] = static_cast<uint8_t>(mp::kFixArrayMin | 4);
+    // bucket_id: fixint / uint8 / uint16 (bucket ids are small)
+    if (bucket_id < 128) {
+        tp[tn++] = static_cast<uint8_t>(bucket_id);
+    } else if (bucket_id <= 0xff) {
+        tp[tn++] = 0xcc;
+        tp[tn++] = static_cast<uint8_t>(bucket_id);
+    } else {
+        tp[tn++] = 0xcd;
+        tp[tn++] = static_cast<uint8_t>(bucket_id >> 8);
+        tp[tn++] = static_cast<uint8_t>(bucket_id);
+    }
+    auto enc_str = [&](std::string_view sv) {
+        if (sv.size() < 32) {
+            tp[tn++] = static_cast<uint8_t>(0xa0 | sv.size());
+        } else if (sv.size() <= 0xff) {
+            tp[tn++] = 0xd9;
+            tp[tn++] = static_cast<uint8_t>(sv.size());
+        } else {
+            tp[tn++] = 0xda;
+            tp[tn++] = static_cast<uint8_t>(sv.size() >> 8);
+            tp[tn++] = static_cast<uint8_t>(sv.size());
+        }
+        std::memcpy(tp + tn, sv.data(), sv.size());
+        tn += sv.size();
+    };
+    enc_str(mode_string);
+    enc_str(func);
+    std::memcpy(tp + tn, args_data, args_len);
+    tn += args_len;
 
     storages::tarantool::impl::CallRouteInfo info{};
     info.bucket_id = bucket_id;
-    info.tuple_begin = tuple.data();
-    info.tuple_end = tuple.data() + tuple.size();
+    info.tuple_begin = tp;
+    info.tuple_end = tp + tn;
 
     uint32_t attempt = 0;
     bool waiting_on_locked_bucket = false;

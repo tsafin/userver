@@ -490,3 +490,30 @@ Remaining proxy-CPU levers (plan Phase 3a/D): per-request detached handler
 tasks are the biggest scheduler cost (task alloc + DetachedTasksSyncBlock +
 queue ops); a persistent handler-coroutine pool per connection would remove
 them, plus inline pending entries (make_shared per request).
+
+### Round 20261023e — response staging + stack tuple (measured wins only)
+
+- `ServerConn::SendResultFrame`: success replies are encoded directly into
+  the connection's out_buf_ (two-phase preheader back-patch) — removes the
+  per-reply frame vector + copy. Byte-identical to the old
+  BuildResultFrameRaw output (verified).
+- `DoCallForwardBytes`: the storage-call tuple is encoded into a 1 KiB
+  UNINITIALIZED stack buffer (heap fallback for oversize) — removes one
+  malloc per request. NB: `std::array{}"` zero-initialization made it
+  SLOWER than the malloc it replaced — the `{}` mattered.
+
+Measured (proxy CPU per 1000 ops, min-of-3, moderate load, single proxy
+instance on the port — SO_REUSEPORT stacking skews everything):
+
+| binary | cpu-ms/1000 ops |
+|---|---:|
+| ABC (10ab8d9f3) | ~4.1 |
+| + SendResultFrame + stack tuple | **2.0-3.1** |
+
+REJECTED experiment: handing the parsed frame buffer to the handler task by
+move (zero-copy request handoff) measured ~25% WORSE — the reader has to
+re-allocate the high-water buffer every frame and the handler frees it
+cross-thread; three small copies (func, mode, args ≈ 100 B) are cheaper.
+
+Sanity: byte-identical responses, 169 unit tests, 0 errors across 300k-op
+pipelined runs and net.box bench (35.5k @100 fibers, client-limited).

@@ -1033,6 +1033,40 @@ class ServerConn {
         DrainOut();
     }
 
+    /// Build an IPROTO OK frame carrying @p data and stage it directly in
+    /// out_buf_ — no intermediate frame vector.
+    void SendResultFrame(uint64_t sync, const uint8_t* data, std::size_t len) {
+        {
+            std::lock_guard lock(out_mutex_);
+            // Two-phase append: reserve the 5-byte preheader, emit the
+            // header map + body, then back-patch the total length.
+            const auto pre_pos = out_buf_.size();
+            out_buf_.resize(pre_pos + 5);
+            tnt::EncodeFixMap(out_buf_, 3);
+            out_buf_.push_back(static_cast<uint8_t>(Iproto::REQUEST_TYPE));
+            out_buf_.push_back(0x00u);
+            tnt::AppendIprotoHeaderKv(out_buf_, static_cast<uint8_t>(Iproto::SYNC),
+                                 sync);
+            tnt::AppendIprotoHeaderKv(
+                out_buf_, static_cast<uint8_t>(Iproto::SCHEMA_VERSION),
+                kSchemaVersion);
+            // body: fixmap(1) { IPROTO_DATA: payload }
+            out_buf_.push_back(static_cast<uint8_t>(mp::kFixMapMin | 1));
+            out_buf_.push_back(static_cast<uint8_t>(Iproto::DATA));
+            out_buf_.insert(out_buf_.end(), data, data + len);
+            const uint32_t total =
+                static_cast<uint32_t>(out_buf_.size() - pre_pos - 5);
+            out_buf_[pre_pos]     = 0xce;
+            out_buf_[pre_pos + 1] = static_cast<uint8_t>(total >> 24);
+            out_buf_[pre_pos + 2] = static_cast<uint8_t>(total >> 16);
+            out_buf_[pre_pos + 3] = static_cast<uint8_t>(total >> 8);
+            out_buf_[pre_pos + 4] = static_cast<uint8_t>(total);
+        }
+        if (out_sleeping_.load(std::memory_order_acquire)) {
+            out_event_.Send();
+        }
+    }
+
     /// Mark the connection as closing and wake the flush task one last time.
     void StartClosing() {
         closing_.store(true, std::memory_order_release);
@@ -1449,8 +1483,9 @@ static void HandleConnection(engine::io::Socket sock,
 
                 // Execute concurrently with the reader loop so that pipelined
                 // requests on this connection are in flight simultaneously.
-                // Copy the request fields out of the reused parse buffer
-                // before the reader overwrites it with the next frame.
+                // NB: handing the parse buffer over by move was measured to
+                // be SLOWER (malloc of the whole high-water buffer per frame
+                // + cross-thread free); small per-request copies win.
                 in_flight.lock_shared();
                 engine::DetachUnscopedUnsafe(engine::AsyncNoSpan(
                     [&proxy, &conn, &in_flight, sync = req.sync, mode,
@@ -1532,9 +1567,8 @@ static void HandleConnection(engine::io::Socket sock,
                             }
                         }
 
-                        const auto resp = BuildResultFrameRaw(
-                            sync, result_bytes.data(), result_bytes.size());
-                        (void)conn.Send(resp.data(), resp.size());
+                        conn.SendResultFrame(sync, result_bytes.data(),
+                                             result_bytes.size());
                         in_flight.unlock_shared();
                     }));
                     // NB: the engine::Task destructor cancels and joins the
