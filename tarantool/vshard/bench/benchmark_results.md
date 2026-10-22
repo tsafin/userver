@@ -423,3 +423,30 @@ tarantool processes): ~105k is the practical ceiling of this WSL2 stand,
 not of the software. Reaching 1M needs the remaining Phase 0 item —
 bare-metal / more cores / more masters — the router is no longer the
 nearest bottleneck.
+
+### Round 20261023c — wal_mode='none' + clean single-proxy measurements (git=1701e900a)
+
+Stand: 8 masters, both replicas stopped, `wal_mode='none'` in
+vshard/example/localcfg.lua (benchmark-only durability tradeoff, +23-25%
+over wal_mode='write'). NOTE: always verify exactly one proxy process owns
+:13306 — repeated restarts stack instances (SO_REUSEPORT) and skew results;
+a 3-instance accident measured 130-132k while a single clean instance
+measures 145-152k.
+
+| Stand (8 WSL2 cores, load ~7, single proxy) | ops/s |
+|---|---:|
+| proxy, 16x200 | **145.7k** |
+| proxy, 4x1000 | **151.8k** |
+| proxy, 8x500 | 108.6k |
+| Lua router, 16x200 (same client) | 108.8k |
+
+**Proxy path progression across the quest: 43.3k (Round 7) -> 59.8k (multi-
+proc Lua clients) -> 88.1k (Phase 1c) -> 105.1k (8 masters) -> 151.8k
+(wal none). 3.5x total; proxy vs Lua router +34% at equal load.** Zero
+errors everywhere; 169 unit tests green.
+
+The box remains CPU-saturated (load ~7/8 across proxy + 9 tarantool
+instances + loadgen): ~150k is the stand's hardware ceiling. Remaining
+levers toward 1M: bare metal with more cores, more masters, and the
+code-side Phases 3-5 (per-request allocations, wakeups, pool bypass)
+to cut router CPU per request.
