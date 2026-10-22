@@ -79,6 +79,26 @@ if (USERVER_IS_THE_ROOT_PROJECT)
     endif()
 
     # -----------------------------------------------------------------------
+    # Standalone pipelined load generator (speaks IPROTO to the proxy or to
+    # the Lua router's listener).  Keeps --depth requests in flight per
+    # connection so router-side batching engages; unlike bench_vshard.lua it
+    # does not cap at the single-process synchronous-client ceiling.
+    # -----------------------------------------------------------------------
+    file(GLOB LOADGEN_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/loadgen/*.cpp)
+    if (LOADGEN_SOURCES)
+        add_executable(userver-tarantool-vshard-loadgen ${LOADGEN_SOURCES})
+        target_include_directories(userver-tarantool-vshard-loadgen PRIVATE
+            ${CMAKE_SOURCE_DIR}/tarantool/src
+            $<TARGET_PROPERTY:userver-tarantool,INCLUDE_DIRECTORIES>
+        )
+        target_link_libraries(userver-tarantool-vshard-loadgen
+            userver-tarantool
+            userver-core
+            tntcxx
+        )
+    endif()
+
+    # -----------------------------------------------------------------------
     # Functional (pytest) tests — requires a live vshard cluster + vshard Lua
     # module.  The test harness in conftest.py spins up Tarantool instances
     # automatically.

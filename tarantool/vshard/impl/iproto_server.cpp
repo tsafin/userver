@@ -18,18 +18,29 @@
 #include <vshard/impl/iproto_server.hpp>
 
 #include <array>
+#include <atomic>
 #include <cctype>
 #include <cstring>
 #include <optional>
+#include <string>
 #include <string_view>
 #include <vector>
 
 #include <Client/IprotoConstants.hpp>
 
+#include <Buffer/Buffer.hpp>
+
+#include <fmt/format.h>
+
 #include <userver/components/component_config.hpp>
 #include <userver/components/component_context.hpp>
 #include <userver/engine/deadline.hpp>
 #include <userver/engine/io/socket.hpp>
+#include <userver/engine/mutex.hpp>
+#include <userver/engine/semaphore.hpp>
+#include <userver/engine/single_consumer_event.hpp>
+#include <userver/engine/sleep.hpp>
+#include <userver/engine/task/task_with_result.hpp>
 #include <userver/formats/msgpack/serialize.hpp>
 #include <userver/formats/msgpack/value.hpp>
 #include <userver/logging/log.hpp>
@@ -884,71 +895,207 @@ static std::string BuildReturnRawUnsupportedError() {
 
 static constexpr std::size_t kMaxFrameSize = 16 * 1024 * 1024;  // 16 MB
 
-/// Read exactly `n` bytes from socket into `buf`, resizing as needed.
-/// Returns false on EOF or error.
-static bool RecvExact(engine::io::Socket& sock, std::vector<uint8_t>& buf,
-                       std::size_t n) {
-    buf.resize(n);
-    const auto got = sock.RecvAll(buf.data(), n, engine::Deadline{});
-    return got == n;
-}
+// ---------------------------------------------------------------------------
+// Per-connection I/O state: buffered reads + batched writes (Phase 1/1c)
+// ---------------------------------------------------------------------------
+//
+// The receive side reads through a ring buffer (tnt::Buffer) filled by one
+// RecvSome syscall per fill, replacing the previous scheme of one recv for
+// the 1-byte length prefix plus another recv for the body (2-3 syscalls per
+// request).  Frames are parsed from a reusable flat buffer that grows to the
+// high-water mark of frame sizes, so after warmup there are no allocations.
+//
+// The send side is served by a dedicated flush task: request handlers stage
+// replies in out_buf_ (thread-safe) and signal out_event_; FlushLoop drains
+// the staging buffer with one SendAll per batch.  With a synchronous client
+// this degenerates to one SendAll per reply (as before); with pipelined
+// requests, replies accumulated within one scheduler slice coalesce into a
+// single syscall.
 
-/// Append `n` bytes from socket to `buf`.
-[[maybe_unused]] static bool RecvAppend(engine::io::Socket& sock,
-                                         std::vector<uint8_t>& buf,
-                                         std::size_t n) {
-    const auto off = buf.size();
-    buf.resize(off + n);
-    const auto got = sock.RecvAll(buf.data() + off, n, engine::Deadline{});
-    return got == n;
-}
+class ServerConn {
+ public:
+    explicit ServerConn(engine::io::Socket sock) : sock_{std::move(sock)} {
+        recv_tmp_.resize(kRecvTmpSize);
+        frame_buf_.reserve(4096);
+        out_buf_.reserve(4096);
+    }
+
+    // ---- Receive side (single reader coroutine only) ---------------------
+
+    /// Read more bytes into the ring (blocking).  Throws on EOF or error.
+    void Fill() {
+        const auto n = sock_.RecvSome(recv_tmp_.data(), recv_tmp_.size(),
+                                      engine::Deadline{});
+        if (n == 0) throw std::runtime_error{"connection closed by peer"};
+        rbuf_.write(RecvBuf::WData{reinterpret_cast<char*>(recv_tmp_.data()),
+                                   n});
+    }
+
+    /// Ensure at least @p n unread bytes are available at rpos_.
+    void Ensure(std::size_t n) {
+        while (!rbuf_.has(rpos_, n)) Fill();
+    }
+
+    /// True if at least one unread byte is already buffered (i.e. the client
+    /// has pipelined more data); used to decide whether to keep batching.
+    bool HasBufferedInput() { return rbuf_.has(rpos_, 1); }
+
+    /// Decode the next frame length from the buffered msgpack uint prefix,
+    /// advancing past it.  IPROTO prefixes are msgpack-encoded uint32 values,
+    /// so small frames use fixint (1 byte), uint8 (2), uint16 (3) or uint32
+    /// (5) encodings.
+    uint32_t ReadFrameLengthPrefix() {
+        Ensure(1);
+        uint8_t lead = 0;
+        ReadBytes(&lead, 1);
+        consumed_ += 1;
+        if (lead <= 0x7f) return lead;  // positive fixint
+        switch (lead) {
+            case 0xcc: {  // uint8
+                Ensure(1);
+                uint8_t v = 0;
+                ReadBytes(&v, 1);
+                consumed_ += 1;
+                return v;
+            }
+            case 0xcd: {  // uint16
+                Ensure(2);
+                uint8_t v[2] = {0, 0};
+                ReadBytes(v, 2);
+                consumed_ += 2;
+                return (uint32_t(v[0]) << 8) | uint32_t(v[1]);
+            }
+            case 0xce: {  // uint32
+                Ensure(4);
+                uint8_t v[4] = {0, 0, 0, 0};
+                ReadBytes(v, 4);
+                consumed_ += 4;
+                return (uint32_t(v[0]) << 24) | (uint32_t(v[1]) << 16) |
+                       (uint32_t(v[2]) << 8) | uint32_t(v[3]);
+            }
+            default:
+                throw std::runtime_error{
+                    fmt::format("iproto_server: unexpected length prefix "
+                                "byte 0x{:02x}",
+                                lead)};
+        }
+    }
+
+    /// Copy the next @p body_len bytes into the flat parse buffer and release
+    /// the consumed ring bytes.  The returned pointer stays valid until the
+    /// next ReadFrameBody() call.
+    const uint8_t* ReadFrameBody(std::size_t body_len) {
+        Ensure(body_len);
+        if (frame_buf_.size() < body_len) frame_buf_.resize(body_len);
+        rpos_.read(RecvBuf::RData{reinterpret_cast<char*>(frame_buf_.data()),
+                                  body_len});
+        consumed_ += body_len;
+        // Release the consumed bytes; rpos_ has already advanced past them,
+        // so no registered iterator points into the freed region.
+        rbuf_.dropFront(consumed_);
+        consumed_ = 0;
+        return frame_buf_.data();
+    }
+
+    // ---- Send side (thread-safe: reader + request-handler coroutines) ----
+
+    /// Stage an outgoing reply and wake the flush task.
+    void Send(const uint8_t* p, std::size_t n) {
+        {
+            std::lock_guard lock(out_mutex_);
+            out_buf_.insert(out_buf_.end(), p, p + n);
+        }
+        out_event_.Send();
+    }
+
+    /// Flush task body: drains out_buf_ until the connection is closing.
+    void FlushLoop() {
+            for (;;) {
+            if (!out_event_.WaitForEvent()) break;  // cancelled
+            // Yield so that other handlers staging in this scheduler slice
+            // land in the same batch.
+            engine::Yield();
+            DrainOut();
+            if (closing_.load(std::memory_order_acquire)) break;
+        }
+        DrainOut();
+    }
+
+    /// Mark the connection as closing and wake the flush task one last time.
+    void StartClosing() {
+        closing_.store(true, std::memory_order_release);
+        out_event_.Send();
+    }
+
+    engine::io::Socket& Socket() noexcept { return sock_; }
+
+ private:
+    void ReadBytes(void* dst, std::size_t n) {
+        rpos_.read(RecvBuf::RData{static_cast<char*>(dst), n});
+    }
+
+    void DrainOut() {
+            while (true) {
+            std::vector<uint8_t> batch;
+            {
+                std::lock_guard lock(out_mutex_);
+                if (out_buf_.empty()) return;
+                batch.swap(out_buf_);
+            }
+            sock_.SendAll(batch.data(), batch.size(), engine::Deadline{});
+        }
+    }
+
+    using RecvBuf = ::tnt::Buffer<16384>;
+    static constexpr std::size_t kRecvTmpSize = 65536;
+
+    engine::io::Socket sock_;
+    RecvBuf rbuf_;
+    RecvBuf::iterator rpos_{rbuf_.begin()};
+    std::vector<char> recv_tmp_;
+    std::vector<uint8_t> frame_buf_;  // flat copy of the current frame body
+    std::size_t consumed_{0};         // ring bytes consumed since last dropFront
+
+    // Send side
+    engine::Mutex out_mutex_;
+    engine::SingleConsumerEvent out_event_;
+    std::vector<uint8_t> out_buf_;    // staged replies (under out_mutex_)
+    std::atomic<bool> closing_{false};
+};
+
+/// Max concurrently executing vshard CALL handler tasks per connection.
+/// Bounds memory (each holds a small arg copy + result buffer) and gives
+/// natural backpressure against unbounded client pipelining.
+static constexpr std::size_t kMaxRequestsInFlight = 512;
 
 static void HandleConnection(engine::io::Socket sock,
                               VshardProxy& proxy) {
-    // 1. Send greeting
+    ServerConn conn{std::move(sock)};
+
+    // 1. Send greeting (direct, before batching is active)
     const auto greeting = MakeGreeting();
     try {
-        (void)sock.SendAll(greeting.data(), greeting.size(), engine::Deadline{});
+        (void)conn.Socket().SendAll(greeting.data(), greeting.size(),
+                                    engine::Deadline{});
     } catch (const std::exception& ex) {
         LOG_DEBUG() << "iproto_server: greeting send failed: " << ex.what();
         return;
     }
 
-    std::vector<uint8_t> frame_buf;
-    frame_buf.reserve(4096);
+    // 2. Reply flush task: request handlers stage replies via conn.Send()
+    //    and the flush task coalesces them into one SendAll per batch.
+    engine::Semaphore in_flight{kMaxRequestsInFlight};
+    engine::TaskWithResult<void> flush_task =
+        engine::AsyncNoSpan([&conn] { conn.FlushLoop(); });
 
-    // 2. Request loop
+    // 3. Request loop — frames arrive through the ring buffer; replies are
+    // staged by the per-request handler tasks and flushed by FlushLoop.
     while (true) {
         // Read frame length: variable-length msgpack uint
-        // Tarantool IPROTO frames are prefixed with a msgpack-encoded uint32
-        // body length. Small frames may use fixint (1 byte), uint8 (2 bytes),
-        // uint16 (3 bytes) or uint32 (5 bytes) encoding.
         uint32_t body_len = 0;
         try {
-            if (!RecvExact(sock, frame_buf, 1)) break;
+            body_len = conn.ReadFrameLengthPrefix();
         } catch (...) {
-            break;
-        }
-        const uint8_t lead = frame_buf[0];
-        if (lead <= 0x7f) {
-            // positive fixint: length is the byte itself
-            body_len = lead;
-        } else if (lead == 0xcc) {
-            // uint8
-            try { if (!RecvExact(sock, frame_buf, 1)) break; } catch (...) { break; }
-            body_len = frame_buf[0];
-        } else if (lead == 0xcd) {
-            // uint16
-            try { if (!RecvExact(sock, frame_buf, 2)) break; } catch (...) { break; }
-            body_len = (uint32_t(frame_buf[0]) << 8) | uint32_t(frame_buf[1]);
-        } else if (lead == mp::kUint32) {
-            // uint32
-            try { if (!RecvExact(sock, frame_buf, 4)) break; } catch (...) { break; }
-            body_len = (uint32_t(frame_buf[0]) << 24) | (uint32_t(frame_buf[1]) << 16) |
-                       (uint32_t(frame_buf[2]) << 8)  |  uint32_t(frame_buf[3]);
-        } else {
-            LOG_WARNING() << "iproto_server: unexpected length prefix byte "
-                          << static_cast<int>(lead);
             break;
         }
 
@@ -957,16 +1104,17 @@ static void HandleConnection(engine::io::Socket sock,
             break;
         }
 
-        // Read body
+        // Read body (flat copy out of the ring, zero alloc after warmup)
+        const uint8_t* frame = nullptr;
         try {
-            if (!RecvExact(sock, frame_buf, body_len)) break;
+            frame = conn.ReadFrameBody(body_len);
         } catch (...) {
             break;
         }
 
         // Parse header using shared ParseIprotoRequest from iproto_frames.hpp
         const auto req = storages::tarantool::impl::ParseIprotoRequest(
-            frame_buf.data(), body_len);
+            frame, body_len);
         if (req.type == 0 && req.sync == 0) {
             LOG_WARNING() << "iproto_server: malformed frame, closing";
             break;
@@ -976,21 +1124,21 @@ static void HandleConnection(engine::io::Socket sock,
         try {
             if (req.type == kTypeId) {
                 const auto resp = BuildIdOkFrame(req.sync);
-                (void)sock.SendAll(resp.data(), resp.size(), engine::Deadline{});
+                (void)conn.Send(resp.data(), resp.size());
 
             } else if (req.type == Iproto::AUTH) {
                 // Accept any credentials without verification.
                 const auto resp = BuildAuthOkFrame(req.sync);
-                (void)sock.SendAll(resp.data(), resp.size(), engine::Deadline{});
+                (void)conn.Send(resp.data(), resp.size());
 
             } else if (req.type == Iproto::PING) {
                 const auto resp = BuildPingOkFrame(req.sync);
-                (void)sock.SendAll(resp.data(), resp.size(), engine::Deadline{});
+                (void)conn.Send(resp.data(), resp.size());
 
             } else if (req.type == Iproto::SELECT) {
                 // net.box fetches schema on connect; return empty data.
                 const auto resp = BuildSelectEmptyFrame(req.sync);
-                (void)sock.SendAll(resp.data(), resp.size(), engine::Deadline{});
+                (void)conn.Send(resp.data(), resp.size());
 
             } else if (req.type == Iproto::CALL || req.type == kTypeCall16) {
                 // Both CALL (0x0A) and legacy CALL_16 (0x06) carry
@@ -998,7 +1146,7 @@ static void HandleConnection(engine::io::Socket sock,
                 if (!req.body_begin) {
                     const auto resp = tnt::BuildIprotoErrorFrame(
                         req.sync, kSchemaVersion, "missing body");
-                    (void)sock.SendAll(resp.data(), resp.size(), engine::Deadline{});
+                    (void)conn.Send(resp.data(), resp.size());
                     continue;
                 }
 
@@ -1006,7 +1154,7 @@ static void HandleConnection(engine::io::Socket sock,
                 if (!body || !body->tuple_begin) {
                     const auto resp = tnt::BuildIprotoErrorFrame(
                         req.sync, kSchemaVersion, "missing args");
-                    (void)sock.SendAll(resp.data(), resp.size(), engine::Deadline{});
+                    (void)conn.Send(resp.data(), resp.size());
                     continue;
                 }
 
@@ -1036,14 +1184,14 @@ static void HandleConnection(engine::io::Socket sock,
                         const auto resp = tnt::BuildIprotoErrorFrame(req.sync,
                             kSchemaVersion,
                             "bad bucket_id_mpcrc32 args: expected [key]");
-                        (void)sock.SendAll(resp.data(), resp.size(), engine::Deadline{});
+                        (void)conn.Send(resp.data(), resp.size());
                         continue;
                     }
                     const uint32_t bid = key->is_string
                         ? proxy.ComputeBucketId(key->str_val)
                         : proxy.ComputeBucketId(key->int_val);
                     const auto resp = BuildUint32ResultFrame(req.sync, bid);
-                    (void)sock.SendAll(resp.data(), resp.size(), engine::Deadline{});
+                    (void)conn.Send(resp.data(), resp.size());
                     continue;
 
                 } else if (body->func_name == "vshard.router.bucket_id_strcrc32") {
@@ -1053,12 +1201,12 @@ static void HandleConnection(engine::io::Socket sock,
                         const auto resp = tnt::BuildIprotoErrorFrame(
                             req.sync, kSchemaVersion,
                             "bad bucket_id_strcrc32 args: expected [string_key]");
-                        (void)sock.SendAll(resp.data(), resp.size(), engine::Deadline{});
+                        (void)conn.Send(resp.data(), resp.size());
                         continue;
                     }
                     const uint32_t bid = proxy.ComputeBucketId(key->str_val);
                     const auto resp = BuildUint32ResultFrame(req.sync, bid);
-                    (void)sock.SendAll(resp.data(), resp.size(), engine::Deadline{});
+                    (void)conn.Send(resp.data(), resp.size());
                     continue;
 
                 } else if (body->func_name == "vshard.router.route") {
@@ -1068,19 +1216,19 @@ static void HandleConnection(engine::io::Socket sock,
                         const auto resp = tnt::BuildIprotoErrorFrame(
                             req.sync, kSchemaVersion,
                             "bad route args: expected [bucket_id]");
-                        (void)sock.SendAll(resp.data(), resp.size(), engine::Deadline{});
+                        (void)conn.Send(resp.data(), resp.size());
                         continue;
                     }
                     const auto uuid = proxy.Route(
                         static_cast<BucketId>(key->int_val));
                     const auto resp = BuildRouteResultFrame(req.sync, uuid);
-                    (void)sock.SendAll(resp.data(), resp.size(), engine::Deadline{});
+                    (void)conn.Send(resp.data(), resp.size());
                     continue;
 
                 } else if (body->func_name == "vshard.router.routeall") {
                     const auto routeall = proxy.GetRouteAll();
                     const auto resp = BuildResultFrame(req.sync, routeall);
-                    (void)sock.SendAll(resp.data(), resp.size(), engine::Deadline{});
+                    (void)conn.Send(resp.data(), resp.size());
                     continue;
 
                 } else if (body->func_name == "vshard.router.info") {
@@ -1090,12 +1238,12 @@ static void HandleConnection(engine::io::Socket sock,
                         const auto resp = tnt::BuildIprotoErrorFrame(
                             req.sync, kSchemaVersion,
                             "bad info args: expected [] or [{with_services=...}]");
-                        (void)sock.SendAll(resp.data(), resp.size(), engine::Deadline{});
+                        (void)conn.Send(resp.data(), resp.size());
                         continue;
                     }
                     const auto info = proxy.GetInfo(info_args.with_services);
                     const auto resp = BuildResultFrame(req.sync, info);
-                    (void)sock.SendAll(resp.data(), resp.size(), engine::Deadline{});
+                    (void)conn.Send(resp.data(), resp.size());
                     continue;
 
                 } else if (body->func_name == "vshard.router.sync") {
@@ -1105,7 +1253,7 @@ static void HandleConnection(engine::io::Socket sock,
                         const auto resp = tnt::BuildIprotoErrorFrame(
                             req.sync, kSchemaVersion,
                             "Usage: vshard.router.sync([timeout: number])");
-                        (void)sock.SendAll(resp.data(), resp.size(), engine::Deadline{});
+                        (void)conn.Send(resp.data(), resp.size());
                         continue;
                     }
 
@@ -1116,7 +1264,7 @@ static void HandleConnection(engine::io::Socket sock,
                             BuildTimeoutClientErrorReturn(std::nullopt);
                         const auto resp = BuildResultFrameRaw(
                             req.sync, result_bytes.data(), result_bytes.size());
-                        (void)sock.SendAll(resp.data(), resp.size(), engine::Deadline{});
+                        (void)conn.Send(resp.data(), resp.size());
                         continue;
                     }
 
@@ -1129,7 +1277,7 @@ static void HandleConnection(engine::io::Socket sock,
                                 : std::nullopt);
                         const auto resp = BuildResultFrameRaw(
                             req.sync, result_bytes.data(), result_bytes.size());
-                        (void)sock.SendAll(resp.data(), resp.size(), engine::Deadline{});
+                        (void)conn.Send(resp.data(), resp.size());
                         continue;
                     }
 
@@ -1137,7 +1285,7 @@ static void HandleConnection(engine::io::Socket sock,
                         static_cast<uint8_t>(mp::kFixArrayMin | 1), mp::kTrue};
                     const auto resp = BuildResultFrameRaw(
                         req.sync, result_bytes.data(), result_bytes.size());
-                    (void)sock.SendAll(resp.data(), resp.size(), engine::Deadline{});
+                    (void)conn.Send(resp.data(), resp.size());
                     continue;
 
                 } else if (body->func_name == "vshard.router.bootstrap") {
@@ -1147,7 +1295,7 @@ static void HandleConnection(engine::io::Socket sock,
                         const auto resp = tnt::BuildIprotoErrorFrame(
                             req.sync, kSchemaVersion,
                             "Usage: vshard.router.bootstrap({<options>})");
-                        (void)sock.SendAll(resp.data(), resp.size(), engine::Deadline{});
+                        (void)conn.Send(resp.data(), resp.size());
                         continue;
                     }
 
@@ -1160,7 +1308,7 @@ static void HandleConnection(engine::io::Socket sock,
                         bootstrap_args.if_not_bootstrapped, cc);
                     const auto resp = BuildResultFrameRaw(
                         req.sync, result_bytes.data(), result_bytes.size());
-                    (void)sock.SendAll(resp.data(), resp.size(), engine::Deadline{});
+                    (void)conn.Send(resp.data(), resp.size());
                     continue;
 
                 } else if (body->func_name == "vshard.router.map_callrw") {
@@ -1171,7 +1319,7 @@ static void HandleConnection(engine::io::Socket sock,
                         const auto resp = tnt::BuildIprotoErrorFrame(
                             req.sync, kSchemaVersion,
                             "Usage: vshard.router.map_callrw(func, args[, opts])");
-                        (void)sock.SendAll(resp.data(), resp.size(), engine::Deadline{});
+                        (void)conn.Send(resp.data(), resp.size());
                         continue;
                     }
 
@@ -1202,7 +1350,7 @@ static void HandleConnection(engine::io::Socket sock,
                             return_values.end(), map_bytes.begin(), map_bytes.end());
                         const auto resp = BuildResultFrameRaw(
                             req.sync, return_values.data(), return_values.size());
-                        (void)sock.SendAll(resp.data(), resp.size(), engine::Deadline{});
+                        (void)conn.Send(resp.data(), resp.size());
                     } catch (const VshardProxy::MapCallRWException& ex) {
                         const auto result_bytes = IsConnectivityErrorMessage(ex.what())
                             ? BuildMapCallRWClientErrorReturn(
@@ -1214,7 +1362,7 @@ static void HandleConnection(engine::io::Socket sock,
                                   ex.GetReplicasetId());
                         const auto resp = BuildResultFrameRaw(
                             req.sync, result_bytes.data(), result_bytes.size());
-                        (void)sock.SendAll(resp.data(), resp.size(), engine::Deadline{});
+                        (void)conn.Send(resp.data(), resp.size());
                     }
                     continue;
 
@@ -1223,7 +1371,7 @@ static void HandleConnection(engine::io::Socket sock,
                                   << body->func_name << "'";
                     const auto resp = tnt::BuildIprotoErrorFrame(
                         req.sync, kSchemaVersion, "unsupported vshard function");
-                    (void)sock.SendAll(resp.data(), resp.size(), engine::Deadline{});
+                    (void)conn.Send(resp.data(), resp.size());
                     continue;
                 }
 
@@ -1249,7 +1397,7 @@ static void HandleConnection(engine::io::Socket sock,
                         req.sync, kSchemaVersion, is_generic_call
                             ? "bad vshard.router.call args: expected [bucket_id, mode, func, args]"
                             : "bad vshard.router args: expected [bucket_id, func, args]");
-                    (void)sock.SendAll(resp.data(), resp.size(), engine::Deadline{});
+                    (void)conn.Send(resp.data(), resp.size());
                     continue;
                 }
                 if (!vargs->opts_valid) {
@@ -1257,7 +1405,7 @@ static void HandleConnection(engine::io::Socket sock,
                         req.sync, kSchemaVersion, is_generic_call
                             ? "Usage: call(bucket_id, mode, func, args, opts)"
                             : "Usage: call(bucket_id, func, args, opts)");
-                    (void)sock.SendAll(resp.data(), resp.size(), engine::Deadline{});
+                    (void)conn.Send(resp.data(), resp.size());
                     continue;
                 }
                 const auto total_timeout =
@@ -1267,7 +1415,7 @@ static void HandleConnection(engine::io::Socket sock,
                     const auto resp = tnt::BuildIprotoErrorFrame(
                         req.sync, kSchemaVersion,
                         "request_timeout must be <= timeout");
-                    (void)sock.SendAll(resp.data(), resp.size(), engine::Deadline{});
+                    (void)conn.Send(resp.data(), resp.size());
                     continue;
                 }
 
@@ -1278,86 +1426,139 @@ static void HandleConnection(engine::io::Socket sock,
                         MillisecondsFromSeconds(vargs->timeout)) {
                     cc = storages::tarantool::CommandControl{*timeout_ms};
                 }
-                std::vector<uint8_t> result_bytes;
                 if (vargs->return_raw) {
                     const auto resp = tnt::BuildIprotoErrorFrame(
                         req.sync, kSchemaVersion,
                         BuildReturnRawUnsupportedError());
-                    (void)sock.SendAll(resp.data(), resp.size(), engine::Deadline{});
+                    (void)conn.Send(resp.data(), resp.size());
                     continue;
                 }
-                try {
-                    if (vargs->is_async) {
-                        proxy.CallAsyncWithModeString(
-                            vargs->bucket_id, mode,
-                            is_generic_call
-                                ? vargs->storage_mode
-                                : (mode == CallMode::kReadWrite ? "write" : "read"),
-                            vargs->func_name, vargs->args_begin,
-                            vargs->args_len, cc);
-                        result_bytes = BuildAsyncFuturePlaceholderReturn();
-                    } else {
-                        result_bytes = is_generic_call
-                            ? proxy.CallRawBytesWithModeString(
-                                  vargs->bucket_id, mode, vargs->storage_mode,
-                                  vargs->func_name, vargs->args_begin,
-                                  vargs->args_len, cc)
-                            : proxy.CallRawBytes(
-                                  vargs->bucket_id, mode, vargs->func_name,
-                                  vargs->args_begin, vargs->args_len, cc);
-                    }
-                } catch (const storages::tarantool::vshard::UnreachableReplicasetError& ex) {
-                    result_bytes = BuildRouterShardingErrorReturn(
-                        8, "UNREACHABLE_REPLICASET", ex.what(),
-                        ex.GetReplicasetId(), ex.GetBucketId());
-                } catch (const storages::tarantool::vshard::NoRouteToBucketError& ex) {
-                    result_bytes = BuildRouterShardingErrorReturn(
-                        9, "NO_ROUTE_TO_BUCKET", ex.what(),
-                        std::nullopt, ex.GetBucketId());
-                } catch (const storages::tarantool::vshard::MovedError& ex) {
-                    // Retries exhausted after MOVED redirect: return as vshard
-                    // DATA so the caller sees [nil, {code=1, name='WRONG_BUCKET'}]
-                    // just like the Lua router does, rather than an IPROTO error.
-                    const auto& dest = ex.GetDestinationUuid();
-                    result_bytes = BuildRouterShardingErrorReturn(
-                        1, "WRONG_BUCKET", ex.what(),
-                        dest.empty() ? std::optional<std::string_view>{}
-                                     : std::optional<std::string_view>{dest},
-                        ex.GetBucketId());
-                } catch (const storages::tarantool::vshard::TransferError& ex) {
-                    // Bucket transfer still in progress after retries exhausted.
-                    result_bytes = BuildRouterShardingErrorReturn(
-                        32, "TRANSFER_IS_IN_PROGRESS", ex.what(),
-                        std::nullopt, std::nullopt);
-                } catch (const std::exception& ex) {
-                    if (IsConnectivityErrorMessage(ex.what())) {
-                        result_bytes = BuildNetboxClientErrorReturn(ex.what());
-                    } else {
-                        throw;
-                    }
-                }
 
-                const auto resp = BuildResultFrameRaw(
-                    req.sync, result_bytes.data(), result_bytes.size());
-                (void)sock.SendAll(resp.data(), resp.size(), engine::Deadline{});
+                // Execute concurrently with the reader loop so that pipelined
+                // requests on this connection are in flight simultaneously.
+                // Copy the request fields out of the reused parse buffer
+                // before the reader overwrites it with the next frame.
+                in_flight.lock_shared();
+                engine::DetachUnscopedUnsafe(engine::AsyncNoSpan(
+                    [&proxy, &conn, &in_flight, sync = req.sync, mode,
+                     is_generic_call, is_async = vargs->is_async,
+                     bucket_id = vargs->bucket_id,
+                     func = std::string{vargs->func_name},
+                     storage_mode = std::string{vargs->storage_mode},
+                     args = std::vector<uint8_t>{
+                         vargs->args_begin,
+                         vargs->args_begin + vargs->args_len},
+                     cc] {
+                        std::vector<uint8_t> result_bytes;
+                        try {
+                            if (is_async) {
+                                proxy.CallAsyncWithModeString(
+                                    bucket_id, mode, storage_mode, func,
+                                    args.data(), args.size(), cc);
+                                result_bytes = BuildAsyncFuturePlaceholderReturn();
+                            } else if (is_generic_call) {
+                                result_bytes = proxy.CallRawBytesWithModeString(
+                                    bucket_id, mode, storage_mode, func,
+                                    args.data(), args.size(), cc);
+                            } else {
+                                result_bytes = proxy.CallRawBytes(
+                                    bucket_id, mode, func, args.data(),
+                                    args.size(), cc);
+                            }
+                        } catch (const storages::tarantool::vshard::
+                                     UnreachableReplicasetError& ex) {
+                            result_bytes = BuildRouterShardingErrorReturn(
+                                8, "UNREACHABLE_REPLICASET", ex.what(),
+                                ex.GetReplicasetId(), ex.GetBucketId());
+                        } catch (const storages::tarantool::vshard::
+                                     NoRouteToBucketError& ex) {
+                            result_bytes = BuildRouterShardingErrorReturn(
+                                9, "NO_ROUTE_TO_BUCKET", ex.what(), std::nullopt,
+                                ex.GetBucketId());
+                        } catch (const storages::tarantool::vshard::MovedError&
+                                     ex) {
+                            // Retries exhausted after MOVED redirect: return as
+                            // vshard DATA so the caller sees
+                            // [nil, {code=1, name='WRONG_BUCKET'}] just like
+                            // the Lua router does, rather than an IPROTO error.
+                            const auto& dest = ex.GetDestinationUuid();
+                            result_bytes = BuildRouterShardingErrorReturn(
+                                1, "WRONG_BUCKET", ex.what(),
+                                dest.empty()
+                                    ? std::optional<std::string_view>{}
+                                    : std::optional<std::string_view>{dest},
+                                ex.GetBucketId());
+                        } catch (const storages::tarantool::vshard::
+                                     TransferError& ex) {
+                            // Bucket transfer still in progress after retries
+                            // exhausted.
+                            result_bytes = BuildRouterShardingErrorReturn(
+                                32, "TRANSFER_IS_IN_PROGRESS", ex.what(),
+                                std::nullopt, std::nullopt);
+                        } catch (const std::exception& ex) {
+                            if (IsConnectivityErrorMessage(ex.what())) {
+                                result_bytes =
+                                    BuildNetboxClientErrorReturn(ex.what());
+                            } else {
+                                // Match the old inline behaviour: unexpected
+                                // errors become IPROTO error frames.
+                                try {
+                                    const auto err = tnt::BuildIprotoErrorFrame(
+                                        sync, kSchemaVersion, ex.what());
+                                    (void)conn.Send(err.data(), err.size());
+                                } catch (...) {
+                                    LOG_WARNING()
+                                        << "iproto_server: request handler "
+                                           "error: "
+                                        << ex.what();
+                                }
+                                in_flight.unlock_shared();
+                                return;
+                            }
+                        }
+
+                        const auto resp = BuildResultFrameRaw(
+                            sync, result_bytes.data(), result_bytes.size());
+                        (void)conn.Send(resp.data(), resp.size());
+                        in_flight.unlock_shared();
+                    }));
+                    // NB: the engine::Task destructor cancels and joins the
+                    // task — a temporary TaskWithResult would kill the
+                    // handler before its first step (observed: requests hung
+                    // forever). DetachUnscopedUnsafe is safe here: handler
+                    // references (proxy, conn) stay alive until the
+                    // in_flight semaphore drain at connection close.
 
             } else {
                 LOG_WARNING() << "iproto_server: unsupported request type 0x"
                               << static_cast<unsigned>(req.type);
                 const auto resp = tnt::BuildIprotoErrorFrame(
                     req.sync, kSchemaVersion, "unsupported request type");
-                (void)sock.SendAll(resp.data(), resp.size(), engine::Deadline{});
+                (void)conn.Send(resp.data(), resp.size());
             }
         } catch (const std::exception& ex) {
             LOG_DEBUG() << "iproto_server: request error: " << ex.what();
             try {
                 const auto resp = tnt::BuildIprotoErrorFrame(
                     req.sync, kSchemaVersion, ex.what());
-                (void)sock.SendAll(resp.data(), resp.size(), engine::Deadline{});
+                (void)conn.Send(resp.data(), resp.size());
             } catch (...) {
                 break;  // can't write back, drop connection
             }
         }
+    }
+
+    // 4. Drain: wait until every in-flight handler task has completed so
+    // nothing touches conn afterwards, then let the flush task push the
+    // remaining staged replies and stop.
+    for (std::size_t i = 0; i < kMaxRequestsInFlight; ++i) {
+        in_flight.lock_shared();
+    }
+    conn.StartClosing();
+    try {
+        flush_task.Get();
+    } catch (const std::exception& ex) {
+        LOG_DEBUG() << "iproto_server: flush task ended: " << ex.what();
     }
 }
 
