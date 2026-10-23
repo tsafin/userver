@@ -571,3 +571,13 @@ client = **243k ops/s** on one master (wal none) — the Lua-CALL path in
 Tarantool costs ~2.4x over raw IPROTO replace.
 
 Loadgen gained `--storage-direct` (vshard.storage.call arg format).
+
+### Round 20261023h — ASAN clean (git=39d5de4f7)
+
+AddressSanitizer build (RelWithDebInfo, USERVER_SANITIZE=addr; note:
+configure requires -DUSERVER_IS_THE_ROOT_PROJECT=ON for the vshard
+targets): 230k+ pipelined ops (incl. 16x200 depth-200 bursts) plus 8
+parallel short-lived loadgen processes for connection churn (drain/close
+paths) — **zero ASAN findings, zero request errors**, proxy survived all
+teardowns. The concurrent request handling (Phase 1c) and forwarding path
+(Phase 2) are memory-clean under ASAN.
