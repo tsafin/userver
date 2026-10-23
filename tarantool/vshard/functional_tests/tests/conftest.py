@@ -22,6 +22,19 @@ import tarantool
 # Bucket count for the local vshard example cluster.
 BUCKET_COUNT = 3000
 
+# Optional extra master-only replicasets of the scaled benchmark stand
+# (vshard example RS3-RS8 on 127.0.0.1:3311-3316).  Included only when the
+# port is accepting connections, so the suite works on both the stock 2-RS
+# and the scaled 8-RS stands.
+EXTRA_REPLICASETS = [
+    ('cd3a0000-0000-4000-8000-000000000003', 3311, 'storage_3'),
+    ('cd3a0000-0000-4000-8000-000000000004', 3312, 'storage_4'),
+    ('cd3a0000-0000-4000-8000-000000000005', 3313, 'storage_5'),
+    ('cd3a0000-0000-4000-8000-000000000006', 3314, 'storage_6'),
+    ('cd3a0000-0000-4000-8000-000000000007', 3315, 'storage_7'),
+    ('cd3a0000-0000-4000-8000-000000000008', 3316, 'storage_8'),
+]
+
 # Fixed UUIDs matching the canonical vshard example localcfg.lua.
 RS1_UUID = 'cbf06940-0790-498b-948d-042b62cf3d29'
 RS2_UUID = 'ac522f65-aa94-4134-9f64-51ee384f1a54'
@@ -265,12 +278,19 @@ def vshard_cluster(vshard_example_dir, cluster_ports, cluster_tmpdir):
     _wait_for_storage_ready(ports['rs2_master'])
     _wait_for_buckets_distributed(ports['lua_router'])
 
+    # Live extra master-only replicasets (scaled 8-RS stand), if any.
+    extra_masters = []
+    for rs_uuid, port, name in EXTRA_REPLICASETS:
+        if _wait_for_port('127.0.0.1', port, timeout=0.3):
+            extra_masters.append({'uuid': rs_uuid, 'port': port, 'name': name})
+
     yield {
         'ports': ports,
         'tmpdir': cluster_tmpdir,
         'example_dir': vshard_example_dir,
         'bucket_count': BUCKET_COUNT,
         'reused_existing': reuse_existing,
+        'extra_masters': extra_masters,
     }
 
     if not reuse_existing:
@@ -339,6 +359,24 @@ def secdist_config(vshard_cluster):
             },
         },
     }
+    # Attach live extra masters (8-RS stand) to the secdist.
+    import socket as _socket
+    for rs_uuid, port, name in EXTRA_REPLICASETS:
+        try:
+            probe = _socket.create_connection(('127.0.0.1', port), timeout=0.3)
+            probe.close()
+        except OSError:
+            continue
+        config['tarantool_vshard_settings']['tarantool-vshard'][
+            'replicasets'].append(
+            {
+                'uuid': rs_uuid,
+                'nodes': [
+                    {'host': '127.0.0.1', 'port': port,
+                     'is_master': True, 'name': name},
+                ],
+            })
+
     secdist_path = os.path.join(vshard_cluster['tmpdir'], 'secdist.json')
     with open(secdist_path, 'w') as f:
         json.dump(config, f)

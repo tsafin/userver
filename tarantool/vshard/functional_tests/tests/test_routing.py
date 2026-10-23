@@ -392,12 +392,22 @@ class TestBucketId:
 
 def _bucket_owner_uuid(vshard_cluster, bucket_id):
     ports = vshard_cluster['ports']
-    for rs_name, rs_uuid in (
+    known = [
         ('rs1_master', 'cbf06940-0790-498b-948d-042b62cf3d29'),
         ('rs2_master', 'ac522f65-aa94-4134-9f64-51ee384f1a54'),
-    ):
+    ] + [
+        ('extra', m['uuid'])
+        for m in vshard_cluster.get('extra_masters', [])
+    ]
+    for rs_name, rs_uuid in known:
+        port = ports.get(rs_name)
+        if port is None:
+            port = dict(
+                (m['uuid'], m['port'])
+                for m in vshard_cluster.get('extra_masters', [])
+            )[rs_uuid]
         conn = tarantool.connect(
-            '127.0.0.1', ports[rs_name], user='storage', password='storage',
+            '127.0.0.1', port, user='storage', password='storage',
         )
         try:
             result = conn.call('vshard.storage.bucket_stat', [bucket_id])

@@ -58,6 +58,10 @@ struct Args {
     long timeout_ms = 5000;
     std::string router_func = "vshard.router.callrw";
     std::string space_op = "box.space.customer:replace";
+    /// Talk vshard.storage.call directly to a storage node (for byte-relay
+    /// probes): args [bucket, mode, func, [tuple]] instead of
+    /// vshard.router.callrw args [bucket, func, [tuple]].
+    bool storage_direct{false};
 };
 
 Args ParseArgs(int argc, char** argv) {
@@ -82,6 +86,7 @@ Args ParseArgs(int argc, char** argv) {
         else if (k == "--password")    a.password = need(i++);
         else if (k == "--timeout-ms")  a.timeout_ms = std::stol(need(i++));
         else if (k == "--router-func") a.router_func = need(i++);
+        else if (k == "--storage-direct") a.storage_direct = true;
         else if (k == "--space-op")    a.space_op = need(i++);
         else {
             std::cerr << "unknown arg: " << k << "\n";
@@ -102,18 +107,28 @@ void RunWorker(storages::tarantool::impl::Connection& conn, const Args& a,
         const auto deadline =
             engine::Deadline::FromDuration(std::chrono::milliseconds{a.timeout_ms});
         try {
-            auto args = formats::msgpack::ValueBuilder::Array();
-            args.PushBack(formats::msgpack::ValueBuilder{static_cast<uint64_t>(bid)});
-            args.PushBack(formats::msgpack::ValueBuilder{a.space_op});
             auto tuple = formats::msgpack::ValueBuilder::Array();
             tuple.PushBack(formats::msgpack::ValueBuilder{static_cast<uint64_t>(bid)});
             tuple.PushBack(formats::msgpack::ValueBuilder{static_cast<uint64_t>(bid)});
             tuple.PushBack(formats::msgpack::ValueBuilder{"x"});
             auto inner = formats::msgpack::ValueBuilder::Array();
             inner.PushBack(std::move(tuple));
-            args.PushBack(std::move(inner));
 
-            auto query = storages::tarantool::Query::Call(a.router_func, std::move(args));
+            formats::msgpack::ValueBuilder args = formats::msgpack::ValueBuilder::Array();
+            if (a.storage_direct) {
+                args.PushBack(formats::msgpack::ValueBuilder{static_cast<uint64_t>(bid)});
+                args.PushBack(formats::msgpack::ValueBuilder{std::string{"write"}});
+                args.PushBack(formats::msgpack::ValueBuilder{a.space_op});
+                args.PushBack(std::move(inner));
+            } else {
+                args.PushBack(formats::msgpack::ValueBuilder{static_cast<uint64_t>(bid)});
+                args.PushBack(formats::msgpack::ValueBuilder{a.space_op});
+                args.PushBack(std::move(inner));
+            }
+
+            const std::string& func =
+                a.storage_direct ? std::string{"vshard.storage.call"} : a.router_func;
+            auto query = storages::tarantool::Query::Call(func, std::move(args));
             auto fut = conn.ExecuteAsync(deadline, query);
             auto res = fut.get();
             if (!res.IsOk()) ++errors;
