@@ -22,13 +22,18 @@ wal_mode=none, pipelined-клиент), +34% к Lua-роутеру. Все
 - [ ] TSAN-сборка + короткий прогон (если переживает TSAN-замедление)
 
 ## P3. Прототип thread-per-core + io_uring (главный софтверный путь к 1M)
-Шаг 0 (этот заход): **замер потолка подхода** — минимальный IPROTO-прокси
-на io_uring (1 поток = 1 ядро, свои соединения клиент+storage, ноль локов):
-- [ ] `probe_io_uring`: N-воркерный io_uring echo/proxy на loopback;
-      сравнить ops/s и CPU/op против userver-прокси на том же стенде
-- [ ] Критерий: если CPU/op ≥ 2x лучше — начинать полноценный порт
-      протокольного слоя (`ParseIprotoRequest`, `CallRouteInfo`,
-      `ParseCallBody` уже изолированы в iproto_frames.hpp / iproto_server.cpp)
+Шаг 0 (завершён 2026-10-23): **замер потолка подхода заблокирован
+платформой** — io_uring в WSL2-ядре (6.18 microsoft-standard) отдаёт
+completions лениво/сломанно: poll-completion через ~15M итераций горячего
+цикла, io_uring_submit возвращает 0 при заполненном SQ. Код probe сохранён
+в ветке `exp/p3-iouring-probe` (bench/EXPERIMENTS-io_uring.md). Бонус-факт:
+direct storage через лёгкий клиент = **243k ops/s** на одном мастере
+(wal none) — Lua-CALL-путь Tarantool стоит ~2.4x.
+- [ ] ПОВТОРИТЬ на bare metal: собрать `probe` (gcc -O2 probe.c -luring),
+      замерить релей против userver-прокси тем же loadgen
+      (--storage-direct); если CPU/op ≥ 2x лучше — порт протокольного слоя
+      (`ParseIprotoRequest`, `CallRouteInfo`, `ParseCallBody` уже изолированы
+      в iproto_frames.hpp / iproto_server.cpp)
 Шаги 1+ (отдельный проект, вне userver): полномасштабный standalone-прокси
 (роутинг бакетов, MOVED-логика, discovery) — переиспользует алгоритмы
 vshard_proxy.cpp.
