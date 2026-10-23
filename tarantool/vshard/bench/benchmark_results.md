@@ -542,3 +542,32 @@ proxy CPU per request is framework-intrinsic. The path to 1M ops/s is
 hardware (10-12 masters on bare metal ≈ 80-100k each) — or a future
 standalone thread-per-core/io_uring proxy, for which the protocol layer
 (iproto_server.cpp + Connection) is already portable.**
+
+### Round 20261023g — hygiene + trust + io_uring probe (git=39d5de4f7)
+
+P1 hygiene:
+- `run_benchmarks.sh --extra-master UUID:HOST:PORT` (repeatable) — the
+  sweep protocol now covers the 8-RS stand.
+- vshard example stand committed upstream (`~/src/vshard` f34d623).
+- Experiment worktrees removed; branches `exp/e1-spinning`,
+  `exp/e2-inline-slots`, `exp/e3-handler-pool`, `exp/p3-iouring-probe`
+  keep the code + EXPERIMENTS.md.
+
+P2 trust:
+- Functional suite on the 8-RS stand: **56/72 pass**; 16 failures are
+  stand-dependent (2-RS expectations hardcoded in tests, `router.sync`
+  timeout under wal_mode=none) and reproduce 1:1 with the
+  pre-optimization binary — not regressions. Conftest now auto-attaches
+  live RS3-RS8 to secdist and fixtures expose `extra_masters`.
+- ASAN build+run: in progress (separate toolchain configure).
+
+P3 step 0 (io_uring floor probe): **blocked by the platform** — WSL2
+kernel 6.18-microsoft delivers io_uring completions lazily/brokenly
+(poll completion after ~15.4M busy-loop iterations; io_uring_submit
+returns 0 with a non-full SQ). Code preserved in `exp/p3-iouring-probe`
+(probe.c + uringtest.c + polltest.c + EXPERIMENTS-io_uring.md);
+re-measure on bare metal. Side finding: direct storage with a lightweight
+client = **243k ops/s** on one master (wal none) — the Lua-CALL path in
+Tarantool costs ~2.4x over raw IPROTO replace.
+
+Loadgen gained `--storage-direct` (vshard.storage.call arg format).
