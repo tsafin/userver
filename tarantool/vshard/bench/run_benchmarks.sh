@@ -37,6 +37,9 @@ PROXY_BINARY=""
 LUA_ROUTER="localhost:3305"
 RS1_MASTER="127.0.0.1:3301"
 RS2_MASTER="127.0.0.1:3303"
+# Additional masters beyond RS1/RS2, format UUID:HOST:PORT (repeatable).
+# The current 8-RS stand: cd3a0000-...03@127.0.0.1:3311 ... -08@3316.
+EXTRA_MASTERS=()
 FIBER_COUNTS="10,20,50,100,150"
 OPS=100000
 OUTPUT_FILE="${SCRIPT_DIR}/benchmark_results.md"
@@ -51,6 +54,7 @@ while [[ $# -gt 0 ]]; do
         --lua-router)     LUA_ROUTER="$2";      shift 2 ;;
         --rs1-master)     RS1_MASTER="$2";      shift 2 ;;
         --rs2-master)     RS2_MASTER="$2";      shift 2 ;;
+        --extra-master)   EXTRA_MASTERS+=("$2"); shift 2 ;;
         --fiber-counts)   FIBER_COUNTS="$2";    shift 2 ;;
         --fibers)         FIBER_COUNTS="$2";    shift 2 ;;
         --ops)            OPS="$2";             shift 2 ;;
@@ -194,12 +198,28 @@ cat > "${CPP_SECDIST}" << JSON
                     "nodes": [
                         {"host": "${RS2_MASTER%%:*}", "port": ${RS2_MASTER##*:}, "is_master": true}
                     ]
-                }
+                }${EXTRA_RS_JSON}
             ]
         }
     }
 }
 JSON
+
+# Build the extra-replicasets JSON from --extra-master UUID:HOST:PORT args.
+EXTRA_RS_JSON=""
+for m in "${EXTRA_MASTERS[@]}"; do
+    m_uuid="${m%%:*}"
+    m_rest="${m#*:}"
+    m_host="${m_rest%%:*}"
+    m_port="${m_rest##*:}"
+    EXTRA_RS_JSON+=",
+                {
+                    \"uuid\": \"${m_uuid}\",
+                    \"nodes\": [
+                        {\"host\": \"${m_host}\", \"port\": ${m_port}, \"is_master\": true}
+                    ]
+                }"
+done
 
 # Static config mirrors what the functional tests' conftest.py generates.
 cat > "${CPP_PROXY_CONFIG}" << YAML
