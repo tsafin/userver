@@ -601,3 +601,19 @@ keep an eye on bucket ownership after restarting RS instances mid-transfer.
 
 Final state: **64 passed, 8 skipped** (documented stand/version skips),
 stable across consecutive runs. TSAN run pending build fix.
+
+### Round 20261024b — TSAN run (git=2b742b263 + tsan.hpp GCC fix)
+
+- Fixed userver's `universal/.../compiler/impl/tsan.hpp` for GCC: it probed
+  only `__has_feature(thread_sanitizer)` (Clang-only); GCC defines
+  `__SANITIZE_THREAD__` instead, so every GCC+TSAN build failed with
+  "Broken CMake: thread sanitizer is not used however Boost thinks it is".
+  Also required `setarch -R` (TSAN + high-entropy ASLR mapping error).
+- 30k pipelined ops (8x50) under TSAN: 31 reports, ALL in framework /
+  3rd-party code — StackUsageMonitor telemetry (2), boost::lockfree
+  tagged-pointer freelist of the connection pool (27; known TSAN false
+  positives with bit-packed atomics), ResultStore plumbing (2). **Zero
+  races attributable to vshard proxy or connector hot-path logic.**
+  Caveat: TSAN is blind to stackful-coroutine switches, so cross-coroutine
+  happens-before is under-reported; ASAN (clean) + functional coverage
+  remain the primary correctness gates.
