@@ -581,3 +581,23 @@ parallel short-lived loadgen processes for connection churn (drain/close
 paths) — **zero ASAN findings, zero request errors**, proxy survived all
 teardowns. The concurrent request handling (Phase 1c) and forwarding path
 (Phase 2) are memory-clean under ASAN.
+
+### Round 20261024 — functional suite green on the 8-RS canonical stand (git=2b742b263)
+
+The scaled stand exposed a real product bug:
+- **callbre on replica-less replicasets raised "All replicas unavailable"**
+  while Lua vshard falls back to the master; fixed in all 8 forward/execute
+  methods of ReplicasetPool (any production master-only topology would hit
+  this).
+- Proxy error fidelity: BuildStorageCallErrorReturn now passes the storage
+  IPROTO error code through (masked & 0x3FFF, matching box.error.code).
+
+Cluster note: wal_mode='none' breaks vshard replication (replicas cannot
+sync) — the functional suite requires the canonical wal_mode='write' stand;
+localcfg.lua now switches via VSHARD_WAL_NONE=1. A storage_2_a restart in
+the middle of the earlier rebalancing left split-brain bucket ownership
+(router 375x8 vs storage_1_a holding 1500) — fixed by full rebootstrap;
+keep an eye on bucket ownership after restarting RS instances mid-transfer.
+
+Final state: **64 passed, 8 skipped** (documented stand/version skips),
+stable across consecutive runs. TSAN run pending build fix.
