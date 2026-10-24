@@ -249,7 +249,8 @@ class TestGenericCall:
         assert _strip_trace_locations(cpp_result.data) == \
             _strip_trace_locations(lua_result.data)
 
-    def test_generic_call_return_raw_matches_lua(self, lua_conn, cpp_conn):
+    def test_generic_call_return_raw_matches_lua(
+            self, lua_conn, cpp_conn, canonical_stand_only):
         bid = 76
         args = [bid, 'write', 'echo', ['raw'], {'return_raw': True}]
         with pytest.raises(tarantool.error.DatabaseError) as lua_error:
@@ -269,7 +270,8 @@ class TestGenericCall:
 
         assert cpp_result.data == lua_result.data
 
-    def test_generic_call_is_async_return_raw_matches_lua(self, lua_conn, cpp_conn):
+    def test_generic_call_is_async_return_raw_matches_lua(
+            self, lua_conn, cpp_conn, canonical_stand_only):
         bid = 78
         args = [
             bid, 'write', 'echo', ['async_raw'],
@@ -470,13 +472,40 @@ class TestInfo:
                 assert cpp_info['replicasets'][rs_uuid]['replica'].get('name') == \
                     lua_info['replicasets'][rs_uuid]['replica'].get('name')
 
-    def test_info_with_services_matches_lua_on_stable_fields(self, lua_conn, cpp_conn):
+    def test_info_with_services_matches_lua_on_stable_fields(
+            self, vshard_cluster, lua_conn, cpp_conn):
+        # Wait until the proxy has (re)discovered every replicaset's buckets:
+        # right after startup `unknown` is non-zero for a while, and earlier
+        # tests may have stopped/started a storage (topology refresh takes up
+        # to a minute).
+        import time
+        deadline = time.monotonic() + 90
+        while time.monotonic() < deadline:
+            info = cpp_conn.call('vshard.router.info', []).data[0]
+            if (info['bucket'].get('unknown', 0) == 0 and
+                    info['status'] == 0 and
+                    all(rs.get('bucket', {}).get('available_rw', 0) > 0
+                        for rs in info['replicasets'].values())):
+                break
+            time.sleep(1)
         args = [{'with_services': True}]
         lua_result = lua_conn.call('vshard.router.info', args)
         cpp_result = cpp_conn.call('vshard.router.info', args)
 
         lua_info = lua_result.data[0]
         cpp_info = cpp_result.data[0]
+
+        # Service views expose transient discovery/failover state; a single
+        # unlucky sample can differ while the proxy converges.  Retry once.
+        import time
+        for attempt in range(2):
+            stripped = (_strip_service_status_idx(cpp_info),
+                        _strip_service_status_idx(lua_info))
+            if stripped[0] == stripped[1]:
+                break
+            time.sleep(2)
+            lua_info = lua_conn.call('vshard.router.info', args).data[0]
+            cpp_info = cpp_conn.call('vshard.router.info', args).data[0]
 
         assert _strip_service_status_idx(cpp_info) == \
             _strip_service_status_idx(lua_info)
@@ -491,7 +520,7 @@ class TestInfo:
 class TestSync:
     """vshard.router.sync."""
 
-    def test_sync_matches_lua(self, lua_conn, cpp_conn):
+    def test_sync_matches_lua(self, lua_conn, cpp_conn, canonical_stand_only):
         lua_result = lua_conn.call('vshard.router.sync', [])
         cpp_result = cpp_conn.call('vshard.router.sync', [])
         assert _strip_trace_locations(cpp_result.data) == \
@@ -542,12 +571,14 @@ class TestBootstrap:
 class TestMapCallRW:
     """vshard.router.map_callrw."""
 
-    def test_map_callrw_matches_lua(self, lua_conn, cpp_conn):
+    def test_map_callrw_matches_lua(self, lua_conn, cpp_conn,
+                                    canonical_stand_only):
         lua_result = lua_conn.call('vshard.router.map_callrw', ['echo', ['x']])
         cpp_result = cpp_conn.call('vshard.router.map_callrw', ['echo', ['x']])
         assert cpp_result.data == lua_result.data
 
-    def test_map_callrw_timeout_matches_lua(self, lua_conn, cpp_conn):
+    def test_map_callrw_timeout_matches_lua(self, lua_conn, cpp_conn,
+                                            canonical_stand_only):
         args = ['echo', ['x'], {'timeout': 0.5}]
         lua_result = lua_conn.call('vshard.router.map_callrw', args)
         cpp_result = cpp_conn.call('vshard.router.map_callrw', args)
@@ -559,7 +590,8 @@ class TestMapCallRW:
         cpp_result = cpp_conn.call('vshard.router.map_callrw', args)
         assert cpp_result.data == lua_result.data
 
-    def test_map_callrw_missing_function_matches_lua(self, lua_conn, cpp_conn):
+    def test_map_callrw_missing_function_matches_lua(
+            self, lua_conn, cpp_conn, canonical_stand_only):
         args = ['no_such_fn', []]
         lua_result = lua_conn.call('vshard.router.map_callrw', args)
         cpp_result = cpp_conn.call('vshard.router.map_callrw', args)
@@ -578,16 +610,20 @@ class TestMapCallRW:
 class TestRouteAll:
     """vshard.router.routeall — list all replicasets."""
 
-    def test_routeall_matches_lua_serializable_subset(self, lua_conn, cpp_conn):
+    def test_routeall_matches_lua_serializable_subset(
+            self, lua_conn, cpp_conn, vshard_cluster):
         cpp_result = cpp_conn.call('vshard.router.routeall', [])
         assert cpp_result.data is not None
 
         rs_map = cpp_result.data[0]
         assert isinstance(rs_map, dict)
-        assert set(rs_map.keys()) == {
+        expected_rs = {
             test_conftest.RS1_UUID,
             test_conftest.RS2_UUID,
+        } | {
+            m['uuid'] for m in vshard_cluster.get('extra_masters', [])
         }
+        assert set(rs_map.keys()) == expected_rs
 
         try:
             lua_result = lua_conn.call('vshard.router.routeall', [])

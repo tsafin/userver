@@ -65,9 +65,10 @@ storages::tarantool::ExecutionResult ReplicasetPool::Execute(
             return SelectReplica().Execute(cc, query);
 
         case CallMode::kBestReadOnlyError:
-            if (!IsReplicaAvailable()) {
-                throw ReplicaUnavailableError{uuid_};
-            }
+            // Lua vshard semantics (replicaset_template_multicallro,
+            // prefer_replica=true): fall back to the master when no
+            // replica is available - a replica-less replicaset is not
+            // an error for reads (SelectReplica already falls back).
             return SelectReplica().Execute(cc, query);
     }
     return master_->Execute(cc, query);
@@ -90,9 +91,10 @@ engine::Future<storages::tarantool::ExecutionResult> ReplicasetPool::ExecuteAsyn
             return SelectReplica().ExecuteAsync(cc, query);
 
         case CallMode::kBestReadOnlyError:
-            if (!IsReplicaAvailable()) {
-                throw ReplicaUnavailableError{uuid_};
-            }
+            // Lua vshard semantics (replicaset_template_multicallro,
+            // prefer_replica=true): fall back to the master when no
+            // replica is available - a replica-less replicaset is not
+            // an error for reads (SelectReplica already falls back).
             return SelectReplica().ExecuteAsync(cc, query);
     }
     return master_->ExecuteAsync(cc, query);
@@ -119,9 +121,10 @@ storages::tarantool::ExecutionResult ReplicasetPool::ForwardStorageCall(
             return SelectReplica().ForwardStorageCall(info, cc);
 
         case CallMode::kBestReadOnlyError:
-            if (!IsReplicaAvailable()) {
-                throw ReplicaUnavailableError{uuid_};
-            }
+            // Lua vshard semantics (replicaset_template_multicallro,
+            // prefer_replica=true): fall back to the master when no
+            // replica is available - a replica-less replicaset is not
+            // an error for reads (SelectReplica already falls back).
             return SelectReplica().ForwardStorageCall(info, cc);
     }
     return master_->ForwardStorageCall(info, cc);
@@ -148,9 +151,8 @@ storages::tarantool::ExecutionResult ReplicasetPool::ForwardVshardCall(
             return SelectReplica().ForwardVshardCall(info.bucket_id, info.mode,
                                                      body, body_len, cc);
         case CallMode::kBestReadOnlyError:
-            if (!IsReplicaAvailable()) {
-                throw ReplicaUnavailableError{uuid_};
-            }
+            // Lua vshard semantics: fall back to the master when no replica
+            // is available (see the note above).
             return SelectReplica().ForwardVshardCall(info.bucket_id, info.mode,
                                                      body, body_len, cc);
     }
@@ -175,9 +177,10 @@ storages::tarantool::ExecutionResult ReplicasetPool::ExecuteDirect(
             return SelectReplica().ExecuteDirect(deadline, query);
 
         case CallMode::kBestReadOnlyError:
-            if (!IsReplicaAvailable()) {
-                throw ReplicaUnavailableError{uuid_};
-            }
+            // Lua vshard semantics (replicaset_template_multicallro,
+            // prefer_replica=true): fall back to the master when no
+            // replica is available - a replica-less replicaset is not
+            // an error for reads (SelectReplica already falls back).
             return SelectReplica().ExecuteDirect(deadline, query);
     }
     return master_->ExecuteDirect(deadline, query);
@@ -200,9 +203,10 @@ storages::tarantool::ExecutionResult ReplicasetPool::ForwardStorageCallDirect(
             return SelectReplica().ForwardStorageCallDirect(info, deadline);
 
         case CallMode::kBestReadOnlyError:
-            if (!IsReplicaAvailable()) {
-                throw ReplicaUnavailableError{uuid_};
-            }
+            // Lua vshard semantics (replicaset_template_multicallro,
+            // prefer_replica=true): fall back to the master when no
+            // replica is available - a replica-less replicaset is not
+            // an error for reads (SelectReplica already falls back).
             return SelectReplica().ForwardStorageCallDirect(info, deadline);
     }
     return master_->ForwardStorageCallDirect(info, deadline);
@@ -228,9 +232,8 @@ storages::tarantool::ExecutionResult ReplicasetPool::ForwardVshardCallDirect(
             return SelectReplica().ForwardVshardCallDirect(info.bucket_id, info.mode,
                                                            body, body_len, deadline);
         case CallMode::kBestReadOnlyError:
-            if (!IsReplicaAvailable()) {
-                throw ReplicaUnavailableError{uuid_};
-            }
+            // Lua vshard semantics: fall back to the master when no replica
+            // is available (see the note above).
             return SelectReplica().ForwardVshardCallDirect(info.bucket_id, info.mode,
                                                            body, body_len, deadline);
     }

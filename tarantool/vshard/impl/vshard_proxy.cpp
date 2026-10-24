@@ -33,7 +33,8 @@ namespace {
 namespace tnt = storages::tarantool::impl;
 constexpr std::string_view kThisFile = __FILE__;
 
-std::vector<uint8_t> BuildStorageCallErrorReturn(std::string_view message) {
+std::vector<uint8_t> BuildStorageCallErrorReturn(
+    std::string_view message, std::optional<uint32_t> code = std::nullopt) {
     static constexpr std::string_view kErrorType = "LuajitError";
 
     std::vector<uint8_t> buf;
@@ -42,7 +43,14 @@ std::vector<uint8_t> BuildStorageCallErrorReturn(std::string_view message) {
     tnt::EncodeArray(buf, 2);
     tnt::EncodeNil(buf);
 
-    tnt::EncodeFixMap(buf, 4);
+    // The Lua router passes the storage/IPROTO error code through to the
+    // client inside the error map; mirror that for differential fidelity.
+    std::size_t field_count = code ? 5 : 4;
+    tnt::EncodeFixMap(buf, static_cast<uint8_t>(field_count));
+    if (code) {
+        tnt::EncodeStr(buf, "code");
+        tnt::EncodeUint(buf, *code);
+    }
     tnt::EncodeStr(buf, "base_type");
     tnt::EncodeStr(buf, kErrorType);
     tnt::EncodeStr(buf, "type");
@@ -730,7 +738,8 @@ std::vector<uint8_t> VshardProxy::DoCallRawBytes(
         try {
             raw = rs->ExecuteDirect(mode, query, deadline);
         } catch (const storages::tarantool::CommandException& ex) {
-            return BuildStorageCallErrorReturn(ex.what());
+            return BuildStorageCallErrorReturn(ex.what(),
+                                                  ex.GetErrorCode() & 0x3FFF);
         } catch (const engine::io::IoException& ex) {
             return BuildNetboxClientErrorReturn(ex.what());
         } catch (const storages::tarantool::TarantoolException& ex) {
@@ -759,7 +768,8 @@ std::vector<uint8_t> VshardProxy::DoCallRawBytes(
         try {
             env = impl::DecodeEnvelopeRaw(raw);
         } catch (const storages::tarantool::CommandException& ex) {
-            return BuildStorageCallErrorReturn(ex.what());
+            return BuildStorageCallErrorReturn(ex.what(),
+                                                  ex.GetErrorCode() & 0x3FFF);
         }
 
         if (env.status != impl::RawEnvelopeStatus::kVshardError) {
@@ -886,7 +896,8 @@ std::vector<uint8_t> VshardProxy::DoCallForwardBytes(
         try {
             raw = rs->ForwardStorageCallDirect(mode, info, deadline);
         } catch (const storages::tarantool::CommandException& ex) {
-            return BuildStorageCallErrorReturn(ex.what());
+            return BuildStorageCallErrorReturn(ex.what(),
+                                                  ex.GetErrorCode() & 0x3FFF);
         } catch (const engine::io::IoException& ex) {
             return BuildNetboxClientErrorReturn(ex.what());
         } catch (const storages::tarantool::TarantoolException& ex) {
@@ -915,7 +926,8 @@ std::vector<uint8_t> VshardProxy::DoCallForwardBytes(
         try {
             env = impl::DecodeEnvelopeRaw(raw);
         } catch (const storages::tarantool::CommandException& ex) {
-            return BuildStorageCallErrorReturn(ex.what());
+            return BuildStorageCallErrorReturn(ex.what(),
+                                                  ex.GetErrorCode() & 0x3FFF);
         }
 
         if (env.status != impl::RawEnvelopeStatus::kVshardError) {
