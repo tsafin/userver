@@ -1,0 +1,141 @@
+#pragma once
+
+/// @file vshard/impl/replicaset_pool.hpp
+/// @brief One vshard replicaset: a master pool + N replica pools.
+
+#include <atomic>
+#include <memory>
+#include <string>
+#include <vector>
+
+#include <userver/engine/deadline.hpp>
+#include <userver/engine/future.hpp>
+#include <userver/storages/tarantool/options.hpp>
+#include <userver/storages/tarantool/query.hpp>
+#include <userver/storages/tarantool/result.hpp>
+#include <userver/utils/statistics/writer.hpp>
+
+#include <storages/tarantool/impl/iproto_frames.hpp>
+#include <storages/tarantool/impl/pool.hpp>
+
+#include <vshard/impl/iproto_vshard_frames.hpp>
+
+USERVER_NAMESPACE_BEGIN
+
+namespace storages::tarantool::vshard::impl {
+
+/// Read/write mode for vshard calls.
+enum class CallMode {
+    kReadWrite,         ///< Route to master (rw)
+    kReadOnly,          ///< Round-robin replicas; fall back to master (ro)
+    kBestReadOnly,      ///< Like kReadOnly but silently fall back (bro)
+    kBestReadOnlyError, ///< Like kReadOnly but throw if no replica (bre)
+};
+
+std::string_view ToString(CallMode) noexcept;
+
+/// A vshard replicaset: one master Pool + zero-or-more replica Pools.
+///
+/// Routing rules:
+/// - `kReadWrite` / `kBestReadOnlyError` → always `master_`
+/// - `kReadOnly` → round-robin `replicas_`; fall back to master if unavailable
+/// - `kBestReadOnly` → round-robin `replicas_`; fall back to master silently
+class ReplicasetPool final {
+ public:
+    struct InstanceMeta {
+        std::string host;
+        uint16_t port{0};
+        std::string uuid;
+        std::string name;
+    };
+
+    explicit ReplicasetPool(
+        std::string uuid, std::string name,
+        std::shared_ptr<storages::tarantool::impl::Pool> master,
+        InstanceMeta master_meta);
+
+    /// Add a replica pool. Call before first request.
+    void AddReplica(
+        std::shared_ptr<storages::tarantool::impl::Pool> replica,
+        InstanceMeta meta);
+
+    /// Execute a query on the appropriate pool based on call mode.
+    storages::tarantool::ExecutionResult Execute(
+        CallMode mode,
+        const storages::tarantool::Query& query,
+        storages::tarantool::OptionalCommandControl cc = {});
+    engine::Future<storages::tarantool::ExecutionResult> ExecuteAsync(
+        CallMode mode,
+        const storages::tarantool::Query& query,
+        storages::tarantool::OptionalCommandControl cc = {});
+
+    storages::tarantool::impl::ConnectionPtr AcquireMaster(
+        engine::Deadline deadline);
+
+    /// Forward a pre-parsed IPROTO CALL body as vshard.storage.call.
+    /// No msgpack re-encoding: TUPLE bytes are copied once from info.
+    storages::tarantool::ExecutionResult ForwardStorageCall(
+        CallMode mode,
+        const storages::tarantool::impl::CallRouteInfo& info,
+        storages::tarantool::OptionalCommandControl cc = {});
+
+    /// Forward an IPROTO_VSHARD_CALL to the appropriate pool.
+    /// Routes master/replica by info.mode (0=ro→replica, 1=rw→master).
+    storages::tarantool::ExecutionResult ForwardVshardCall(
+        const VshardCallInfo& info,
+        const uint8_t* body, std::size_t body_len,
+        storages::tarantool::OptionalCommandControl cc = {});
+
+    // ---- No-span direct variants -------------------------------------------
+    // Skip tracing::Span creation; take an absolute deadline directly.
+    // Used by VshardProxy hot-path to avoid per-request span-ID generation.
+
+    storages::tarantool::ExecutionResult ExecuteDirect(
+        CallMode mode,
+        const storages::tarantool::Query& query,
+        engine::Deadline deadline);
+
+    storages::tarantool::ExecutionResult ForwardStorageCallDirect(
+        CallMode mode,
+        const storages::tarantool::impl::CallRouteInfo& info,
+        engine::Deadline deadline);
+
+    storages::tarantool::ExecutionResult ForwardVshardCallDirect(
+        const VshardCallInfo& info,
+        const uint8_t* body, std::size_t body_len,
+        engine::Deadline deadline);
+
+    bool IsAvailable() const;
+    bool IsMasterAvailable() const;
+    bool HasReplica() const;
+    bool IsReplicaAvailable() const;
+    const std::string& GetUuid() const noexcept { return uuid_; }
+    const std::string& GetName() const noexcept { return name_; }
+    const InstanceMeta& GetMasterMeta() const noexcept { return master_meta_; }
+    const InstanceMeta* GetReplicaMeta() const noexcept {
+        return replica_metas_.empty() ? nullptr : &replica_metas_.front();
+    }
+    std::vector<InstanceMeta> GetAllInstanceMetas() const {
+        auto result = std::vector<InstanceMeta>{master_meta_};
+        result.insert(
+            result.end(), replica_metas_.begin(), replica_metas_.end());
+        return result;
+    }
+
+    void WriteStatistics(utils::statistics::Writer& writer) const;
+
+ private:
+    storages::tarantool::impl::Pool& SelectReplica() const;
+
+    std::string uuid_;
+    std::string name_;
+    std::shared_ptr<storages::tarantool::impl::Pool> master_;
+    std::vector<std::shared_ptr<storages::tarantool::impl::Pool>> replicas_;
+    InstanceMeta master_meta_;
+    std::vector<InstanceMeta> replica_metas_;
+    mutable std::atomic<std::size_t> replica_idx_{0};
+};
+
+}  // namespace storages::tarantool::vshard::impl
+
+USERVER_NAMESPACE_END

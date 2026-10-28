@@ -1,0 +1,780 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>C++ vshard vs Lua vshard — Equivalence Analysis</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans:wght@300;400;600;700&display=swap');
+
+  :root {
+    --bg: #0e1117;
+    --surface: #161b22;
+    --surface2: #1c2333;
+    --border: #30363d;
+    --text: #c9d1d9;
+    --text-dim: #8b949e;
+    --accent: #58a6ff;
+    --green: #3fb950;
+    --yellow: #d29922;
+    --red: #f85149;
+    --orange: #e3b341;
+    --purple: #bc8cff;
+    --mono: 'IBM Plex Mono', monospace;
+    --sans: 'IBM Plex Sans', sans-serif;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--sans);
+    font-size: 14px;
+    line-height: 1.6;
+    padding: 40px 32px;
+    max-width: 1400px;
+    margin: 0 auto;
+  }
+
+  header {
+    border-bottom: 2px solid var(--border);
+    padding-bottom: 24px;
+    margin-bottom: 36px;
+  }
+
+  header h1 {
+    font-size: 22px;
+    font-weight: 700;
+    color: #fff;
+    letter-spacing: -0.3px;
+    margin-bottom: 6px;
+  }
+
+  header .subtitle {
+    color: var(--text-dim);
+    font-size: 13px;
+  }
+
+  header .ref {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--accent);
+    margin-top: 8px;
+  }
+
+  .legend {
+    display: flex;
+    gap: 20px;
+    flex-wrap: wrap;
+    margin-bottom: 28px;
+    padding: 14px 18px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    font-size: 12px;
+  }
+
+  .legend-item {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    font-weight: 600;
+  }
+
+  .badge {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 12px;
+    font-family: var(--mono);
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.3px;
+    white-space: nowrap;
+  }
+
+  .p0 { background: rgba(248,81,73,0.2); color: #f85149; border: 1px solid rgba(248,81,73,0.4); }
+  .p1 { background: rgba(210,153,34,0.2); color: #e3b341; border: 1px solid rgba(210,153,34,0.4); }
+  .p2 { background: rgba(188,140,255,0.2); color: #bc8cff; border: 1px solid rgba(188,140,255,0.4); }
+  .p3 { background: rgba(88,166,255,0.15); color: #79c0ff; border: 1px solid rgba(88,166,255,0.3); }
+  .ok  { background: rgba(63,185,80,0.15);  color: #3fb950; border: 1px solid rgba(63,185,80,0.3); }
+
+  section {
+    margin-bottom: 40px;
+  }
+
+  section h2 {
+    font-size: 13px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 1.2px;
+    color: var(--text-dim);
+    margin-bottom: 14px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13px;
+  }
+
+  thead th {
+    background: var(--surface);
+    color: var(--text-dim);
+    font-weight: 600;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.8px;
+    padding: 10px 14px;
+    text-align: left;
+    border: 1px solid var(--border);
+    position: sticky;
+    top: 0;
+    z-index: 2;
+  }
+
+  tbody tr {
+    border-bottom: 1px solid var(--border);
+  }
+
+  tbody tr:hover {
+    background: rgba(88,166,255,0.04);
+  }
+
+  tbody td {
+    padding: 11px 14px;
+    vertical-align: top;
+    border: 1px solid var(--border);
+    line-height: 1.55;
+  }
+
+  td.area {
+    font-weight: 700;
+    color: #fff;
+    font-size: 13px;
+    white-space: nowrap;
+    min-width: 150px;
+  }
+
+  td.lua {
+    font-family: var(--mono);
+    font-size: 11.5px;
+    color: #79c0ff;
+    background: rgba(88,166,255,0.04);
+    max-width: 300px;
+  }
+
+  td.cpp {
+    font-family: var(--mono);
+    font-size: 11.5px;
+    color: #ffa657;
+    background: rgba(255,166,87,0.04);
+    max-width: 300px;
+  }
+
+  td.impact {
+    color: var(--text);
+    max-width: 320px;
+  }
+
+  td.sev {
+    text-align: center;
+    white-space: nowrap;
+    min-width: 80px;
+  }
+
+  code {
+    font-family: var(--mono);
+    font-size: 11px;
+    background: rgba(255,255,255,0.07);
+    padding: 1px 5px;
+    border-radius: 3px;
+  }
+
+  .note {
+    color: var(--text-dim);
+    font-size: 11.5px;
+    margin-top: 4px;
+    line-height: 1.45;
+  }
+
+  .tag-fixed {
+    font-size: 10px;
+    font-family: var(--mono);
+    background: rgba(63,185,80,0.2);
+    color: #3fb950;
+    border: 1px solid rgba(63,185,80,0.3);
+    padding: 1px 5px;
+    border-radius: 3px;
+    margin-left: 4px;
+    vertical-align: middle;
+  }
+
+  .tag-open {
+    font-size: 10px;
+    font-family: var(--mono);
+    background: rgba(248,81,73,0.15);
+    color: #f85149;
+    border: 1px solid rgba(248,81,73,0.3);
+    padding: 1px 5px;
+    border-radius: 3px;
+    margin-left: 4px;
+    vertical-align: middle;
+  }
+
+  /* Summary boxes */
+  .summary-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+    gap: 14px;
+    margin-bottom: 32px;
+  }
+
+  .summary-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 16px;
+    text-align: center;
+  }
+
+  .summary-card .num {
+    font-size: 32px;
+    font-weight: 700;
+    font-family: var(--mono);
+    line-height: 1;
+    margin-bottom: 4px;
+  }
+
+  .summary-card .lbl {
+    font-size: 11px;
+    color: var(--text-dim);
+    text-transform: uppercase;
+    letter-spacing: 0.6px;
+  }
+
+  .equiv-section {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 22px;
+    margin-bottom: 32px;
+  }
+
+  .equiv-section h3 {
+    font-size: 14px;
+    font-weight: 700;
+    color: #fff;
+    margin-bottom: 12px;
+  }
+
+  .equiv-section p {
+    color: var(--text);
+    font-size: 13px;
+    margin-bottom: 10px;
+  }
+
+  .equiv-section ul {
+    padding-left: 20px;
+  }
+
+  .equiv-section li {
+    font-size: 13px;
+    margin-bottom: 6px;
+    color: var(--text);
+  }
+
+  .equiv-section li strong {
+    color: #fff;
+  }
+
+  .strategy-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 16px;
+    margin-top: 14px;
+  }
+
+  .strategy-card {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 16px;
+  }
+
+  .strategy-card h4 {
+    font-size: 13px;
+    font-weight: 700;
+    color: var(--accent);
+    margin-bottom: 8px;
+  }
+
+  .strategy-card p, .strategy-card li {
+    font-size: 12px;
+    color: var(--text-dim);
+    line-height: 1.5;
+    margin-bottom: 4px;
+  }
+
+  .strategy-card ul {
+    padding-left: 16px;
+  }
+
+  .vshard-tests {
+    margin-top: 16px;
+  }
+
+  .test-row {
+    display: grid;
+    grid-template-columns: 220px 1fr 160px;
+    gap: 12px;
+    align-items: start;
+    padding: 10px 0;
+    border-bottom: 1px solid var(--border);
+    font-size: 12px;
+  }
+
+  .test-row:last-child { border-bottom: none; }
+
+  .test-name {
+    font-family: var(--mono);
+    color: var(--accent);
+    font-size: 11.5px;
+  }
+
+  .test-desc {
+    color: var(--text-dim);
+  }
+
+  .test-covers {
+    color: var(--orange);
+    font-size: 11px;
+    font-style: italic;
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>C++ vshard Router vs Lua vshard Router — Equivalence Analysis</h1>
+  <p class="subtitle">Detailed comparison of behavioral deviations between the C++ userver implementation and the reference Lua vshard router</p>
+  <p class="ref">Reference: tsafin/userver PR#3 · tarantool/vshard master · vshard/error.lua · vshard/router/init.lua · vshard/consts.lua</p>
+</header>
+
+<section class="equiv-section">
+  <h3>Current State</h3>
+  <p>
+    This HTML report is historical background and is not a line-by-line current
+    status sheet anymore.
+  </p>
+  <p>
+    The current verified state is:
+  </p>
+  <ul>
+    <li><strong>71 tests pass</strong> in the vshard functional suite.</li>
+    <li>
+      The C++ proxy now matches Lua closely for the tested IPROTO router API on
+      Tarantool 2.6.0.
+    </li>
+    <li>
+      Most formerly open gaps in call parsing, error envelopes, discovery,
+      <code>map_callrw</code>, rebalance paths, <code>bootstrap</code>,
+      <code>sync</code>, <code>info</code>, and <code>routeall</code> have been
+      closed.
+    </li>
+    <li>
+      The main remaining gaps are degraded-cluster <code>info()</code> parity
+      and true <code>return_raw</code> support on newer Tarantool runtimes with
+      msgpack-object support.
+    </li>
+  </ul>
+  <p>
+    For the current up-to-date review, use
+    <code>tarantool/vshard/lua_cpp_semantic_review.md</code>.
+  </p>
+</section>
+
+<div class="summary-grid">
+  <div class="summary-card">
+    <div class="num" style="color:#3fb950">71</div>
+    <div class="lbl">Current Passing Tests</div>
+  </div>
+  <div class="summary-card">
+    <div class="num" style="color:#3fb950">14</div>
+    <div class="lbl">Router APIs Covered</div>
+  </div>
+  <div class="summary-card">
+    <div class="num" style="color:#3fb950">Most</div>
+    <div class="lbl">Earlier Gaps Closed</div>
+  </div>
+  <div class="summary-card">
+    <div class="num" style="color:#e3b341">2</div>
+    <div class="lbl">Meaningful Gaps Left</div>
+  </div>
+  <div class="summary-card">
+    <div class="num" style="color:#79c0ff">2.6.0</div>
+    <div class="lbl">Target Tarantool Runtime</div>
+  </div>
+</div>
+
+<!-- ============================================================ -->
+<section>
+  <h2>1 — Topology Discovery &amp; RefreshFull</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>Area</th>
+        <th>Lua vshard (reference)</th>
+        <th>C++ implementation</th>
+        <th>Impact</th>
+        <th>Sev</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td class="area">RefreshFull strategy</td>
+        <td class="lua">Background discovery fiber calls <code>vshard.storage.buckets_discovery</code> on every RS iteratively, building the full route_map. Bucket→RS mapping is entirely driven by what the storages report.</td>
+        <td class="cpp">Probes only bucket <code>1</code> and <code>bucket_count/2+1</code>, then extrapolates a contiguous-range split across all known RS. Fixed in <code>topology_fetcher.cpp:185</code>.</td>
+        <td class="impact">Correctness failure for ≥3 RS clusters. After any RefreshFull the routing table can route large ranges to the wrong RS — opposite of healing. WRONG_BUCKET storm becomes permanent until restart.</td>
+        <td class="sev"><span class="badge p0">P0</span> <span class="tag-open">OPEN</span></td>
+      </tr>
+      <tr>
+        <td class="area">Discovery scope on unknown bucket</td>
+        <td class="lua">When bucket is unknown, Lua calls <code>bucket_stat</code> on <em>all</em> RS until it finds the owner (<code>bucket_discovery()</code>). Scans every replicaset.</td>
+        <td class="cpp">No equivalent bucket_stat scan across all RS. Unknown bucket → triggers rate-limited <code>RefreshFull</code>, which itself is broken for N>2 RS (see above).</td>
+        <td class="impact">Unknown buckets may never resolve for N>2 RS. Lua falls back to scan; C++ falls back to broken two-probe refresh.</td>
+        <td class="sev"><span class="badge p1">P1</span></td>
+      </tr>
+      <tr>
+        <td class="area">RefreshFull rate-limit scope</td>
+        <td class="lua">Discovery fiber runs continuously; rate limiting is per-RS via exponential backoff on connection errors.</td>
+        <td class="cpp">Single global 1s rate-limit on <code>last_moved_refresh_</code>. All concurrent fibers benefit once one fires it — stated as intentional in commit message.</td>
+        <td class="impact">Rate-limit logic is correct in intent but the underlying RefreshFull is still broken (see #1). Also the 1s floor is a hardcoded constant vs Lua's data-driven backoff.</td>
+        <td class="sev"><span class="badge p2">P2</span></td>
+      </tr>
+      <tr>
+        <td class="area">BUCKET_IS_LOCKED handling</td>
+        <td class="lua"><code>router_call_impl</code> handles code <code>BUCKET_IS_LOCKED</code> the same as <code>WRONG_BUCKET</code>: calls <code>bucket_reset</code> and retries with destination.</td>
+        <td class="cpp"><code>vshard_error.hpp</code> / <code>vshard_error.cpp</code> do not define or handle <code>BUCKET_IS_LOCKED</code> (no such <code>VshardErrorType</code>). It would be treated as an unknown error and propagated to the client.</td>
+        <td class="impact">Requests during internal bucket locking (admin operations, forced moves) fail instead of retrying. Not a common path but fully observable under manual rebalancing.</td>
+        <td class="sev"><span class="badge p2">P2</span></td>
+      </tr>
+    </tbody>
+  </table>
+</section>
+
+<!-- ============================================================ -->
+<section>
+  <h2>2 — Public API: vshard.router.call* parsing</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>Area</th>
+        <th>Lua vshard (reference)</th>
+        <th>C++ implementation</th>
+        <th>Impact</th>
+        <th>Sev</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td class="area">vshard.router.call generic signature</td>
+        <td class="lua"><code>call(bucket_id, mode, func, args, opts)</code> where <code>mode</code> is the second positional arg. callrw/callro/callre/callbro/callbre are convenience wrappers that fill in <code>mode</code>.</td>
+        <td class="cpp"><code>ParseVshardRouterArgs</code> assumes the 3-tuple shape <code>[bucket_id, func_name, args_array]</code> and routes generic <code>vshard.router.call</code> through the same parser — <code>mode</code> is read as <code>func_name</code>.</td>
+        <td class="impact">Any client calling the generic <code>vshard.router.call(bid, 'write', 'myfunc', {...})</code> gets the string <code>'write'</code> dispatched as the function name and <code>'myfunc'</code> as args. Every such call fails with a procedure-not-found or corrupted result.</td>
+        <td class="sev"><span class="badge p0">P0</span> <span class="tag-open">OPEN</span></td>
+      </tr>
+      <tr>
+        <td class="area">callbro / callbre routing semantics</td>
+        <td class="lua"><code>callbro</code> = <code>mode='read', balance=true</code>. <code>callbre</code> = <code>mode='read', balance=true, prefer_replica=true</code>. Different replica-selection logic from plain <code>callro</code>.</td>
+        <td class="cpp">Both names accepted in the dispatch list but routed to plain <code>kReadOnly</code> mode — no <code>balance</code> or <code>prefer_replica</code> flag is set or propagated.</td>
+        <td class="impact">Zone/weight-based load balancing silently broken. Under zone weighting or replica outages the proxy can pick a different node than net.box would, or fall back to master when caller explicitly requested replica-preferred path.</td>
+        <td class="sev"><span class="badge p1">P1</span> <span class="tag-open">OPEN</span></td>
+      </tr>
+      <tr>
+        <td class="area">callre routing semantics</td>
+        <td class="lua"><code>callre</code> = <code>mode='read', prefer_replica=true</code>. Tries replicas first, falls back to master only after all replicas are exhausted.</td>
+        <td class="cpp">Accepted and routed as plain <code>kReadOnly</code>. <code>prefer_replica</code> semantics not implemented. Falls back to master as soon as no ready replica is cached.</td>
+        <td class="impact">Applications relying on <code>callre</code> to keep read load off the master won't get the expected behavior. Functionally incorrect but rarely catastrophic.</td>
+        <td class="sev"><span class="badge p2">P2</span></td>
+      </tr>
+      <tr>
+        <td class="area">opts.timeout / per-call timeout</td>
+        <td class="lua"><code>router_call_impl</code> reads <code>opts.timeout</code> (default: <code>CALL_TIMEOUT_MIN = 0.5s</code>) and uses a deadline-based retry loop. Retries stop when deadline is exceeded.</td>
+        <td class="cpp">No per-call timeout from the IPROTO client request. <code>retry_count_</code> caps retries; no wall-clock deadline enforcement visible in the retry loop.</td>
+        <td class="impact">Long-duration retries can silently hold client connections far past what the application expects. No client-visible timeout behavior on the router hop.</td>
+        <td class="sev"><span class="badge p1">P1</span></td>
+      </tr>
+      <tr>
+        <td class="area">opts.return_raw</td>
+        <td class="lua"><code>opts.return_raw = true</code> returns raw msgpack objects, skipping Lua deserialization. Documented API option.</td>
+        <td class="cpp">Not parsed. Opts struct is entirely ignored/dropped at the IPROTO server layer.</td>
+        <td class="impact">Clients using <code>return_raw</code> for performance (large result sets) get decoded results. Not a correctness bug; a performance/API coverage gap.</td>
+        <td class="sev"><span class="badge p3">P3</span></td>
+      </tr>
+    </tbody>
+  </table>
+</section>
+
+<!-- ============================================================ -->
+<section>
+  <h2>3 — Error Handling &amp; Retry Semantics</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>Area</th>
+        <th>Lua vshard (reference)</th>
+        <th>C++ implementation</th>
+        <th>Impact</th>
+        <th>Sev</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td class="area">WRONG_BUCKET retry on missing destination</td>
+        <td class="lua">If <code>err.destination == nil</code>, calls <code>bucket_reset</code> (clears local entry) and re-enters discovery via the background fiber. Does NOT directly call bucket_stat scan immediately in the hot path.</td>
+        <td class="cpp">If <code>destination</code> key is absent (IsMissing), the pre-fix code called <code>PatchBucketOwner("")</code> silently. Fixed in commit <code>b4bac7b</code>. Post-fix: calls <code>RefreshFull</code>, but RefreshFull is still broken for N>2 RS.</td>
+        <td class="impact">Post-fix is structurally correct but relies on broken RefreshFull. See §1.</td>
+        <td class="sev"><span class="badge p1">P1</span></td>
+      </tr>
+      <tr>
+        <td class="area">NON_MASTER retry</td>
+        <td class="lua">Calls <code>bucket_reset</code> and triggers failover fiber to re-identify master. The retry uses the updated master from the replicaset's internal failover state.</td>
+        <td class="cpp">Calls <code>RefreshFromStorage(rs)</code> to re-probe the specific RS's master. Single-RS probe is correct for this case.</td>
+        <td class="impact">Behaviorally correct for the 2-RS case tested. Minor: doesn't handle the edge case where the RS itself is partitioned (Lua falls back to discovery).</td>
+        <td class="sev"><span class="badge p3">P3</span></td>
+      </tr>
+      <tr>
+        <td class="area">TRANSFER_IS_IN_PROGRESS retry</td>
+        <td class="lua">Calls <code>bucket_reset</code>, waits a small interval (<code>CALL_TIMEOUT_MIN * 2^n</code> exponential backoff up to <code>CALL_TIMEOUT_MAX = 64s</code>) and retries.</td>
+        <td class="cpp">Retries immediately without backoff. PR commit message says "back off, retry" in description but no sleep/backoff is visible — just increments retry counter and loops.</td>
+        <td class="impact">Under active bucket migration, the C++ proxy generates a tight retry storm toward the storage that is busy transferring. Can amplify load on the storage node exactly when it is most stressed.</td>
+        <td class="sev"><span class="badge p1">P1</span> <span class="tag-open">OPEN</span></td>
+      </tr>
+      <tr>
+        <td class="area">Retry count vs deadline</td>
+        <td class="lua">Retry loop is deadline-based. No fixed retry count. Retries continue until <code>fiber.clock() >= deadline</code>.</td>
+        <td class="cpp">Fixed <code>kMaxRetries</code> (from settings). Deadline not checked. A cluster with many bucket migrations could hit the cap before the request succeeds.</td>
+        <td class="impact">Two different failure modes: Lua might retry too long; C++ might give up too early. Different observable SLA behavior for the same cluster event.</td>
+        <td class="sev"><span class="badge p2">P2</span></td>
+      </tr>
+      <tr>
+        <td class="area">Error code parsing: name fallback</td>
+        <td class="lua">Errors always carry both <code>.code</code> (int) and <code>.name</code> (string). Router checks <code>.code</code> numerically.</td>
+        <td class="cpp">Post-fix (<code>b4bac7b</code>) added <code>ErrorTypeFromName()</code> fallback. Correct codes 1/2/7/9 are now used. <span class="tag-fixed">FIXED</span></td>
+        <td class="impact">Fixed in the PR. Was a critical bug earlier (all WRONG_BUCKET retries were silently no-ops).</td>
+        <td class="sev"><span class="badge ok">✓ Fixed</span></td>
+      </tr>
+    </tbody>
+  </table>
+</section>
+
+<!-- ============================================================ -->
+<section>
+  <h2>4 — Replica Selection &amp; Connection Pool</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>Area</th>
+        <th>Lua vshard (reference)</th>
+        <th>C++ implementation</th>
+        <th>Impact</th>
+        <th>Sev</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td class="area">Replica priority list (zone weights)</td>
+        <td class="lua">Per-replicaset <code>priority_list</code> ordered by <code>cfg.weights</code> distance from current zone. <code>callro/callre</code> walks the list in priority order, skipping down replicas.</td>
+        <td class="cpp">Round-robin across all replicas for <code>kReadOnly</code>. No zone concept. No weights parameter.</td>
+        <td class="impact">Geographic/zone-aware routing unavailable. Requests may cross DCs unnecessarily. Acceptable for single-DC deployments; a correctness gap for multi-DC.</td>
+        <td class="sev"><span class="badge p3">P3</span></td>
+      </tr>
+      <tr>
+        <td class="area">Adaptive network timeout</td>
+        <td class="lua"><code>network_timeout</code> per replica: updated on every 10th success (+) and every 2nd failure (-). Dynamic congestion-sensitive timeout.</td>
+        <td class="cpp">Fixed timeout from <code>static_config.yaml</code>. No adaptive adjustment.</td>
+        <td class="impact">Under congestion, the C++ proxy either times out too aggressively or too leniently. No automatic calibration.</td>
+        <td class="sev"><span class="badge p3">P3</span></td>
+      </tr>
+      <tr>
+        <td class="area">Replicaset backoff / REPLICASET_IN_BACKOFF</td>
+        <td class="lua">Recent Lua versions add per-replicaset backoff state. Discovery skips RS in backoff (<code>err.code == REPLICASET_IN_BACKOFF</code>).</td>
+        <td class="cpp">No backoff state per RS. Unhealthy RS are probed on every request until they respond or timeout.</td>
+        <td class="impact">Under partial RS failure, C++ generates more failed probes than necessary. No correctness issue; latency/throughput impact.</td>
+        <td class="sev"><span class="badge p2">P2</span></td>
+      </tr>
+      <tr>
+        <td class="area">map_callrw (scatter/reduce)</td>
+        <td class="lua">Full <code>vshard.router.map_callrw</code>: consistent map-reduce with storage refs, prevents bucket migration during scatter phase, collects all RS results.</td>
+        <td class="cpp"><code>vshard.router.map_callrw</code> is now exposed over IPROTO and keeps <code>storage_ref</code> and <code>storage_map</code> on the same Tarantool session per replicaset. Partial <code>bucket_ids</code> routing uses live discovery.</td>
+        <td class="impact">Plain differential parity is now covered. The remaining unverified part is behavior under active rebalancing while refs are held.</td>
+        <td class="sev"><span class="badge p2">P2</span></td>
+      </tr>
+    </tbody>
+  </table>
+</section>
+
+<!-- ============================================================ -->
+<section>
+  <h2>5 — Correctly Implemented (Notable)</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>Area</th>
+        <th>Lua vshard</th>
+        <th>C++ implementation</th>
+        <th>Note</th>
+        <th></th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td class="area">Error codes (post-fix)</td>
+        <td class="lua">WRONG_BUCKET=1, NON_MASTER=2, TRANSFER=7, NO_ROUTE=9</td>
+        <td class="cpp">Corrected in commit b4bac7b. Name fallback added.</td>
+        <td class="impact">Was critical before the fix. Now correct.</td>
+        <td class="sev"><span class="badge ok">✓</span></td>
+      </tr>
+      <tr>
+        <td class="area">bucket_id_mpcrc32 algorithm</td>
+        <td class="lua">CRC32 of msgpack-encoded value. Integers encoded as fixint/uint8/uint16/uint32/uint64 by value magnitude.</td>
+        <td class="cpp"><code>BucketIdMpcrc32</code>: same msgpack integer encoding + CRC32. Cross-checked in unit tests.</td>
+        <td class="impact">Bucket IDs computed by C++ match Lua for integer keys. String keys also match.</td>
+        <td class="sev"><span class="badge ok">✓</span></td>
+      </tr>
+      <tr>
+        <td class="area">IPROTO wire format for vshard.storage.call</td>
+        <td class="lua">Calls <code>vshard.storage.call(bucket_id, mode, func, args)</code> on storage master.</td>
+        <td class="cpp">Correctly encodes the 4-element tuple and routes to master pool. Mode strings "write"/"read" verified in fix commit.</td>
+        <td class="impact">Wire-level compatibility confirmed. Was briefly broken (used "rw"/"ro") before fix commit.</td>
+        <td class="sev"><span class="badge ok">✓</span></td>
+      </tr>
+      <tr>
+        <td class="area">IPROTO_VSHARD_CALL (0x50) extension</td>
+        <td class="lua">Not implemented in Lua vshard (proposed future extension).</td>
+        <td class="cpp">Fully implemented as an optimization: bucket_id in header, zero body scan.</td>
+        <td class="impact">New extension, not a regression. Clients using the standard CALL path are unaffected.</td>
+        <td class="sev"><span class="badge ok">✓</span></td>
+      </tr>
+      <tr>
+        <td class="area">WRONG_BUCKET with destination hint</td>
+        <td class="lua">Patches route_map directly from <code>err.destination</code> UUID, retries on new RS.</td>
+        <td class="cpp"><code>PatchBucketOwner(bucket_id, dest_uuid)</code> then retry. Correct after b4bac7b fix.</td>
+        <td class="impact">Hot-path bucket migration handled correctly when destination is provided.</td>
+        <td class="sev"><span class="badge ok">✓</span></td>
+      </tr>
+    </tbody>
+  </table>
+</section>
+
+<!-- ============================================================ -->
+<section>
+  <h2>6 — Equivalence Proof Strategy</h2>
+
+  <div class="equiv-section">
+    <h3>6.1 — Can formal equivalence be proved?</h3>
+    <p>Full formal equivalence is not achievable without fixing the known behavioral gaps first. After fixing the P0/P1 items, three complementary approaches can establish high confidence:</p>
+
+    <div class="strategy-grid">
+      <div class="strategy-card">
+        <h4>A. Protocol-Level Differential Testing</h4>
+        <p>Run both the Lua router and the C++ proxy in front of the same vshard cluster. Send identical IPROTO request streams to both. Compare responses byte-for-byte (ignoring sync IDs). This catches any encoding, routing, or retry divergence.</p>
+        <ul>
+          <li>Tool: existing <code>bench_vshard.lua</code> adapted as a diff harness</li>
+          <li>Scenarios: normal calls, mid-migration calls, RS failure, master failover</li>
+          <li>Automated using tarantool-test-run + two router endpoints</li>
+        </ul>
+      </div>
+      <div class="strategy-card">
+        <h4>B. Reuse vshard's Own Integration Test Suite</h4>
+        <p>The tarantool/vshard repo has a full integration test suite under <code>test/router/</code>. These tests drive the router via net.box IPROTO calls — the same interface the C++ proxy exposes. By pointing <code>test/router/*.test.lua</code> at the C++ proxy instead of the Lua router, deviations surface as test failures.</p>
+        <ul>
+          <li>Directly applicable tests: <code>router.test.lua</code>, <code>retry_reads.test.lua</code>, <code>exponential_timeout.test.lua</code>, <code>master_discovery.test.lua</code></li>
+          <li>Requires: C++ proxy listening on same port as Lua router in test env</li>
+        </ul>
+      </div>
+      <div class="strategy-card">
+        <h4>C. Property-Based Testing of Routing Table</h4>
+        <p>The <code>RoutingTable</code> and <code>RefreshFull</code> logic can be property-tested in isolation. Key invariant: for any cluster configuration (N RS, arbitrary bucket assignments), after <code>RefreshFull</code>, <code>FindReplicaset(b)</code> must return the RS that actually owns bucket <code>b</code>.</p>
+        <ul>
+          <li>Fuzz bucket ownership assignments, run RefreshFull, assert correctness</li>
+          <li>Already has unit test infrastructure in <code>vshard_test.cpp</code> — extend it</li>
+        </ul>
+      </div>
+      <div class="strategy-card">
+        <h4>D. State Machine Equivalence (Long-term)</h4>
+        <p>Model both routers as state machines over the routing table state and compare reachable states under the same event sequences. Practical approach: use <code>IPROTO_WATCH</code> to observe bucket ownership changes on storages and verify both routers converge to the same table state after each event.</p>
+        <ul>
+          <li>Most rigorous but highest effort</li>
+          <li>vshard's test_run framework can inject events programmatically</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+
+  <div class="equiv-section">
+    <h3>6.2 — Relevant tests in tarantool/vshard</h3>
+    <p>These test files in <code>test/router/</code> and <code>test/rebalancer/</code> directly cover behaviors where the C++ implementation deviates:</p>
+    <div class="vshard-tests">
+      <div class="test-row">
+        <div class="test-name">test/router/router.test.lua</div>
+        <div class="test-desc">Core call routing, WRONG_BUCKET retry, NON_MASTER retry, unknown bucket discovery, all call variants (callrw/callro/callre/callbro/callbre)</div>
+        <div class="test-covers">Covers gaps #1, #2, #3, #4, #5</div>
+      </div>
+      <div class="test-row">
+        <div class="test-name">test/router/retry_reads.test.lua</div>
+        <div class="test-desc">Read retry behavior when replicas are down; fallback sequence from replica to master; prefer_replica semantics</div>
+        <div class="test-covers">Covers callre/callbre gaps</div>
+      </div>
+      <div class="test-row">
+        <div class="test-name">test/router/exponential_timeout.test.lua</div>
+        <div class="test-desc">Timeout backoff during TRANSFER_IS_IN_PROGRESS; confirms exponential backoff up to CALL_TIMEOUT_MAX</div>
+        <div class="test-covers">Covers TRANSFER retry gap</div>
+      </div>
+      <div class="test-row">
+        <div class="test-name">test/router/master_discovery.test.lua</div>
+        <div class="test-desc">NON_MASTER detection, master re-election, calls during master absence; wait semantics</div>
+        <div class="test-covers">Covers NON_MASTER gap</div>
+      </div>
+      <div class="test-row">
+        <div class="test-name">test/rebalancer/receiving_bucket.test.lua</div>
+        <div class="test-desc">Routing during active bucket transfer (TRANSFER_IS_IN_PROGRESS path); verifies retry eventually succeeds</div>
+        <div class="test-covers">Covers TRANSFER + RefreshFull gaps</div>
+      </div>
+      <div class="test-row">
+        <div class="test-name">test/router/discovery.test.lua</div>
+        <div class="test-desc">bucket_discovery across multiple RS; discovery_mode 'on'/'once'/'off'; known_bucket_count convergence</div>
+        <div class="test-covers">Covers RefreshFull / discovery gap (critical)</div>
+      </div>
+      <div class="test-row">
+        <div class="test-name">test/misc/check_uuid_on_connect.test.lua</div>
+        <div class="test-desc">Topology identity verification at connection time; cluster UUID checks</div>
+        <div class="test-covers">Covers topology fetcher correctness</div>
+      </div>
+      <div class="test-row">
+        <div class="test-name">test/rebalancer/bucket_ref.test.lua</div>
+        <div class="test-desc">map_callrw ref protocol; verifies bucket migration is blocked during scatter phase</div>
+        <div class="test-covers">Covers map_callrw consistency gap</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="equiv-section">
+    <h3>6.3 — Recommended Fix Priority Order</h3>
+    <ul>
+      <li><strong>Fix 1 (P0):</strong> Replace two-probe heuristic in <code>RefreshFull</code> with a proper scan: for each known RS master, call <code>vshard.storage.buckets_discovery({from=1})</code> iteratively (or <code>bucket_stat</code> on a representative spread) until all <code>bucket_count</code> buckets are mapped.</li>
+      <li><strong>Fix 2 (P0):</strong> Add mode-arg parsing for generic <code>vshard.router.call</code>: detect 5-tuple shape <code>[bucket_id, mode_str, func, args, opts]</code> vs 3-tuple shape used by callrw/callro.</li>
+      <li><strong>Fix 3 (P1):</strong> Add per-call deadline tracking. Read <code>opts.timeout</code> from the IPROTO request (or default to <code>CALL_TIMEOUT_MIN</code>) and enforce it as a deadline in the retry loop.</li>
+      <li><strong>Fix 4 (P1):</strong> Add exponential backoff sleep on <code>TRANSFER_IS_IN_PROGRESS</code>: start at <code>CALL_TIMEOUT_MIN/2</code>, double per retry, cap at <code>CALL_TIMEOUT_MAX</code>.</li>
+      <li><strong>Fix 5 (P1):</strong> Add <code>BUCKET_IS_LOCKED</code> to <code>VshardErrorType</code> and treat it identically to <code>WRONG_BUCKET</code>.</li>
+      <li><strong>Fix 6 (P1):</strong> Implement <code>prefer_replica</code> and <code>balance</code> flags for <code>callre</code>/<code>callbro</code>/<code>callbre</code>.</li>
+      <li><strong>Fix 7 (P1):</strong> Implement storage ref protocol in <code>MapCallRW</code> (<code>vshard.storage.ref</code>/<code>vshard.storage.unref</code> + <code>vshard.storage.map</code>).</li>
+    </ul>
+  </div>
+</section>
+
+</body>
+</html>

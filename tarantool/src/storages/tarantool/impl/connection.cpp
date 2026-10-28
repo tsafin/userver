@@ -18,6 +18,7 @@
 #include <userver/engine/io/sockaddr.hpp>
 #include <userver/engine/io/socket.hpp>
 #include <userver/engine/sleep.hpp>
+#include <userver/engine/task/cancel.hpp>
 #include <userver/formats/msgpack/value.hpp>
 #include <userver/logging/log.hpp>
 #include <userver/tracing/span.hpp>
@@ -47,6 +48,10 @@ constexpr uint32_t kIprotoCall    = 10;
 constexpr uint32_t kIprotoAuth    = 7;
 constexpr uint32_t kIprotoPing    = 64;
 constexpr uint32_t kIprotoUpsert  = 9;
+// IPROTO_VSHARD_CALL extension (userver/vshard, not upstream Tarantool)
+constexpr uint32_t kIprotoVshardCall    = 0x50;  ///< new request type
+constexpr uint32_t kKeyVshardBucketId   = 0x5e;  ///< header key: bucket_id (uint32)
+constexpr uint32_t kKeyVshardMode       = 0x5f;  ///< header key: mode (0=ro, 1=rw)
 
 // IPROTO header/body keys
 constexpr uint32_t kKeyCode         = 0x00;
@@ -245,7 +250,7 @@ Connection::~Connection() {
     broken_.store(true, std::memory_order_release);
     // Wake the flush task in case it is sleeping in WaitForEvent(), so it
     // can notice cancellation promptly rather than waiting for the next Send().
-    flush_event_.Send();
+    NotifyFlush();
     // SyncCancel requests cancellation and blocks until the task finishes.
     flush_task_.SyncCancel();
     // reader_task_ RecvSome() will throw engine::io::IoCancelled, which
@@ -379,20 +384,29 @@ void Connection::ReaderLoop() {
                                    std::move(data_buf),
                                    std::move(error_info)};
 
-            // Dispatch to the waiting coroutine
-            engine::Promise<ExecutionResult> promise;
-            bool found = false;
+                        // Dispatch to the waiting coroutine
+            std::shared_ptr<PendingEntry> entry;
             {
                 std::lock_guard lock(pending_mutex_);
-                auto it = pending_.find(sync_id);
-                if (it != pending_.end()) {
-                    promise = std::move(it->second);
-                    pending_.erase(it);
-                    found = true;
+                const std::size_t slot_idx = sync_id & (kPendingSlotCount - 1);
+                auto& slot = pending_slots_[slot_idx];
+                if (slot.sync_id == sync_id) {
+                    entry = std::move(slot.entry);
+                    slot.sync_id = 0;
                 }
             }
-            if (found) {
-                promise.set_value(std::move(result));
+            if (entry) {
+                if (auto* a = std::get_if<AsyncPendingEntry>(entry.get())) {
+                    try {
+                        a->promise.set_value(std::move(result));
+                    } catch (const std::exception&) {
+                    }
+                } else if (auto* s = std::get_if<SyncPendingEntry>(entry.get())) {
+                    if (!s->abandoned.load(std::memory_order_acquire)) {
+                        s->result = std::move(result);
+                        s->ready.Send();
+                    }
+                }
             }
         }
     } catch (const engine::io::IoCancelled&) {
@@ -408,40 +422,55 @@ void Connection::ReaderLoop() {
 }
 
 void Connection::WakeAllPending(std::exception_ptr ex) {
-    std::unordered_map<uint64_t, engine::Promise<ExecutionResult>> pending;
+    // Collect occupied slots under the lock, then wake outside it.
+    std::vector<std::shared_ptr<PendingEntry>> to_wake;
     {
         std::lock_guard lock(pending_mutex_);
-        pending = std::move(pending_);
+        for (auto& slot : pending_slots_) {
+            if (slot.sync_id != 0 && slot.entry) {
+                to_wake.push_back(std::move(slot.entry));
+                slot.sync_id = 0;
+            }
+        }
     }
-    for (auto& [id, p] : pending) {
+    for (auto& entry : to_wake) {
         try {
-            p.set_exception(ex);
+            if (auto* a = std::get_if<AsyncPendingEntry>(entry.get())) {
+                a->promise.set_exception(ex);
+            } else if (auto* s = std::get_if<SyncPendingEntry>(entry.get())) {
+                if (!s->abandoned.load(std::memory_order_acquire)) {
+                    s->exc = ex;
+                    s->ready.Send();
+                }
+            }
         } catch (...) {}
     }
 }
 
 // ---- Flush coroutine ----
 
-void Connection::FlushLoop() {
-    // WaitForEvent() returns false when the task is cancelled (normal shutdown).
-    while (flush_event_.WaitForEvent()) {
-        // Yield once: all concurrent senders that have already staged their frame
-        // and called flush_event_.Send() will continue executing (they return the
-        // future and then yield at wait_until()).  By the time we resume, every
-        // same-scheduler-slice sender has its frame in staging_buf_, so the
-        // subsequent SendAll coalesces the entire batch into one syscall —
-        // the same "batch-everything-then-flush" model as Tarantool net.box.
-        engine::Yield();
+void Connection::NotifyFlush() {
+    if (flush_sleeping_.load(std::memory_order_acquire)) {
+        flush_event_.Send();
+    }
+}
 
-        // Inner drain loop: keep sending until staging_buf_ is empty.
-        // New frames arriving during SendAll call flush_event_.Send() again;
-        // those will be picked up by the next outer-loop iteration.
+void Connection::FlushLoop() {
+    // Drain: keep sending until staging_buf_ is empty.  New frames arriving
+    // during SendAll are picked up by the next outer-loop iteration.
+    auto drain = [this]() {
         for (;;) {
             std::vector<uint8_t> to_send;
             {
                 std::lock_guard lock(staging_mutex_);
                 if (staging_buf_.empty()) break;
                 to_send = std::move(staging_buf_);
+                // Reclaim capacity so the next batch of senders does not
+                // trigger a reallocation when appending into the now-empty
+                // staging_buf_.  The reserve is intentionally inside the lock
+                // so no sender observes zero capacity between the move and the
+                // reserve, which would force it to allocate independently.
+                staging_buf_.reserve(to_send.capacity());
             }
 
             if (broken_.load(std::memory_order_acquire)) {
@@ -463,6 +492,28 @@ void Connection::FlushLoop() {
                 return;
             }
         }
+    };
+
+    // Wakeup elision (plan Phase 4): producers check flush_sleeping_ and only
+    // call flush_event_.Send() while this task is parked.  The flag flips in
+    // the order "park-check-sleep" so a producer that staged between the
+    // staging-empty check and the sleep is guaranteed to see sleeping==true
+    // and signal the event.
+    for (;;) {
+        drain();
+        flush_sleeping_.store(true, std::memory_order_release);
+        {
+            std::lock_guard<SpinLock> lock(staging_mutex_);
+            if (!staging_buf_.empty()) {
+                flush_sleeping_.store(false, std::memory_order_relaxed);
+                continue;
+            }
+        }
+        if (!flush_event_.WaitForEvent()) break;  // cancelled (shutdown)
+        flush_sleeping_.store(false, std::memory_order_release);
+        // Yield once so concurrent same-slice senders finish staging, then
+        // drain their frames as one batch.
+        engine::Yield();
     }
     // Task was cancelled (normal shutdown path).
 }
@@ -489,9 +540,30 @@ engine::Future<ExecutionResult> Connection::SendAndRegister(
     }
 
     const uint64_t sync_id = ++sync_counter_;
+    const std::size_t slot_idx = sync_id & (kPendingSlotCount - 1);
+    std::shared_ptr<PendingEntry> stale_entry;
     {
         std::lock_guard lock(pending_mutex_);
-        pending_.emplace(sync_id, std::move(promise));
+        auto& slot = pending_slots_[slot_idx];
+        if (slot.sync_id != 0) {
+            // A still-registered entry in the target slot means the slot
+            // ring wrapped while an old request is unanswered (e.g. its
+            // response was lost).  Silently overwriting it strands the old
+            // waiter forever; move it out and fail it explicitly below so
+            // callers observe a real error instead of a hang.
+            stale_entry = std::move(slot.entry);
+        }
+        slot.entry = std::make_shared<PendingEntry>(
+            AsyncPendingEntry{std::move(promise)});
+        slot.sync_id = sync_id;
+    }
+    if (stale_entry) {
+        if (auto* a = std::get_if<AsyncPendingEntry>(stale_entry.get())) {
+            a->promise.set_exception(std::make_exception_ptr(
+                TarantoolException{"pending slot overflow: unanswered request "
+                                   "evicted after kPendingSlotCount newer "
+                                   "requests"}));
+        }
     }
 
     // Build the IPROTO frame directly into staging_buf_ — two-phase approach:
@@ -516,12 +588,85 @@ engine::Future<ExecutionResult> Connection::SendAndRegister(
         staging_buf_[prehdr_pos + 3] = static_cast<uint8_t>(len >> 8);
         staging_buf_[prehdr_pos + 4] = static_cast<uint8_t>(len);
     }
-    flush_event_.Send();  // Signal the flush coroutine (non-blocking, multi-producer safe)
+    NotifyFlush();  // signal the flush coroutine only if it is parked
 
     return future;
 }
 
-// ---- Space ID resolver ----
+// ---- Zero-copy storage call forwarding ----
+
+engine::Future<ExecutionResult> Connection::ForwardStorageCallAsync(
+    const CallRouteInfo& info, engine::Deadline deadline) {
+    const std::size_t tuple_size =
+        static_cast<std::size_t>(info.tuple_end - info.tuple_begin);
+    // Build body: kStorageCallBodyPrefix (23 bytes) + raw TUPLE bytes.
+    // One memcpy of the TUPLE; no msgpack re-encoding of the vshard envelope.
+    std::vector<uint8_t> body;
+    body.reserve(sizeof(kStorageCallBodyPrefix) + tuple_size);
+    body.insert(body.end(),
+                kStorageCallBodyPrefix,
+                kStorageCallBodyPrefix + sizeof(kStorageCallBodyPrefix));
+    body.insert(body.end(), info.tuple_begin, info.tuple_end);
+    return SendAndRegister(deadline, kIprotoCall, std::move(body));
+}
+
+engine::Future<ExecutionResult> Connection::ForwardVshardCallAsync(
+    uint32_t bucket_id, uint8_t mode,
+    const uint8_t* body, std::size_t body_len,
+    engine::Deadline deadline) {
+
+    engine::Promise<ExecutionResult> promise;
+    auto future = promise.get_future();
+
+    if (broken_.load(std::memory_order_acquire)) {
+        promise.set_exception(std::make_exception_ptr(
+            TarantoolException{"connection is broken"}));
+        return future;
+    }
+    if (deadline.IsReached()) {
+        promise.set_exception(std::make_exception_ptr(
+            TarantoolException{"Request deadline exceeded before send"}));
+        return future;
+    }
+
+    const uint64_t sync_id = ++sync_counter_;
+    const std::size_t slot_idx = sync_id & (kPendingSlotCount - 1);
+    {
+        std::lock_guard lock(pending_mutex_);
+        UASSERT_MSG(pending_slots_[slot_idx].sync_id == 0,
+                    "pending slot collision — max_in_flight exceeded kPendingSlotCount");
+        pending_slots_[slot_idx].entry = std::make_shared<PendingEntry>(
+            AsyncPendingEntry{std::move(promise)});
+        pending_slots_[slot_idx].sync_id = sync_id;
+    }
+
+    // IPROTO_VSHARD_CALL frame: preheader(5) + header(fixmap(4) ~21 bytes) + body.
+    // Header keys: REQUEST_TYPE=0x50, SYNC=<uint64>, VSHARD_BUCKET_ID=<uint32>,
+    //              VSHARD_MODE=<uint8>.  Body bytes are copied once.
+    {
+        std::lock_guard lock(staging_mutex_);
+        const auto prehdr_pos = staging_buf_.size();
+        staging_buf_.resize(prehdr_pos + 5);  // preheader slot (filled last)
+
+        EncodeFixMap(staging_buf_, 4);
+        EncodeUint(staging_buf_, kKeyCode);          EncodeUint(staging_buf_, kIprotoVshardCall);
+        EncodeUint(staging_buf_, kKeySync);          EncodeUint(staging_buf_, sync_id);
+        EncodeUint(staging_buf_, kKeyVshardBucketId);EncodeUint(staging_buf_, uint64_t{bucket_id});
+        EncodeUint(staging_buf_, kKeyVshardMode);    EncodeUint(staging_buf_, uint64_t{mode});
+
+        staging_buf_.insert(staging_buf_.end(), body, body + body_len);
+
+        const uint32_t len =
+            static_cast<uint32_t>(staging_buf_.size() - prehdr_pos - 5);
+        staging_buf_[prehdr_pos]     = 0xce;
+        staging_buf_[prehdr_pos + 1] = static_cast<uint8_t>(len >> 24);
+        staging_buf_[prehdr_pos + 2] = static_cast<uint8_t>(len >> 16);
+        staging_buf_[prehdr_pos + 3] = static_cast<uint8_t>(len >>  8);
+        staging_buf_[prehdr_pos + 4] = static_cast<uint8_t>(len);
+    }
+    NotifyFlush();
+    return future;
+}
 
 uint32_t Connection::ResolveSpaceId(const std::string& space_name,
                                     engine::Deadline deadline) {
@@ -573,9 +718,9 @@ uint32_t Connection::ResolveSpaceId(const std::string& space_name,
     return space_id;
 }
 
-// ---- ExecuteAsync ----
+// ---- Query body builder (shared by ExecuteAsync and SyncExecute) ----
 
-engine::Future<ExecutionResult> Connection::ExecuteAsync(
+std::pair<uint32_t, std::vector<uint8_t>> Connection::BuildQueryBody(
         engine::Deadline deadline, const Query& query) {
     uint32_t space_id = 0;
     if (query.GetType() != Query::Type::kCall) {
@@ -650,7 +795,14 @@ engine::Future<ExecutionResult> Connection::ExecuteAsync(
             break;
         }
     }
+    return {request_type, std::move(body)};
+}
 
+// ---- ExecuteAsync ----
+
+engine::Future<ExecutionResult> Connection::ExecuteAsync(
+        engine::Deadline deadline, const Query& query) {
+    auto [request_type, body] = BuildQueryBody(deadline, query);
     return SendAndRegister(deadline, request_type, std::move(body));
 }
 
@@ -658,14 +810,7 @@ engine::Future<ExecutionResult> Connection::ExecuteAsync(
 
 ExecutionResult Connection::Execute(engine::Deadline deadline,
                                     const Query& query) {
-    auto future = ExecuteAsync(deadline, query);
-    const auto status = future.wait_until(deadline);
-    if (status == engine::FutureStatus::kTimeout)
-        throw TarantoolException{"execute deadline expired"};
-    if (status == engine::FutureStatus::kCancelled)
-        throw engine::TaskCancelledException{
-            engine::TaskCancellationReason::kUserRequest};
-    return future.get();
+    return CollectSyncEntry(SyncExecute(deadline, query), deadline);
 }
 
 // ---- Ping ----
@@ -681,9 +826,14 @@ engine::Future<ExecutionResult> Connection::PingAsync(engine::Deadline deadline)
     }
 
     const uint64_t sync_id = ++sync_counter_;
+    const std::size_t slot_idx = sync_id & (kPendingSlotCount - 1);
     {
         std::lock_guard lock(pending_mutex_);
-        pending_.emplace(sync_id, std::move(promise));
+        UASSERT_MSG(pending_slots_[slot_idx].sync_id == 0,
+                    "pending slot collision — max_in_flight exceeded kPendingSlotCount");
+        pending_slots_[slot_idx].entry = std::make_shared<PendingEntry>(
+            AsyncPendingEntry{std::move(promise)});
+        pending_slots_[slot_idx].sync_id = sync_id;
     }
 
     // PING frames are always 18 bytes (fixed layout: see iproto_frames.hpp).
@@ -694,23 +844,243 @@ engine::Future<ExecutionResult> Connection::PingAsync(engine::Deadline deadline)
         std::lock_guard lock(staging_mutex_);
         staging_buf_.insert(staging_buf_.end(), frame.begin(), frame.end());
     }
-    flush_event_.Send();
+    NotifyFlush();
 
     return future;
 }
 
 void Connection::Ping(engine::Deadline deadline) {
-    auto future = PingAsync(deadline);
-    const auto status = future.wait_until(deadline);
-    if (status != engine::FutureStatus::kReady) {
-        broken_.store(true, std::memory_order_release);
-        throw TarantoolException{"ping timeout or cancelled"};
-    }
-    auto result = future.get();
+    auto result = CollectSyncEntry(SyncPing(deadline), deadline);
     if (!result.IsOk()) {
         broken_.store(true, std::memory_order_release);
         throw TarantoolException{"ping returned error"};
     }
+}
+
+// ---- Sync pipelining primitives (Phase 3) ----------------------------------
+
+// StageSyncRequest — allocates a SyncPendingEntry via make_shared<PendingEntry>,
+// registers it in pending_, stages the encoded frame into staging_buf_, and
+// signals the flush coroutine.  Returns an alias shared_ptr<SyncPendingEntry>
+// that shares ownership with the pending_ map entry via the aliasing constructor.
+//
+// Ownership at return:
+//   - pending_[sync_id]  → shared_ptr<PendingEntry>  (ref count 2)
+//   - returned handle    → shared_ptr<SyncPendingEntry> (same ctrl block, ref count 2)
+// When the caller calls CollectSyncEntry() the entry is moved out of pending_
+// by ReaderLoop, dropping that reference.  The caller's handle is the last ref
+// and the object is destroyed when CollectSyncEntry() returns.
+std::shared_ptr<SyncPendingEntry> Connection::StageSyncRequest(
+        engine::Deadline deadline,
+        uint32_t request_type,
+        std::vector<uint8_t> body) {
+    if (deadline.IsReached()) {
+        throw TarantoolException{"Request deadline exceeded before send"};
+    }
+
+    // Construct the variant in-place (SyncPendingEntry is not movable).
+    auto owner = std::make_shared<PendingEntry>(
+        std::in_place_type<SyncPendingEntry>);
+    auto* raw = std::get_if<SyncPendingEntry>(owner.get());
+    // Aliasing constructor: shares owner's ref count, points to the sub-object.
+    std::shared_ptr<SyncPendingEntry> handle{owner, raw};
+
+    const uint64_t sync_id = ++sync_counter_;
+    const std::size_t slot_idx = sync_id & (kPendingSlotCount - 1);
+    {
+        std::lock_guard lock(pending_mutex_);
+        UASSERT_MSG(pending_slots_[slot_idx].sync_id == 0,
+                    "pending slot collision — max_in_flight exceeded kPendingSlotCount");
+        pending_slots_[slot_idx].entry = std::move(owner);
+        pending_slots_[slot_idx].sync_id = sync_id;
+    }
+
+    {
+        std::lock_guard lock(staging_mutex_);
+        const auto prehdr_pos = staging_buf_.size();
+        staging_buf_.resize(prehdr_pos + 5);
+        BuildHeader(staging_buf_, request_type, sync_id);
+        staging_buf_.insert(staging_buf_.end(), body.begin(), body.end());
+        const uint32_t len =
+            static_cast<uint32_t>(staging_buf_.size() - prehdr_pos - 5);
+        staging_buf_[prehdr_pos]     = 0xce;
+        staging_buf_[prehdr_pos + 1] = static_cast<uint8_t>(len >> 24);
+        staging_buf_[prehdr_pos + 2] = static_cast<uint8_t>(len >> 16);
+        staging_buf_[prehdr_pos + 3] = static_cast<uint8_t>(len >> 8);
+        staging_buf_[prehdr_pos + 4] = static_cast<uint8_t>(len);
+    }
+    NotifyFlush();
+
+    return handle;
+}
+
+std::shared_ptr<SyncPendingEntry> Connection::SyncExecute(
+        engine::Deadline deadline, const Query& query) {
+    auto [request_type, body] = BuildQueryBody(deadline, query);
+    return StageSyncRequest(deadline, request_type, std::move(body));
+}
+
+std::shared_ptr<SyncPendingEntry> Connection::SyncForwardStorageCall(
+        const CallRouteInfo& info, engine::Deadline deadline) {
+    if (broken_.load(std::memory_order_acquire)) {
+        throw TarantoolException{"connection is broken"};
+    }
+    if (deadline.IsReached()) {
+        throw TarantoolException{"Request deadline exceeded before send"};
+    }
+
+    const std::size_t tuple_size =
+        static_cast<std::size_t>(info.tuple_end - info.tuple_begin);
+
+    // Construct the variant in-place (SyncPendingEntry is not movable).
+    auto owner = std::make_shared<PendingEntry>(
+        std::in_place_type<SyncPendingEntry>);
+    auto* raw = std::get_if<SyncPendingEntry>(owner.get());
+    // Aliasing constructor: shares owner's ref count, points to the sub-object.
+    std::shared_ptr<SyncPendingEntry> handle{owner, raw};
+
+    const uint64_t sync_id = ++sync_counter_;
+    const std::size_t slot_idx = sync_id & (kPendingSlotCount - 1);
+    {
+        std::lock_guard lock(pending_mutex_);
+        UASSERT_MSG(pending_slots_[slot_idx].sync_id == 0,
+                    "pending slot collision — max_in_flight exceeded kPendingSlotCount");
+        pending_slots_[slot_idx].entry = std::move(owner);
+        pending_slots_[slot_idx].sync_id = sync_id;
+    }
+
+    // Stage prefix + tuple directly into staging_buf_ — no intermediate
+    // body vector (one memcpy of the tuple instead of two copies).
+    {
+        std::lock_guard lock(staging_mutex_);
+        const auto prehdr_pos = staging_buf_.size();
+        staging_buf_.resize(prehdr_pos + 5);
+        BuildHeader(staging_buf_, kIprotoCall, sync_id);
+        staging_buf_.insert(staging_buf_.end(),
+                            kStorageCallBodyPrefix,
+                            kStorageCallBodyPrefix + sizeof(kStorageCallBodyPrefix));
+        staging_buf_.insert(staging_buf_.end(), info.tuple_begin, info.tuple_end);
+        const uint32_t len =
+            static_cast<uint32_t>(staging_buf_.size() - prehdr_pos - 5);
+        staging_buf_[prehdr_pos]     = 0xce;
+        staging_buf_[prehdr_pos + 1] = static_cast<uint8_t>(len >> 24);
+        staging_buf_[prehdr_pos + 2] = static_cast<uint8_t>(len >> 16);
+        staging_buf_[prehdr_pos + 3] = static_cast<uint8_t>(len >> 8);
+        staging_buf_[prehdr_pos + 4] = static_cast<uint8_t>(len);
+    }
+    NotifyFlush();
+
+    return handle;
+}
+
+// SyncForwardVshardCall stages directly into staging_buf_ — no intermediate
+// body vector — matching the zero-allocation property of ForwardVshardCallAsync.
+std::shared_ptr<SyncPendingEntry> Connection::SyncForwardVshardCall(
+        uint32_t bucket_id, uint8_t mode,
+        const uint8_t* body, std::size_t body_len,
+        engine::Deadline deadline) {
+    if (broken_.load(std::memory_order_acquire)) {
+        throw TarantoolException{"connection is broken"};
+    }
+    if (deadline.IsReached()) {
+        throw TarantoolException{"Request deadline exceeded before send"};
+    }
+
+    auto owner = std::make_shared<PendingEntry>(
+        std::in_place_type<SyncPendingEntry>);
+    auto* raw = std::get_if<SyncPendingEntry>(owner.get());
+    std::shared_ptr<SyncPendingEntry> handle{owner, raw};
+
+    const uint64_t sync_id = ++sync_counter_;
+    const std::size_t slot_idx = sync_id & (kPendingSlotCount - 1);
+    {
+        std::lock_guard lock(pending_mutex_);
+        UASSERT_MSG(pending_slots_[slot_idx].sync_id == 0,
+                    "pending slot collision — max_in_flight exceeded kPendingSlotCount");
+        pending_slots_[slot_idx].entry = std::move(owner);
+        pending_slots_[slot_idx].sync_id = sync_id;
+    }
+
+    {
+        std::lock_guard lock(staging_mutex_);
+        const auto prehdr_pos = staging_buf_.size();
+        staging_buf_.resize(prehdr_pos + 5);
+
+        EncodeFixMap(staging_buf_, 4);
+        EncodeUint(staging_buf_, kKeyCode);           EncodeUint(staging_buf_, kIprotoVshardCall);
+        EncodeUint(staging_buf_, kKeySync);           EncodeUint(staging_buf_, sync_id);
+        EncodeUint(staging_buf_, kKeyVshardBucketId); EncodeUint(staging_buf_, uint64_t{bucket_id});
+        EncodeUint(staging_buf_, kKeyVshardMode);     EncodeUint(staging_buf_, uint64_t{mode});
+
+        staging_buf_.insert(staging_buf_.end(), body, body + body_len);
+
+        const uint32_t len =
+            static_cast<uint32_t>(staging_buf_.size() - prehdr_pos - 5);
+        staging_buf_[prehdr_pos]     = 0xce;
+        staging_buf_[prehdr_pos + 1] = static_cast<uint8_t>(len >> 24);
+        staging_buf_[prehdr_pos + 2] = static_cast<uint8_t>(len >> 16);
+        staging_buf_[prehdr_pos + 3] = static_cast<uint8_t>(len >> 8);
+        staging_buf_[prehdr_pos + 4] = static_cast<uint8_t>(len);
+    }
+    NotifyFlush();
+
+    return handle;
+}
+
+std::shared_ptr<SyncPendingEntry> Connection::SyncPing(
+        engine::Deadline deadline) {
+    if (deadline.IsReached()) {
+        throw TarantoolException{"Request deadline exceeded before send"};
+    }
+
+    auto owner = std::make_shared<PendingEntry>(
+        std::in_place_type<SyncPendingEntry>);
+    auto* raw = std::get_if<SyncPendingEntry>(owner.get());
+    std::shared_ptr<SyncPendingEntry> handle{owner, raw};
+
+    const uint64_t sync_id = ++sync_counter_;
+    const std::size_t slot_idx = sync_id & (kPendingSlotCount - 1);
+    {
+        std::lock_guard lock(pending_mutex_);
+        UASSERT_MSG(pending_slots_[slot_idx].sync_id == 0,
+                    "pending slot collision — max_in_flight exceeded kPendingSlotCount");
+        pending_slots_[slot_idx].entry = std::move(owner);
+        pending_slots_[slot_idx].sync_id = sync_id;
+    }
+
+    // PING frames are fixed-size — stage pre-built bytes directly.
+    const auto frame = BuildPingFrame(sync_id);
+    {
+        std::lock_guard lock(staging_mutex_);
+        staging_buf_.insert(staging_buf_.end(), frame.begin(), frame.end());
+        staging_buf_.reserve(staging_buf_.capacity());  // no-op; keeps capacity
+    }
+    NotifyFlush();
+
+    return handle;
+}
+
+// CollectSyncEntry — waits on the SyncPendingEntry event and returns the
+// result, or throws on timeout/cancellation.  Does NOT require a Connection
+// reference; safe to call after the pool slot has been released.
+//
+// Timeout handling: sets abandoned=true so a late ReaderLoop delivery is
+// silently discarded.  The pending_ map entry is cleaned up by ReaderLoop
+// when the response eventually arrives (or by WakeAllPending on conn break).
+// static
+ExecutionResult Connection::CollectSyncEntry(
+        std::shared_ptr<SyncPendingEntry> entry,
+        engine::Deadline deadline) {
+    const bool signalled = entry->ready.WaitForEventUntil(deadline);
+    if (!signalled) {
+        entry->abandoned.store(true, std::memory_order_release);
+        // CancellationPoint() throws TaskCancelledException if the task was
+        // cancelled; if it returns, the failure was a genuine deadline expiry.
+        engine::current_task::CancellationPoint();
+        throw TarantoolException{"sync request deadline expired"};
+    }
+    if (entry->exc) std::rethrow_exception(entry->exc);
+    return std::move(entry->result);
 }
 
 }  // namespace storages::tarantool::impl

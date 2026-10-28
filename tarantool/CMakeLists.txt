@@ -6,6 +6,7 @@ file(GLOB_RECURSE SOURCES
 
 file(GLOB_RECURSE UNIT_TEST_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/*_test.cpp)
+list(FILTER UNIT_TEST_SOURCES EXCLUDE REGEX ".*/vshard/.*")
 list(REMOVE_ITEM SOURCES ${UNIT_TEST_SOURCES})
 
 file(GLOB_RECURSE TT_TEST_SOURCES
@@ -75,4 +76,5 @@ if (USERVER_IS_THE_ROOT_PROJECT)
     endif()
 
     add_subdirectory(functional_tests)
+    add_subdirectory(vshard)
 endif()

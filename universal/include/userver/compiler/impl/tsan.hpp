@@ -15,6 +15,12 @@
 #define USERVER_IMPL_HAS_TSAN 0
 #endif
 
+#elif defined(__SANITIZE_THREAD__)
+// GCC defines __SANITIZE_THREAD__ under -fsanitize=thread but does not
+// support the Clang-style __has_feature(thread_sanitizer) probe.
+// NOLINTNEXTLINE(cppcoreguidelines-macro-usage)
+#define USERVER_IMPL_HAS_TSAN 1
+
 #else
 // NOLINTNEXTLINE(cppcoreguidelines-macro-usage)
 #define USERVER_IMPL_HAS_TSAN 0

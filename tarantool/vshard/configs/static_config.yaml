@@ -1,0 +1,51 @@
+components_manager:
+    components:
+        iproto-vshard-server:
+            port: 3306
+            task_processor: main-task-processor
+
+        tarantool-vshard:
+            secdist_alias: tarantool-vshard
+            initial_pool_size: 4
+            max_pool_size: 16
+
+        secdist: {}
+        default-secdist-provider:
+            config: /tmp/vshard_secdist.json
+            missing-ok: false
+
+        logging:
+            fs-task-processor: fs-task-processor
+            loggers:
+                default:
+                    file_path: '@stderr'
+                    level: warning
+                    overflow_behavior: discard
+
+        logging-configurator:
+            limited-logging-enable: true
+            limited-logging-interval: 1s
+
+        dynamic-config:
+            fs-cache-path: ''
+            defaults:
+                USERVER_NO_LOG_SPANS:
+                    prefixes: ['tarantool_']
+                    names: []
+
+        dns-client:
+            fs-task-processor: fs-task-processor
+
+    coro_pool:
+        initial_size: 1000
+        max_size: 5000
+
+    task_processors:
+        main-task-processor:
+            worker_threads: 4
+            thread_name: main-worker
+        fs-task-processor:
+            thread_name: fs-worker
+            worker_threads: 2
+
+    default_task_processor: main-task-processor
